@@ -45,9 +45,19 @@ jobs:
         with:
           gradle-version: "8.7"
 
-      - name: Verify Gradle
+      - name: Prepare ncnn source
         run: |
-          gradle --version
+          rm -rf third_party/ncnn
+          mkdir -p third_party
+          git clone --depth 1 --recurse-submodules \
+            https://github.com/Tencent/ncnn.git \
+            third_party/ncnn
+
+      - name: Verify ncnn source
+        run: |
+          test -f third_party/ncnn/CMakeLists.txt
+          test -f third_party/ncnn/src/CMakeLists.txt
+          echo "ncnn source is ready"
 
       - name: Build Debug APK
         run: |
