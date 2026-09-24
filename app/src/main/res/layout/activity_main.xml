@@ -1,189 +1,223 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:background="#121212">
+    android:background="#000000"
+    android:keepScreenOn="true">
 
-    <!-- Top Header & Player Navigation -->
-    <LinearLayout
+    <!-- Normal ExoPlayer Output View -->
+    <androidx.media3.ui.PlayerView
+        android:id="@+id/playerView"
         android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:focusable="true" />
+
+    <!-- Interpolated / Intercepted Video Surface -->
+    <SurfaceView
+        android:id="@+id/displaySurfaceView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:visibility="gone" />
+
+    <!-- File Picker Overlay (When no video is playing) -->
+    <LinearLayout
+        android:id="@+id/layoutFilePicker"
+        android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:background="#1E1E1E"
-        android:padding="12dp">
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="32dp"
+        android:background="#D0101010">
 
         <TextView
-            android:layout_width="0dp"
+            android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_weight="1"
-            android:text="Just Player + Real RIFE Vulkan Engine"
+            android:text="RIFE Android TV Player"
             android:textColor="#FFFFFF"
-            android:textSize="18sp"
-            android:textStyle="bold" />
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="16dp" />
 
         <Button
             android:id="@+id/btnOpenVideo"
-            android:layout_width="wrap_content"
+            android:layout_width="240dp"
             android:layout_height="wrap_content"
-            android:text="Open Video"
+            android:text="Open Local Video File"
+            android:textSize="18sp"
             android:focusable="true"
-            android:layout_marginEnd="8dp" />
+            android:layout_marginBottom="12dp" />
 
         <Button
-            android:id="@+id/btnPlayPause"
-            android:layout_width="wrap_content"
+            android:id="@+id/btnRunDiagnostic"
+            android:layout_width="240dp"
             android:layout_height="wrap_content"
-            android:text="Play"
+            android:text="RIFE Diagnostic Test"
+            android:textSize="16sp"
             android:focusable="true" />
     </LinearLayout>
 
+    <!-- On-Screen TV Player Controls Overlay -->
     <LinearLayout
+        android:id="@+id/layoutPlayerControls"
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="1"
-        android:orientation="horizontal">
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:background="#E0101010"
+        android:padding="20dp"
+        android:visibility="gone">
 
-        <!-- Left: Video Output Area -->
-        <FrameLayout
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="2"
-            android:background="#000000">
+        <!-- Position / Duration Text -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginBottom="8dp">
 
-            <androidx.media3.ui.PlayerView
-                android:id="@+id/playerView"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:focusable="true" />
-
-            <TextureView
-                android:id="@+id/textureView"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:visibility="gone" />
-
-            <!-- Diagnostic Overlay -->
             <TextView
-                android:id="@+id/tvDiagnosticOverlay"
+                android:id="@+id/tvCurrentTime"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:layout_margin="12dp"
-                android:padding="8dp"
-                android:background="#B0000000"
+                android:text="00:00"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:fontFamily="monospace" />
+
+            <SeekBar
+                android:id="@+id/seekBar"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:focusable="true" />
+
+            <TextView
+                android:id="@+id/tvDuration"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="00:00"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:fontFamily="monospace" />
+        </LinearLayout>
+
+        <!-- Control Buttons Row -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/btnRewind"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="-10s"
+                android:focusable="true"
+                android:layout_marginEnd="8dp" />
+
+            <Button
+                android:id="@+id/btnPlayPause"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Pause"
+                android:focusable="true"
+                android:layout_marginEnd="8dp" />
+
+            <Button
+                android:id="@+id/btnForward"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="+10s"
+                android:focusable="true"
+                android:layout_marginEnd="16dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="RIFE:"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:layout_marginEnd="8dp" />
+
+            <Switch
+                android:id="@+id/switchRife"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="OFF"
                 android:textColor="#00E676"
-                android:textSize="12sp"
-                android:fontFamily="monospace"
-                android:text="Video: None\nInput FPS: 0\nOutput FPS: 0\nRIFE: OFF\nProcessing: 0 ms\nDropped: 0" />
-        </FrameLayout>
+                android:focusable="true"
+                android:layout_marginEnd="16dp" />
 
-        <!-- Right: TV Settings & Controls -->
-        <ScrollView
-            android:layout_width="0dp"
-            android:layout_height="match_parent"
-            android:layout_weight="1"
-            android:background="#1A1A1A"
-            android:padding="16dp">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Resolution:"
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:layout_marginEnd="8dp" />
 
-            <LinearLayout
+            <Spinner
+                android:id="@+id/spinnerResolution"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:focusable="true" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Overlay Diagnostic & Statistics HUD -->
+    <TextView
+        android:id="@+id/tvOverlayStats"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="16dp"
+        android:padding="8dp"
+        android:background="#C0000000"
+        android:textColor="#00E676"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:text="RIFE Status: Ready" />
+
+    <!-- Diagnostic Log Dialog / Sheet Overlay -->
+    <ScrollView
+        android:id="@+id/layoutDiagnosticDialog"
+        android:layout_width=" match_parent"
+        android:layout_height="match_parent"
+        android:background="#F0101010"
+        android:padding="24dp"
+        android:visibility="gone">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="RIFE &amp; Vulkan System Diagnostics"
+                android:textColor="#00E676"
+                android:textSize="22sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="16dp" />
+
+            <TextView
+                android:id="@+id/tvDiagnosticDetails"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:orientation="vertical">
+                android:textColor="#FFFFFF"
+                android:textSize="14sp"
+                android:fontFamily="monospace"
+                android:lineSpacingExtra="4dp"
+                android:layout_marginBottom="24dp" />
 
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="RIFE Settings"
-                    android:textColor="#00E676"
-                    android:textSize="16sp"
-                    android:textStyle="bold"
-                    android:layout_marginBottom="12dp" />
-
-                <!-- RIFE Toggle -->
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="horizontal"
-                    android:layout_marginBottom="16dp">
-
-                    <TextView
-                        android:layout_width="0dp"
-                        android:layout_height="wrap_content"
-                        android:layout_weight="1"
-                        android:text="RIFE Interpolation:"
-                        android:textColor="#FFFFFF"
-                        android:textSize="14sp" />
-
-                    <Switch
-                        android:id="@+id/switchRife"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="OFF"
-                        android:textColor="#B0BEC5"
-                        android:focusable="true" />
-                </LinearLayout>
-
-                <!-- Processing Resolution -->
-                <TextView
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="Processing Resolution:"
-                    android:textColor="#FFFFFF"
-                    android:textSize="14sp"
-                    android:layout_marginBottom="6dp" />
-
-                <RadioGroup
-                    android:id="@+id/rgResolution"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical"
-                    android:layout_marginBottom="16dp">
-
-                    <RadioButton
-                        android:id="@+id/rbOriginal"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="Original Resolution"
-                        android:checked="true"
-                        android:textColor="#FFFFFF"
-                        android:focusable="true" />
-
-                    <RadioButton
-                        android:id="@+id/rb720p"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="720p (Downscale to 1280)"
-                        android:textColor="#FFFFFF"
-                        android:focusable="true" />
-
-                    <RadioButton
-                        android:id="@+id/rb480p"
-                        android:layout_width="wrap_content"
-                        android:layout_height="wrap_content"
-                        android:text="480p (Downscale to 854)"
-                        android:textColor="#FFFFFF"
-                        android:focusable="true" />
-                </RadioGroup>
-
-                <Button
-                    android:id="@+id/btnRunRifeTest"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="Run RIFE GPU Test (256x256)"
-                    android:focusable="true"
-                    android:layout_marginBottom="16dp" />
-
-                <TextView
-                    android:id="@+id/tvDiagnosticLogs"
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:text="System Status: Ready"
-                    android:textColor="#CCCCCC"
-                    android:textSize="12sp"
-                    android:fontFamily="monospace"
-                    android:lineSpacingExtra="3dp" />
-
-            </LinearLayout>
-        </ScrollView>
-    </LinearLayout>
-</LinearLayout>
+            <Button
+                android:id="@+id/btnCloseDiagnostic"
+                android:layout_width="200dp"
+                android:layout_height="wrap_content"
+                android:text="Close Diagnostics"
+                android:focusable="true" />
+        </LinearLayout>
+    </ScrollView>
+</FrameLayout>

@@ -1,13 +1,16 @@
 package com.rife.androidtv
 
 import android.content.Intent
-import android.graphics.Bitmap
-import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.view.TextureView
+import android.os.Handler
+import android.os.Looper
+import android.view.KeyEvent
 import android.view.View
+import android.widget.AdapterView
+import android.widget.ArrayAdapter
+import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -16,7 +19,7 @@ import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import com.rife.androidtv.databinding.ActivityMainBinding
 
-class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
+class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var player: ExoPlayer? = null
@@ -24,6 +27,9 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private var isRifeModelLoaded = false
     private var videoName = "None"
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val hideControlsRunnable = Runnable { hidePlayerControls() }
 
     private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
@@ -40,33 +46,31 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        binding.textureView.surfaceTextureListener = this
-
         setupVideoFrameProcessor()
         setupPlayer()
         setupUIControls()
+        setupResolutionSpinner()
         runDiagnosticsAndInitializeRife()
+
+        startProgressUpdater()
     }
 
     private fun setupVideoFrameProcessor() {
         videoFrameProcessor = VideoFrameProcessor(
-            textureView = binding.textureView,
+            displaySurfaceView = binding.displaySurfaceView,
             onStatisticsUpdated = { stats ->
                 runOnUiThread {
-                    binding.tvDiagnosticOverlay.text = """
+                    binding.tvOverlayStats.text = """
                         Video: $videoName
-                        Input FPS: ${"%.1f".format(stats.inputFps)}
-                        Output FPS: ${"%.1f".format(stats.outputFps)}
-                        Resolution: ${stats.currentResolution}
-                        RIFE: ${if (videoFrameProcessor?.isRifeEnabled == true) "ON" else "OFF"}
-                        Processing: ${stats.processingTimeMs} ms
-                        Dropped: ${stats.droppedFrames}
+                        Input FPS: ${"%.1f".format(stats.inputFps)} | Output FPS: ${"%.1f".format(stats.outputFps)}
+                        Resolution: ${stats.currentResolution} | RIFE: ${if (videoFrameProcessor?.isRifeEnabled == true) "ON" else "OFF"}
+                        Processing Time: ${stats.processingTimeMs} ms | Dropped: ${stats.droppedFrames}
                     """.trimIndent()
                 }
             },
             onError = { error ->
                 runOnUiThread {
-                    Toast.makeText(this, "RIFE Error: $error", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this, "RIFE Processing Error: $error", Toast.LENGTH_SHORT).show()
                 }
             }
         )
@@ -80,6 +84,17 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         player?.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 binding.btnPlayPause.text = if (isPlaying) "Pause" else "Play"
+                if (isPlaying) {
+                    binding.layoutFilePicker.visibility = View.GONE
+                }
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    val duration = player?.duration ?: 0L
+                    binding.seekBar.max = duration.toInt()
+                    binding.tvDuration.text = formatTime(duration)
+                }
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
@@ -97,6 +112,14 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             filePickerLauncher.launch(intent)
         }
 
+        binding.btnRunDiagnostic.setOnClickListener {
+            binding.layoutDiagnosticDialog.visibility = View.VISIBLE
+        }
+
+        binding.btnCloseDiagnostic.setOnClickListener {
+            binding.layoutDiagnosticDialog.visibility = View.GONE
+        }
+
         binding.btnPlayPause.setOnClickListener {
             player?.let { p ->
                 if (p.isPlaying) {
@@ -105,12 +128,39 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
                     p.play()
                 }
             }
+            showPlayerControls()
         }
+
+        binding.btnRewind.setOnClickListener {
+            player?.let { p ->
+                p.seekTo((p.currentPosition - 10000).coerceAtLeast(0))
+            }
+            showPlayerControls()
+        }
+
+        binding.btnForward.setOnClickListener {
+            player?.let { p ->
+                p.seekTo((p.currentPosition + 10000).coerceAtMost(p.duration))
+            }
+            showPlayerControls()
+        }
+
+        binding.seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (fromUser) {
+                    player?.seekTo(progress.toLong())
+                    binding.tvCurrentTime.text = formatTime(progress.toLong())
+                }
+            }
+
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
 
         binding.switchRife.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked && !isRifeModelLoaded) {
                 binding.switchRife.isChecked = false
-                Toast.makeText(this, "Cannot enable RIFE: RIFE model not loaded.", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "Cannot enable RIFE: Model not loaded.", Toast.LENGTH_LONG).show()
                 return@setOnCheckedChangeListener
             }
 
@@ -118,29 +168,42 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             binding.switchRife.text = if (isChecked) "ON" else "OFF"
 
             if (isChecked) {
+                // Attach player output to frame processor surface
+                videoFrameProcessor?.inputSurface?.let { surface ->
+                    player?.setVideoSurface(surface)
+                }
                 binding.playerView.visibility = View.GONE
-                binding.textureView.visibility = View.VISIBLE
-                player?.setVideoTextureView(binding.textureView)
-                Toast.makeText(this, "RIFE Video Frame Interpolation Enabled", Toast.LENGTH_SHORT).show()
+                binding.displaySurfaceView.visibility = View.VISIBLE
+                Toast.makeText(this, "RIFE Frame Interpolation Active", Toast.LENGTH_SHORT).show()
             } else {
-                player?.clearVideoTextureView(binding.textureView)
-                binding.textureView.visibility = View.GONE
+                player?.setVideoSurface(null)
+                binding.playerView.setPlayer(player)
+                binding.displaySurfaceView.visibility = View.GONE
                 binding.playerView.visibility = View.VISIBLE
-                Toast.makeText(this, "Normal ExoPlayer Playback Enabled", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Normal ExoPlayer Playback Active", Toast.LENGTH_SHORT).show()
             }
+            showPlayerControls()
         }
+    }
 
-        binding.rgResolution.setOnCheckedChangeListener { _, checkedId ->
-            val res = when (checkedId) {
-                R.id.rb720p -> RifeResolution.RES_720P
-                R.id.rb480p -> RifeResolution.RES_480P
-                else -> RifeResolution.ORIGINAL
+    private fun setupResolutionSpinner() {
+        val options = arrayOf("Original", "720p", "480p")
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, options)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        binding.spinnerResolution.adapter = adapter
+
+        binding.spinnerResolution.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                val res = when (position) {
+                    1 -> RifeResolution.RES_720P
+                    2 -> RifeResolution.RES_480P
+                    else -> RifeResolution.ORIGINAL
+                }
+                videoFrameProcessor?.resolution = res
+                showPlayerControls()
             }
-            videoFrameProcessor?.resolution = res
-        }
 
-        binding.btnRunRifeTest.setOnClickListener {
-            runRifeTest()
+            override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
     }
 
@@ -151,6 +214,35 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             it.prepare()
             it.playWhenReady = true
         }
+        binding.layoutFilePicker.visibility = View.GONE
+        showPlayerControls()
+    }
+
+    private fun showPlayerControls() {
+        binding.layoutPlayerControls.visibility = View.VISIBLE
+        mainHandler.removeCallbacks(hideControlsRunnable)
+        mainHandler.postDelayed(hideControlsRunnable, 5000)
+    }
+
+    private fun hidePlayerControls() {
+        if (player?.isPlaying == true) {
+            binding.layoutPlayerControls.visibility = View.GONE
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_BUTTON_A -> {
+                if (binding.layoutPlayerControls.visibility != View.VISIBLE) {
+                    showPlayerControls()
+                    return true
+                }
+            }
+            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                showPlayerControls()
+            }
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     private fun runDiagnosticsAndInitializeRife() {
@@ -187,49 +279,29 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             e.printStackTrace()
         }
 
-        binding.tvDiagnosticLogs.text = sb.toString()
+        binding.tvDiagnosticDetails.text = sb.toString()
     }
 
-    private fun runRifeTest() {
-        if (!isRifeModelLoaded) {
-            Toast.makeText(this, "RIFE model not loaded! Cannot run GPU test.", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        binding.btnRunRifeTest.isEnabled = false
-        binding.tvDiagnosticLogs.append("\nRunning RIFE GPU test (256x256)...\n")
-
-        Thread {
-            val testSuccess = NativeEngine.runRifeTest(256, 256)
-            val status = NativeEngine.getRifeStatus()
-
-            runOnUiThread {
-                binding.btnRunRifeTest.isEnabled = true
-                if (testSuccess) {
-                    binding.tvDiagnosticLogs.append("Test Result: PASSED (${status.lastInferenceTimeMs} ms)\n")
-                    binding.tvDiagnosticLogs.append("Details: ${status.opDetails}\n")
-                    Toast.makeText(this, "RIFE Test Passed in ${status.lastInferenceTimeMs} ms", Toast.LENGTH_SHORT).show()
-                } else {
-                    binding.tvDiagnosticLogs.append("Test Result: FAILED\n")
-                    binding.tvDiagnosticLogs.append("Error: ${status.lastError}\n")
-                    Toast.makeText(this, "RIFE Test Failed: ${status.lastError}", Toast.LENGTH_LONG).show()
+    private fun startProgressUpdater() {
+        mainHandler.post(object : Runnable {
+            override fun run() {
+                player?.let { p ->
+                    if (p.isPlaying) {
+                        val current = p.currentPosition
+                        binding.seekBar.progress = current.toInt()
+                        binding.tvCurrentTime.text = formatTime(current)
+                    }
                 }
+                mainHandler.postDelayed(this, 1000)
             }
-        }.start()
+        })
     }
 
-    override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {}
-    override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
-    override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
-
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-        if (videoFrameProcessor?.isRifeEnabled == true && player?.isPlaying == true) {
-            val bitmap = binding.textureView.getBitmap(640, 360)
-            if (bitmap != null) {
-                val timestampUs = (player?.currentPosition ?: 0) * 1000L
-                videoFrameProcessor?.onNewFrameDecoded(bitmap, timestampUs)
-            }
-        }
+    private fun formatTime(timeMs: Long): String {
+        val totalSec = timeMs / 1000
+        val min = totalSec / 60
+        val sec = totalSec % 60
+        return String.format("%02d:%02d", min, sec)
     }
 
     override fun onStart() {
