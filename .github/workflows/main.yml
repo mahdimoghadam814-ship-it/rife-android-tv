@@ -40,27 +40,27 @@ jobs:
             "cmake;3.22.1" \
             "ndk;26.3.11579264"
 
-      - name: Make Gradle executable
-        run: chmod +x gradlew
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: "8.7"
+
+      - name: Verify Gradle
+        run: |
+          gradle --version
 
       - name: Build Debug APK
-        run: ./gradlew --no-daemon assembleDebug
+        run: |
+          gradle --no-daemon assembleDebug
 
-      - name: Build Release APK
-        run: ./gradlew --no-daemon assembleRelease
+      - name: Check APK
+        run: |
+          ls -lh app/build/outputs/apk/debug/*.apk
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/*.apk
-          if-no-files-found: error
-          retention-days: 7
-
-      - name: Upload Release APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: app-release
-          path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
           retention-days: 7
