@@ -42,13 +42,19 @@ class VideoFrameProcessor(
     private var workerHandler: Handler? = null
 
     private var previousFrame: FrameData? = null
-    private var isProcessing = false
 
     private var frameCountInput = 0
     private var frameCountOutput = 0
     private var droppedFrameCount = 0L
     private var lastStatsResetTime = SystemClock.elapsedRealtime()
     private var lastProcTimeMs = 0L
+
+    // Reusable ByteBuffers to avoid memory allocation thrashing per frame
+    private var cachedIn0Buf: ByteBuffer? = null
+    private var cachedIn1Buf: ByteBuffer? = null
+    private var cachedOutBuf: ByteBuffer? = null
+    private var cachedSrcSize = 0
+    private var cachedTargetSize = 0
 
     fun start() {
         if (workerThread == null) {
@@ -66,25 +72,24 @@ class VideoFrameProcessor(
         frameQueue.clear()
         previousFrame?.bitmap?.recycle()
         previousFrame = null
+        cachedIn0Buf = null
+        cachedIn1Buf = null
+        cachedOutBuf = null
     }
 
     fun onNewFrameDecoded(bitmap: Bitmap, timestampUs: Long) {
         frameCountInput++
 
         if (!isRifeEnabled) {
-            // RIFE OFF: direct surface copy
-            renderBitmapToSurface(bitmap)
             frameCountOutput++
             updateStats()
             return
         }
 
-        // RIFE ON: Queue frame for RIFE processing thread
         val copyBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, false)
         val frameData = FrameData(copyBitmap, timestampUs)
 
         if (!frameQueue.offer(frameData)) {
-            // Queue full: drop stale frame to prevent latency growth
             droppedFrameCount++
             val dropped = frameQueue.poll()
             dropped?.bitmap?.recycle()
@@ -105,7 +110,6 @@ class VideoFrameProcessor(
 
         val prev = previousFrame
         if (prev == null) {
-            // First frame: render directly & store as previous
             renderBitmapToSurface(nextFrame.bitmap)
             previousFrame = nextFrame
             frameCountOutput++
@@ -113,18 +117,32 @@ class VideoFrameProcessor(
             return
         }
 
-        // Calculate target dimensions according to selected RIFE resolution setting
         val srcW = nextFrame.bitmap.width
         val srcH = nextFrame.bitmap.height
         val (targetW, targetH) = calculateTargetDimensions(srcW, srcH, resolution)
 
-        // Allocate direct ByteBuffers for RGBA frame data
         val bufferSizeSrc = srcW * srcH * 4
         val bufferSizeTarget = targetW * targetH * 4
 
-        val in0Buf = ByteBuffer.allocateDirect(bufferSizeSrc)
-        val in1Buf = ByteBuffer.allocateDirect(bufferSizeSrc)
-        val outBuf = ByteBuffer.allocateDirect(bufferSizeTarget)
+        // Reuse ByteBuffers to eliminate heap allocation & GC thrashing
+        if (cachedIn0Buf == null || cachedSrcSize != bufferSizeSrc) {
+            cachedIn0Buf = ByteBuffer.allocateDirect(bufferSizeSrc)
+            cachedIn1Buf = ByteBuffer.allocateDirect(bufferSizeSrc)
+            cachedSrcSize = bufferSizeSrc
+        }
+
+        if (cachedOutBuf == null || cachedTargetSize != bufferSizeTarget) {
+            cachedOutBuf = ByteBuffer.allocateDirect(bufferSizeTarget)
+            cachedTargetSize = bufferSizeTarget
+        }
+
+        val in0Buf = cachedIn0Buf!!
+        val in1Buf = cachedIn1Buf!!
+        val outBuf = cachedOutBuf!!
+
+        in0Buf.rewind()
+        in1Buf.rewind()
+        outBuf.rewind()
 
         prev.bitmap.copyPixelsToBuffer(in0Buf)
         nextFrame.bitmap.copyPixelsToBuffer(in1Buf)
@@ -162,7 +180,6 @@ class VideoFrameProcessor(
         } else {
             val status = NativeEngine.getRifeStatus()
             onError(if (status.lastError.isNotEmpty()) status.lastError else "RIFE frame interpolation failed")
-            // Fallback to normal frame rendering
             renderBitmapToSurface(nextFrame.bitmap)
             frameCountOutput++
         }
@@ -174,8 +191,8 @@ class VideoFrameProcessor(
     }
 
     private fun renderBitmapToSurface(bitmap: Bitmap) {
-        val surfaceHolder = textureView.surfaceTexture ?: return
-        val surface = Surface(surfaceHolder)
+        val surfaceTexture = textureView.surfaceTexture ?: return
+        val surface = Surface(surfaceTexture)
         try {
             val canvas: Canvas = surface.lockCanvas(null)
             canvas.drawBitmap(bitmap, 0f, 0f, null)

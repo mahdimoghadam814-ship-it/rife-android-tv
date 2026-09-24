@@ -15,7 +15,7 @@ object NativeEngine {
     external fun initRife(gpuId: Int): Boolean
 
     @JvmStatic
-    external fun loadRifeModel(assetManager: AssetManager, modelDir: String, isV2: Boolean, isV4: Boolean): Boolean
+    external fun loadRifeModel(assetManager: AssetManager, baseCacheDir: String, modelDir: String, isV2: Boolean, isV4: Boolean): Boolean
 
     @JvmStatic
     external fun interpolateFrameBuffers(

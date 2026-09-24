@@ -24,10 +24,8 @@ public:
     ~RifeEngine();
 
     bool init(int gpu_id = 0);
-    bool loadModelFromAssets(AAssetManager* mgr, const std::string& model_dir, bool is_v2 = true, bool is_v4 = false);
+    bool loadModelFromAssets(AAssetManager* mgr, const std::string& base_cache_dir, const std::string& model_dir, bool is_v2 = true, bool is_v4 = false);
 
-    // Perform RIFE interpolation between two RGBA buffers (in0 and in1) into out_buffer.
-    // target_w and target_h allow downscaling frame dimensions before RIFE inference (e.g. 720p or 480p).
     bool processFrameBuffer(
         const uint8_t* in0_rgba, const uint8_t* in1_rgba,
         int src_w, int src_h,

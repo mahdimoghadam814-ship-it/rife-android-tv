@@ -73,13 +73,13 @@ bool RifeEngine::init(int gpu_id) {
     return true;
 }
 
-bool RifeEngine::loadModelFromAssets(AAssetManager* mgr, const std::string& model_dir, bool is_v2, bool is_v4) {
+bool RifeEngine::loadModelFromAssets(AAssetManager* mgr, const std::string& base_cache_dir, const std::string& model_dir, bool is_v2, bool is_v4) {
     if (!vulkan_available && !init(gpu_id)) {
         last_error = "Vulkan unavailable for RIFE model loading.";
         return false;
     }
 
-    std::string target_dir = "/data/data/com.rife.androidtv/cache/" + model_dir;
+    std::string target_dir = base_cache_dir + "/" + model_dir;
 
     std::string cmd = "mkdir -p " + target_dir;
     system(cmd.c_str());

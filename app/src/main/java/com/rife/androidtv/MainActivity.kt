@@ -6,8 +6,6 @@ import android.graphics.SurfaceTexture
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.view.TextureView
 import android.view.View
 import android.widget.Toast
@@ -26,9 +24,6 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     private var isRifeModelLoaded = false
     private var videoName = "None"
-
-    private val handler = Handler(Looper.getMainLooper())
-    private var frameCaptureRunnable: Runnable? = null
 
     private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
@@ -85,39 +80,12 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
         player?.addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 binding.btnPlayPause.text = if (isPlaying) "Pause" else "Play"
-                if (isPlaying && videoFrameProcessor?.isRifeEnabled == true) {
-                    startFrameCaptureLoop()
-                } else {
-                    stopFrameCaptureLoop()
-                }
             }
 
             override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
                 Toast.makeText(this@MainActivity, "Playback Error: ${error.message}", Toast.LENGTH_LONG).show()
             }
         })
-    }
-
-    private fun startFrameCaptureLoop() {
-        stopFrameCaptureLoop()
-        frameCaptureRunnable = object : Runnable {
-            override fun run() {
-                if (player?.isPlaying == true && videoFrameProcessor?.isRifeEnabled == true) {
-                    val bitmap = binding.textureView.getBitmap(640, 360)
-                    if (bitmap != null) {
-                        val timestampUs = (player?.currentPosition ?: 0) * 1000L
-                        videoFrameProcessor?.onNewFrameDecoded(bitmap, timestampUs)
-                    }
-                    handler.postDelayed(this, 33) // ~30 FPS frame interception
-                }
-            }
-        }
-        handler.post(frameCaptureRunnable!!)
-    }
-
-    private fun stopFrameCaptureLoop() {
-        frameCaptureRunnable?.let { handler.removeCallbacks(it) }
-        frameCaptureRunnable = null
     }
 
     private fun setupUIControls() {
@@ -150,15 +118,11 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             binding.switchRife.text = if (isChecked) "ON" else "OFF"
 
             if (isChecked) {
-                player?.setVideoTextureView(binding.textureView)
                 binding.playerView.visibility = View.GONE
                 binding.textureView.visibility = View.VISIBLE
-                if (player?.isPlaying == true) {
-                    startFrameCaptureLoop()
-                }
+                player?.setVideoTextureView(binding.textureView)
                 Toast.makeText(this, "RIFE Video Frame Interpolation Enabled", Toast.LENGTH_SHORT).show()
             } else {
-                stopFrameCaptureLoop()
                 player?.clearVideoTextureView(binding.textureView)
                 binding.textureView.visibility = View.GONE
                 binding.playerView.visibility = View.VISIBLE
@@ -206,7 +170,8 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
             sb.append("=== RIFE MODEL INITIALIZATION ===\n")
             val initSuccess = NativeEngine.initRife(0)
             if (initSuccess) {
-                val loadSuccess = NativeEngine.loadRifeModel(assets, "rife-v2.4", isV2 = true, isV4 = false)
+                val baseCacheDir = cacheDir.absolutePath
+                val loadSuccess = NativeEngine.loadRifeModel(assets, baseCacheDir, "rife-v2.4", isV2 = true, isV4 = false)
                 isRifeModelLoaded = loadSuccess
                 sb.append("RIFE Model Loaded: ${if (loadSuccess) "YES (rife-v2.4)" else "FAILED"}\n")
             } else {
@@ -256,7 +221,16 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
     override fun onSurfaceTextureAvailable(surface: SurfaceTexture, width: Int, height: Int) {}
     override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, width: Int, height: Int) {}
     override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean = true
-    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+
+    override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+        if (videoFrameProcessor?.isRifeEnabled == true && player?.isPlaying == true) {
+            val bitmap = binding.textureView.getBitmap(640, 360)
+            if (bitmap != null) {
+                val timestampUs = (player?.currentPosition ?: 0) * 1000L
+                videoFrameProcessor?.onNewFrameDecoded(bitmap, timestampUs)
+            }
+        }
+    }
 
     override fun onStart() {
         super.onStart()
@@ -265,13 +239,11 @@ class MainActivity : AppCompatActivity(), TextureView.SurfaceTextureListener {
 
     override fun onStop() {
         super.onStop()
-        stopFrameCaptureLoop()
         player?.playWhenReady = false
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        stopFrameCaptureLoop()
         videoFrameProcessor?.stop()
         player?.release()
         player = null

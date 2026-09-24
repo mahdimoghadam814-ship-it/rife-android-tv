@@ -52,11 +52,13 @@ Java_com_rife_androidtv_NativeEngine_initRife(JNIEnv* env, jclass clazz, jint gp
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_rife_androidtv_NativeEngine_loadRifeModel(
     JNIEnv* env, jclass clazz,
-    jobject assetManager, jstring modelDir, jboolean isV2, jboolean isV4
+    jobject assetManager, jstring baseCacheDir, jstring modelDir, jboolean isV2, jboolean isV4
 ) {
     AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
+    const char* cacheStr = env->GetStringUTFChars(baseCacheDir, nullptr);
     const char* dirStr = env->GetStringUTFChars(modelDir, nullptr);
-    bool res = g_rife_engine.loadModelFromAssets(mgr, dirStr, isV2, isV4);
+    bool res = g_rife_engine.loadModelFromAssets(mgr, cacheStr, dirStr, isV2, isV4);
+    env->ReleaseStringUTFChars(baseCacheDir, cacheStr);
     env->ReleaseStringUTFChars(modelDir, dirStr);
     return res;
 }
