@@ -29,10 +29,40 @@ jobs:
       - name: Install Android SDK components
         run: |
           sdkmanager --install \
+            "platform-tools" \
             "platforms;android-34" \
             "build-tools;34.0.0" \
             "cmake;3.22.1" \
             "ndk;26.3.11579264"
+
+      - name: Prepare ncnn source
+        run: |
+          rm -rf third_party/ncnn
+          mkdir -p third_party
+
+          git clone --depth 1 --recurse-submodules \
+            https://github.com/Tencent/ncnn.git \
+            third_party/ncnn
+
+          test -f third_party/ncnn/CMakeLists.txt
+          test -f third_party/ncnn/src/CMakeLists.txt
+
+          echo "ncnn source prepared successfully"
+
+      - name: Verify build dependencies
+        run: |
+          echo "Android SDK:"
+          ls -la "$ANDROID_SDK_ROOT"
+
+          echo "NDK:"
+          ls -la "$ANDROID_SDK_ROOT/ndk/26.3.11579264"
+
+          echo "CMake:"
+          "$ANDROID_SDK_ROOT/cmake/3.22.1/bin/cmake" --version
+
+          echo "ncnn:"
+          git -C third_party/ncnn rev-parse --short HEAD
+          test -f third_party/ncnn/CMakeLists.txt
 
       - name: Make Gradle executable
         run: chmod +x gradlew
