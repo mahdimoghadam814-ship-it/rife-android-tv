@@ -62,4 +62,5 @@ jobs:
         with:
           name: app-release
           path: app/build/outputs/apk/release/*.apk
-          if-no
+          if-no-files-found: error
+          retention-days: 7
