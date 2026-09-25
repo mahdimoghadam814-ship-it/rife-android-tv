@@ -2313,7 +2313,24 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
             {
                 ex.input("input0", in0_padded);
                 ex.input("input1", in1_padded);
-                ex.extract("flow", flow);
+
+            LOGE("[RIFE-DEBUG] CPU normal: BEFORE flownet extract");
+
+            int ret_flow = ex.extract("flow", flow);
+
+            LOGE("[RIFE-DEBUG] CPU normal: AFTER flownet extract ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_flow,
+                 flow.empty() ? 1 : 0,
+                 flow.w,
+                 flow.h,
+                 flow.c);
+
+            if (ret_flow != 0 || flow.empty())
+            {
+                LOGE("[RIFE-DEBUG] CPU normal: flownet FAILED");
+                return -101;
+            }
+
             }
         }
 
