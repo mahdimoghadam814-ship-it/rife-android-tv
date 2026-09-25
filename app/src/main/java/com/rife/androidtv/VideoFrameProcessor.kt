@@ -3,6 +3,7 @@ package com.rife.androidtv
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Rect
+import android.graphics.SurfaceTexture
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
@@ -11,6 +12,7 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.media3.common.util.EGLSurfaceTexture
+import androidx.media3.common.util.GlUtil
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 
@@ -52,7 +54,8 @@ class VideoFrameProcessor(
     @Volatile
     var resolution = RifeResolution.ORIGINAL
 
-    private var inputSurfaceTexture: android.graphics.SurfaceTexture? = null
+    private var inputSurfaceTexture: SurfaceTexture? = null
+    private var oesTextureId = 0
 
     var inputSurface: Surface? = null
         private set
@@ -67,6 +70,7 @@ class VideoFrameProcessor(
     private var workerHandler: Handler? = null
 
     private var eglSurfaceTexture: EGLSurfaceTexture? = null
+    private var frameGrabber: OesFrameGrabber? = null
 
     private var previousFrame: FrameData? = null
 
@@ -102,20 +106,30 @@ class VideoFrameProcessor(
         val handler = workerHandler
         val egl = eglSurfaceTexture
 
-        if (handler != null && egl != null) {
+        if (handler != null) {
             handler.post {
                 try {
-                    egl.release()
+                    frameGrabber?.release()
+                    frameGrabber = null
                 } catch (e: Exception) {
                     e.printStackTrace()
                 }
 
-                if (eglSurfaceTexture === egl) {
-                    eglSurfaceTexture = null
-                    inputSurfaceTexture = null
+                if (egl != null) {
+                    try {
+                        egl.release()
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+
+                    if (eglSurfaceTexture === egl) {
+                        eglSurfaceTexture = null
+                        inputSurfaceTexture = null
+                    }
                 }
             }
         } else {
+            frameGrabber = null
             eglSurfaceTexture = null
             inputSurfaceTexture = null
         }
@@ -156,11 +170,13 @@ class VideoFrameProcessor(
                 egl.init(EGLSurfaceTexture.SECURE_MODE_NONE)
 
                 eglSurfaceTexture = egl
+                val tex = GlUtil.createExternalTexture()
+                oesTextureId = tex
                 inputSurfaceTexture = egl.surfaceTexture
                 inputSurfaceTexture?.setDefaultBufferSize(1920, 1080)
                 inputSurface = Surface(inputSurfaceTexture)
 
-                Log.i(TAG, "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture")
+                Log.i(TAG, "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture (texId=$tex)")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize EGL SurfaceTexture", e)
                 onError("RIFE EGL initialization failed: ${e.message}")
@@ -172,6 +188,8 @@ class VideoFrameProcessor(
         if (!isRifeEnabled) {
             return
         }
+
+        val surfaceTex = inputSurfaceTexture ?: return
 
         frameCountInput++
 
@@ -186,6 +204,28 @@ class VideoFrameProcessor(
         )
 
         val bitmap = Bitmap.createBitmap(preRifeW, preRifeH, Bitmap.Config.ARGB_8888)
+
+        if (frameGrabber == null) {
+            frameGrabber = OesFrameGrabber()
+        }
+
+        val grabbed = try {
+            frameGrabber?.grabFrame(
+                surfaceTexture = surfaceTex,
+                oesTextureId = oesTextureId,
+                targetWidth = preRifeW,
+                targetHeight = preRifeH,
+                outBitmap = bitmap
+            ) ?: false
+        } catch (e: Exception) {
+            Log.e(TAG, "Error grabbing frame from OES texture", e)
+            false
+        }
+
+        if (!grabbed) {
+            bitmap.recycle()
+            return
+        }
 
         val frameData = FrameData(
             bitmap = bitmap,
@@ -234,7 +274,7 @@ class VideoFrameProcessor(
         if (cachedIn0Buf == null || cachedIn1Buf == null || cachedTargetSize != bufferSizeTarget) {
             cachedIn0Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
             cachedIn1Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
-            cachedSrcSize = bufferSizeTarget
+            cachedTargetSize = bufferSizeTarget
         }
 
         if (cachedOutBuf == null || cachedTargetSize != bufferSizeTarget) {
@@ -310,8 +350,6 @@ class VideoFrameProcessor(
 
         updateStats()
     }
-
-    private var cachedSrcSize = 0
 
     private fun renderBitmapToOutput(bitmap: Bitmap) {
         val surface = outputSurface ?: return
