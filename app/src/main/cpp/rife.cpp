@@ -1,3 +1,5 @@
+#include <android/log.h>
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "RIFE-DEBUG", __VA_ARGS__)
 // rife implemented with ncnn library
 
 #include "rife.h"
