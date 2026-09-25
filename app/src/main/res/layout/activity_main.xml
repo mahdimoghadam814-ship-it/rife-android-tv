@@ -101,12 +101,13 @@
                 android:fontFamily="monospace" />
         </LinearLayout>
 
-        <!-- Control Buttons Row -->
+        <!-- Control Buttons Row 1 -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:gravity="center_vertical">
+            android:gravity="center_vertical"
+            android:layout_marginBottom="8dp">
 
             <Button
                 android:id="@+id/btnRewind"
@@ -163,6 +164,86 @@
                 android:layout_height="wrap_content"
                 android:focusable="true" />
         </LinearLayout>
+
+        <!-- Media & Synchronization Controls Row 2 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical">
+
+            <Button
+                android:id="@+id/btnExtAudio"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Ext Audio"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/btnAudioDelayMinus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="A -0.5s"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:layout_marginEnd="2dp" />
+
+            <TextView
+                android:id="@+id/tvAudioDelay"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="A: 0ms"
+                android:textColor="#FFEB3B"
+                android:textSize="12sp"
+                android:layout_marginEnd="2dp" />
+
+            <Button
+                android:id="@+id/btnAudioDelayPlus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="A +0.5s"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:layout_marginEnd="12dp" />
+
+            <Button
+                android:id="@+id/btnExtSub"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Ext Sub"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:layout_marginEnd="4dp" />
+
+            <Button
+                android:id="@+id/btnSubDelayMinus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="S -0.5s"
+                android:textSize="12sp"
+                android:focusable="true"
+                android:layout_marginEnd="2dp" />
+
+            <TextView
+                android:id="@+id/tvSubDelay"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="S: 0ms"
+                android:textColor="#FFEB3B"
+                android:textSize="12sp"
+                android:layout_marginEnd="2dp" />
+
+            <Button
+                android:id="@+id/btnSubDelayPlus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="S +0.5s"
+                android:textSize="12sp"
+                android:focusable="true" />
+        </LinearLayout>
+
     </LinearLayout>
 
     <!-- Overlay Diagnostic & Statistics HUD -->
@@ -182,7 +263,7 @@
     <!-- Diagnostic Log Dialog / Sheet Overlay -->
     <ScrollView
         android:id="@+id/layoutDiagnosticDialog"
-        android:layout_width=" match_parent"
+        android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:background="#F0101010"
         android:padding="24dp"

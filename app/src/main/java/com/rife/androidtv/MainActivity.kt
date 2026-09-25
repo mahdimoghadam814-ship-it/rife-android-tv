@@ -16,14 +16,18 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.exoplayer.ExoPlayer
 import com.rife.androidtv.databinding.ActivityMainBinding
 
+@androidx.media3.common.util.UnstableApi
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private var player: ExoPlayer? = null
     private var videoFrameProcessor: VideoFrameProcessor? = null
+    private var mediaPlaybackManager: MediaPlaybackManager? = null
+    private var audioDelayProcessor: AudioDelayAudioProcessor? = null
 
     private var isRifeModelLoaded = false
     private var videoName = "None"
@@ -36,7 +40,33 @@ class MainActivity : AppCompatActivity() {
             val uri: Uri? = result.data?.data
             uri?.let {
                 videoName = it.lastPathSegment ?: "Local Video"
-                playVideo(it)
+                mediaPlaybackManager?.setVideoSource(it)
+                binding.layoutFilePicker.visibility = View.GONE
+                showPlayerControls()
+            }
+        }
+    }
+
+    private val audioPickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            val uri: Uri? = result.data?.data
+            uri?.let {
+                val label = it.lastPathSegment ?: "External Audio"
+                mediaPlaybackManager?.setExternalAudioSource(it, label)
+                Toast.makeText(this, "External Audio Attached: $label", Toast.LENGTH_SHORT).show()
+                showPlayerControls()
+            }
+        }
+    }
+
+    private val subPickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            val uri: Uri? = result.data?.data
+            uri?.let {
+                val label = it.lastPathSegment ?: "External Subtitle"
+                mediaPlaybackManager?.setExternalSubtitleSource(it, null, label)
+                Toast.makeText(this, "External Subtitle Attached: $label", Toast.LENGTH_SHORT).show()
+                showPlayerControls()
             }
         }
     }
@@ -60,8 +90,15 @@ class MainActivity : AppCompatActivity() {
             displaySurfaceView = binding.displaySurfaceView,
             onStatisticsUpdated = { stats ->
                 runOnUiThread {
+                    val audioOff = mediaPlaybackManager?.audioOffsetMs ?: 0L
+                    val subOff = mediaPlaybackManager?.subtitleOffsetMs ?: 0L
+                    val extAud = if (mediaPlaybackManager?.isExternalAudioSelected == true) mediaPlaybackManager?.externalAudioName else "None"
+                    val extSub = if (mediaPlaybackManager?.isExternalSubtitleEnabled == true) mediaPlaybackManager?.externalSubtitleName else "None"
+
                     binding.tvOverlayStats.text = """
                         Video: $videoName
+                        Ext Audio: $extAud | Ext Sub: $extSub
+                        Audio Offset: ${audioOff}ms | Sub Offset: ${subOff}ms
                         Input FPS: ${"%.1f".format(stats.inputFps)} | Output FPS: ${"%.1f".format(stats.outputFps)}
                         Resolution: ${stats.currentResolution} | RIFE: ${if (videoFrameProcessor?.isRifeEnabled == true) "ON" else "OFF"}
                         Processing Time: ${stats.processingTimeMs} ms | Dropped: ${stats.droppedFrames}
@@ -78,10 +115,25 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupPlayer() {
-        player = ExoPlayer.Builder(this).build()
+        val audioProcessor = AudioDelayAudioProcessor()
+        this.audioDelayProcessor = audioProcessor
+
+        val renderersFactory = CustomRenderersFactory(this, audioProcessor)
+
+        player = ExoPlayer.Builder(this, renderersFactory).build()
         binding.playerView.player = player
 
+        mediaPlaybackManager = MediaPlaybackManager(
+            context = this,
+            player = player!!,
+            audioDelayProcessor = audioProcessor
+        )
+
         player?.addListener(object : Player.Listener {
+            override fun onTracksChanged(tracks: Tracks) {
+                mediaPlaybackManager?.updateTrackSelection()
+            }
+
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 binding.btnPlayPause.text = if (isPlaying) "Pause" else "Play"
                 if (isPlaying) {
@@ -110,6 +162,54 @@ class MainActivity : AppCompatActivity() {
                 type = "video/*"
             }
             filePickerLauncher.launch(intent)
+        }
+
+        binding.btnExtAudio.setOnClickListener {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "audio/*"
+            }
+            audioPickerLauncher.launch(intent)
+        }
+
+        binding.btnExtSub.setOnClickListener {
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+            }
+            subPickerLauncher.launch(intent)
+        }
+
+        binding.btnAudioDelayMinus.setOnClickListener {
+            val current = mediaPlaybackManager?.audioOffsetMs ?: 0L
+            val updated = (current - 500L).coerceAtLeast(-5000L)
+            mediaPlaybackManager?.setAudioOffset(updated)
+            binding.tvAudioDelay.text = "A: ${updated}ms"
+            showPlayerControls()
+        }
+
+        binding.btnAudioDelayPlus.setOnClickListener {
+            val current = mediaPlaybackManager?.audioOffsetMs ?: 0L
+            val updated = (current + 500L).coerceAtMost(5000L)
+            mediaPlaybackManager?.setAudioOffset(updated)
+            binding.tvAudioDelay.text = "A: ${updated}ms"
+            showPlayerControls()
+        }
+
+        binding.btnSubDelayMinus.setOnClickListener {
+            val current = mediaPlaybackManager?.subtitleOffsetMs ?: 0L
+            val updated = (current - 500L).coerceAtLeast(-5000L)
+            mediaPlaybackManager?.setSubtitleOffset(updated)
+            binding.tvSubDelay.text = "S: ${updated}ms"
+            showPlayerControls()
+        }
+
+        binding.btnSubDelayPlus.setOnClickListener {
+            val current = mediaPlaybackManager?.subtitleOffsetMs ?: 0L
+            val updated = (current + 500L).coerceAtMost(5000L)
+            mediaPlaybackManager?.setSubtitleOffset(updated)
+            binding.tvSubDelay.text = "S: ${updated}ms"
+            showPlayerControls()
         }
 
         binding.btnRunDiagnostic.setOnClickListener {
@@ -168,7 +268,6 @@ class MainActivity : AppCompatActivity() {
             binding.switchRife.text = if (isChecked) "ON" else "OFF"
 
             if (isChecked) {
-                // Attach player output to frame processor surface
                 videoFrameProcessor?.inputSurface?.let { surface ->
                     player?.setVideoSurface(surface)
                 }
@@ -205,17 +304,6 @@ class MainActivity : AppCompatActivity() {
 
             override fun onNothingSelected(parent: AdapterView<*>?) {}
         }
-    }
-
-    private fun playVideo(uri: Uri) {
-        player?.let {
-            val mediaItem = MediaItem.fromUri(uri)
-            it.setMediaItem(mediaItem)
-            it.prepare()
-            it.playWhenReady = true
-        }
-        binding.layoutFilePicker.visibility = View.GONE
-        showPlayerControls()
     }
 
     private fun showPlayerControls() {
