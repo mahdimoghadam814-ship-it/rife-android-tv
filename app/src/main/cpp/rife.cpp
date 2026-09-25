@@ -180,9 +180,12 @@ int RIFE::load(const std::string& modeldir)
     contextnet.opt = opt;
     fusionnet.opt = opt;
 
-    flownet.set_vulkan_device(vkdev);
-    contextnet.set_vulkan_device(vkdev);
-    fusionnet.set_vulkan_device(vkdev);
+    if (vkdev)
+    {
+        flownet.set_vulkan_device(vkdev);
+        contextnet.set_vulkan_device(vkdev);
+        fusionnet.set_vulkan_device(vkdev);
+    }
 
     flownet.register_custom_layer("rife.Warp", Warp_layer_creator);
     contextnet.register_custom_layer("rife.Warp", Warp_layer_creator);
