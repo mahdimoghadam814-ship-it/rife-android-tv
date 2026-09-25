@@ -2,15 +2,13 @@ package com.rife.androidtv
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
-import android.graphics.PixelFormat
-import android.graphics.SurfaceTexture
-import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import androidx.media3.common.util.EGLSurfaceTexture
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 
@@ -33,24 +31,37 @@ data class Statistics(
     val currentResolution: String
 )
 
+@androidx.media3.common.util.UnstableApi
 class VideoFrameProcessor(
     private val displaySurfaceView: SurfaceView,
     private val onStatisticsUpdated: (Statistics) -> Unit,
     private val onError: (String) -> Unit
 ) : SurfaceHolder.Callback {
 
-    @Volatile var isRifeEnabled = false
-    @Volatile var resolution = RifeResolution.ORIGINAL
+    @Volatile
+    var isRifeEnabled = false
 
-    private var inputSurfaceTexture: SurfaceTexture? = null
+    @Volatile
+    var resolution = RifeResolution.ORIGINAL
+
+    private var inputSurfaceTexture: android.graphics.SurfaceTexture? = null
+
     var inputSurface: Surface? = null
         private set
 
     private var outputSurface: Surface? = null
 
     private val frameQueue = ArrayBlockingQueue<FrameData>(4)
+
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
+
+    /*
+     * Media3's EGLSurfaceTexture owns the EGL/GLES context and the
+     * SurfaceTexture lifecycle. Its callback is invoked after the
+     * SurfaceTexture image has been updated.
+     */
+    private var eglSurfaceTexture: EGLSurfaceTexture? = null
 
     private var previousFrame: FrameData? = null
 
@@ -60,7 +71,6 @@ class VideoFrameProcessor(
     private var lastStatsResetTime = SystemClock.elapsedRealtime()
     private var lastProcTimeMs = 0L
 
-    // Reusable direct ByteBuffers
     private var cachedIn0Buf: ByteBuffer? = null
     private var cachedIn1Buf: ByteBuffer? = null
     private var cachedOutBuf: ByteBuffer? = null
@@ -78,56 +88,154 @@ class VideoFrameProcessor(
                 workerHandler = Handler(looper)
             }
         }
+
         createInputSurface()
     }
 
     fun stop() {
-        workerThread?.quitSafely()
-        workerThread = null
-        workerHandler = null
+        isRifeEnabled = false
+
+        /*
+         * Release EGL/SurfaceTexture resources on the same thread on
+         * which they were created.
+         */
+        val handler = workerHandler
+        val egl = eglSurfaceTexture
+
+        if (handler != null && egl != null) {
+            handler.post {
+                try {
+                    egl.release()
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+
+                if (eglSurfaceTexture === egl) {
+                    eglSurfaceTexture = null
+                    inputSurfaceTexture = null
+                }
+            }
+        } else {
+            eglSurfaceTexture = null
+            inputSurfaceTexture = null
+        }
+
+        inputSurface?.release()
+        inputSurface = null
+
         frameQueue.clear()
 
         previousFrame?.bitmap?.recycle()
         previousFrame = null
 
-        inputSurface?.release()
-        inputSurface = null
-        inputSurfaceTexture?.release()
-        inputSurfaceTexture = null
-
         cachedIn0Buf = null
         cachedIn1Buf = null
         cachedOutBuf = null
+
+        workerThread?.quitSafely()
+        workerThread = null
+        workerHandler = null
     }
 
     private fun createInputSurface() {
-        inputSurfaceTexture = SurfaceTexture(1001)
-        inputSurfaceTexture?.setDefaultBufferSize(1280, 720)
-        inputSurface = Surface(inputSurfaceTexture)
+        val handler = workerHandler ?: return
 
-        inputSurfaceTexture?.setOnFrameAvailableListener({
-            if (isRifeEnabled) {
-                // Hardware decoder has produced a new frame!
-                captureFrameFromInputSurface()
+        handler.post {
+            try {
+                /*
+                 * EGLSurfaceTexture creates the required EGL/GLES context
+                 * and a SurfaceTexture associated with that context.
+                 */
+                val egl = EGLSurfaceTexture(
+                    handler,
+                    EGLSurfaceTexture.TextureImageListener {
+                        /*
+                         * Media3 1.3.1 invokes this callback BEFORE it calls
+                         * SurfaceTexture.updateTexImage().
+                         *
+                         * Post the capture work so it runs after
+                         * EGLSurfaceTexture finishes updateTexImage().
+                         */
+                        handler.post {
+                            if (isRifeEnabled) {
+                                captureFrameFromInputSurface()
+                            }
+                        }
+                    }
+                )
+
+                egl.init(EGLSurfaceTexture.SECURE_MODE_NONE)
+
+                eglSurfaceTexture = egl
+                inputSurfaceTexture = egl.surfaceTexture
+                inputSurfaceTexture?.setDefaultBufferSize(1280, 720)
+                inputSurface = Surface(inputSurfaceTexture)
+
+                android.util.Log.i(
+                    "RifeFrameProcessor",
+                    "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture"
+                )
+            } catch (e: Exception) {
+                android.util.Log.e(
+                    "RifeFrameProcessor",
+                    "Failed to initialize EGL SurfaceTexture",
+                    e
+                )
+
+                onError("RIFE EGL initialization failed: ${e.message}")
             }
-        }, workerHandler)
+        }
     }
 
+    /*
+     * IMPORTANT:
+     *
+     * We intentionally DO NOT call updateTexImage() here.
+     *
+     * Media3 1.3.1 performs updateTexImage() inside its own EGLSurfaceTexture
+     * runnable. The TextureImageListener callback happens BEFORE that call,
+     * so the callback above posts this method to the Handler. That guarantees
+     * this method runs after updateTexImage() has completed.
+     *
+     * This first milestone only verifies the SurfaceTexture/EGL lifecycle.
+     * Pixel extraction from the GL texture will be implemented separately.
+     */
     private fun captureFrameFromInputSurface() {
-        inputSurfaceTexture?.updateTexImage()
+        if (!isRifeEnabled) {
+            return
+        }
+
         frameCountInput++
 
-        // Extract frame bitmap directly from decoder SurfaceTexture
+        /*
+         * The existing pipeline expects a Bitmap here.
+         *
+         * For this milestone we keep the existing placeholder behavior
+         * so that we can first verify that enabling RIFE no longer crashes.
+         *
+         * The next milestone will replace this with actual GPU texture
+         * -> CPU Bitmap readback.
+         */
         val width = 640
         val height = 360
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
 
-        val frameData = FrameData(bitmap, System.nanoTime() / 1000)
+        val bitmap = Bitmap.createBitmap(
+            width,
+            height,
+            Bitmap.Config.ARGB_8888
+        )
+
+        val frameData = FrameData(
+            bitmap,
+            System.nanoTime() / 1000
+        )
 
         if (!frameQueue.offer(frameData)) {
             droppedFrameCount++
+
             val dropped = frameQueue.poll()
             dropped?.bitmap?.recycle()
+
             frameQueue.offer(frameData)
         }
 
@@ -138,6 +246,7 @@ class VideoFrameProcessor(
         val nextFrame = frameQueue.poll() ?: return
 
         val prev = previousFrame
+
         if (prev == null) {
             renderBitmapToOutput(nextFrame.bitmap)
             previousFrame = nextFrame
@@ -148,7 +257,9 @@ class VideoFrameProcessor(
 
         val srcW = nextFrame.bitmap.width
         val srcH = nextFrame.bitmap.height
-        val (targetW, targetH) = calculateTargetDimensions(srcW, srcH, resolution)
+
+        val (targetW, targetH) =
+            calculateTargetDimensions(srcW, srcH, resolution)
 
         val bufferSizeSrc = srcW * srcH * 4
         val bufferSizeTarget = targetW * targetH * 4
@@ -174,40 +285,56 @@ class VideoFrameProcessor(
 
         prev.bitmap.copyPixelsToBuffer(in0Buf)
         nextFrame.bitmap.copyPixelsToBuffer(in1Buf)
+
         in0Buf.rewind()
         in1Buf.rewind()
 
         val startTime = SystemClock.elapsedRealtime()
 
         val success = NativeEngine.interpolateFrameBuffers(
-            in0Buf, in1Buf,
-            srcW, srcH,
-            targetW, targetH,
+            in0Buf,
+            in1Buf,
+            srcW,
+            srcH,
+            targetW,
+            targetH,
             0.5f,
             outBuf
         )
 
-        lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
+        lastProcTimeMs =
+            SystemClock.elapsedRealtime() - startTime
 
         if (success) {
-            // Render Frame A
             renderBitmapToOutput(prev.bitmap)
             frameCountOutput++
 
-            // Render RIFE Frame A.5
             outBuf.rewind()
-            val interpBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
+
+            val interpBitmap = Bitmap.createBitmap(
+                targetW,
+                targetH,
+                Bitmap.Config.ARGB_8888
+            )
+
             interpBitmap.copyPixelsFromBuffer(outBuf)
             renderBitmapToOutput(interpBitmap)
             interpBitmap.recycle()
             frameCountOutput++
 
-            // Render Frame B
             renderBitmapToOutput(nextFrame.bitmap)
             frameCountOutput++
         } else {
             val status = NativeEngine.getRifeStatus()
-            onError(if (status.lastError.isNotEmpty()) status.lastError else "RIFE frame interpolation failed")
+
+            onError(
+                if (status.lastError.isNotEmpty()) {
+                    status.lastError
+                } else {
+                    "RIFE frame interpolation failed"
+                }
+            )
+
             renderBitmapToOutput(nextFrame.bitmap)
             frameCountOutput++
         }
@@ -220,6 +347,7 @@ class VideoFrameProcessor(
 
     private fun renderBitmapToOutput(bitmap: Bitmap) {
         val surface = outputSurface ?: return
+
         try {
             val canvas: Canvas = surface.lockCanvas(null)
             canvas.drawBitmap(bitmap, 0f, 0f, null)
@@ -229,11 +357,18 @@ class VideoFrameProcessor(
         }
     }
 
-    private fun calculateTargetDimensions(srcW: Int, srcH: Int, res: RifeResolution): Pair<Int, Int> {
+    private fun calculateTargetDimensions(
+        srcW: Int,
+        srcH: Int,
+        res: RifeResolution
+    ): Pair<Int, Int> {
         return when (res) {
-            RifeResolution.ORIGINAL -> Pair(srcW, srcH)
+            RifeResolution.ORIGINAL ->
+                Pair(srcW, srcH)
+
             RifeResolution.RES_720P -> {
                 val maxDim = 1280
+
                 if (srcW > srcH && srcW > maxDim) {
                     Pair(maxDim, (srcH * maxDim) / srcW)
                 } else if (srcH >= srcW && srcH > maxDim) {
@@ -242,8 +377,10 @@ class VideoFrameProcessor(
                     Pair(srcW, srcH)
                 }
             }
+
             RifeResolution.RES_480P -> {
                 val maxDim = 854
+
                 if (srcW > srcH && srcW > maxDim) {
                     Pair(maxDim, (srcH * maxDim) / srcW)
                 } else if (srcH >= srcW && srcH > maxDim) {
@@ -257,10 +394,16 @@ class VideoFrameProcessor(
 
     private fun updateStats() {
         val now = SystemClock.elapsedRealtime()
-        val durationSec = (now - lastStatsResetTime) / 1000.0f
+        val durationSec =
+            (now - lastStatsResetTime) / 1000.0f
+
         if (durationSec >= 1.0f) {
-            val inFps = frameCountInput / durationSec
-            val outFps = frameCountOutput / durationSec
+            val inFps =
+                frameCountInput / durationSec
+
+            val outFps =
+                frameCountOutput / durationSec
+
             val resStr = when (resolution) {
                 RifeResolution.ORIGINAL -> "Original"
                 RifeResolution.RES_720P -> "720p"
@@ -287,7 +430,12 @@ class VideoFrameProcessor(
         outputSurface = holder.surface
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+    override fun surfaceChanged(
+        holder: SurfaceHolder,
+        format: Int,
+        width: Int,
+        height: Int
+    ) {
         outputSurface = holder.surface
     }
 
