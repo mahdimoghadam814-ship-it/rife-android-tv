@@ -102,8 +102,10 @@ class MediaPlaybackManager(
 
     fun setSubtitleOffset(offsetMs: Long) {
         val clampedOffset = offsetMs.coerceIn(-5000L, 5000L)
-        this.subtitleOffsetMs = clampedOffset
-        applyOffsetsToPlayer()
+        if (this.subtitleOffsetMs != clampedOffset) {
+            this.subtitleOffsetMs = clampedOffset
+            rebuildAndApplyMediaSource()
+        }
     }
 
     fun rebuildAndApplyMediaSource() {

@@ -1272,6 +1272,8 @@ int RIFE::process(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float ti
 
         if (opt.use_fp16_storage && opt.use_int8_storage)
         {
+            if (outimage.empty())
+                outimage.create(out_gpu.w, out_gpu.h, (size_t)channels, 1);
             out = ncnn::Mat(out_gpu.w, out_gpu.h, (unsigned char*)outimage.data, (size_t)channels, 1);
         }
 
@@ -1281,11 +1283,18 @@ int RIFE::process(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float ti
 
         if (!(opt.use_fp16_storage && opt.use_int8_storage))
         {
+            if (outimage.empty())
+            {
+                outimage = out;
+            }
+            else
+            {
 #if _WIN32
-            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
+                out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
-            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
+                out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
 #endif
+            }
         }
     }
 
@@ -2582,11 +2591,18 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
 
     // download
     {
+        if (outimage.empty())
+        {
+            outimage = out;
+        }
+        else
+        {
 #if _WIN32
-        out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
+            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
-        out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
+            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
 #endif
+        }
     }
 
     return 0;
@@ -3311,6 +3327,8 @@ int RIFE::process_v4(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float
 
         if (opt.use_fp16_storage && opt.use_int8_storage)
         {
+            if (outimage.empty())
+                outimage.create(out_gpu.w, out_gpu.h, (size_t)channels, 1);
             out = ncnn::Mat(out_gpu.w, out_gpu.h, (unsigned char*)outimage.data, (size_t)channels, 1);
         }
 
@@ -3320,11 +3338,18 @@ int RIFE::process_v4(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float
 
         if (!(opt.use_fp16_storage && opt.use_int8_storage))
         {
+            if (outimage.empty())
+            {
+                outimage = out;
+            }
+            else
+            {
 #if _WIN32
-            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
+                out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
-            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
+                out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
 #endif
+            }
         }
     }
 
@@ -4523,11 +4548,18 @@ int RIFE::process_v4_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, f
 
     // download
     {
+        if (outimage.empty())
+        {
+            outimage = out;
+        }
+        else
+        {
 #if _WIN32
-        out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
+            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
-        out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
+            out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB);
 #endif
+        }
     }
 
     return 0;
