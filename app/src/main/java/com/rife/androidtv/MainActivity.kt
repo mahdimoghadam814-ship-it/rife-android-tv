@@ -1,11 +1,14 @@
 package com.rife.androidtv
 
+import android.content.ContentUris
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.view.KeyEvent
 import android.view.View
 import android.widget.AdapterView
@@ -13,9 +16,15 @@ import android.widget.ArrayAdapter
 import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
 import androidx.media3.exoplayer.ExoPlayer
 import com.rife.androidtv.databinding.ActivityMainBinding
 
@@ -30,6 +39,10 @@ class MainActivity : AppCompatActivity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val hideControlsRunnable = Runnable { hidePlayerControls() }
+    private val hideSeekFeedbackRunnable = Runnable { binding.tvSeekFeedback.visibility = View.GONE }
+
+    private val mediaItemsList = mutableListOf<MediaFileItem>()
+    private lateinit var gridAdapter: VideoGridAdapter
 
     private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
@@ -41,18 +54,93 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        scanLocalMediaFiles()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
+        setupVideoGridBrowser()
         setupVideoFrameProcessor()
         setupPlayer()
         setupUIControls()
         setupResolutionSpinner()
         runDiagnosticsAndInitializeRife()
 
+        checkPermissionsAndLoadMedia()
         startProgressUpdater()
+    }
+
+    private fun setupVideoGridBrowser() {
+        gridAdapter = VideoGridAdapter(this, mediaItemsList)
+        binding.gridVideos.adapter = gridAdapter
+
+        binding.gridVideos.setOnItemClickListener { _, _, position, _ ->
+            if (position in mediaItemsList.indices) {
+                val item = mediaItemsList[position]
+                videoName = item.title
+                playVideo(item.uri)
+            }
+        }
+    }
+
+    private fun checkPermissionsAndLoadMedia() {
+        val permissionsToRequest = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(android.Manifest.permission.READ_MEDIA_VIDEO)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+            }
+        }
+
+        if (permissionsToRequest.isNotEmpty()) {
+            permissionLauncher.launch(permissionsToRequest.toTypedArray())
+        } else {
+            scanLocalMediaFiles()
+        }
+    }
+
+    private fun scanLocalMediaFiles() {
+        mediaItemsList.clear()
+        val projection = arrayOf(
+            MediaStore.Video.Media._ID,
+            MediaStore.Video.Media.DISPLAY_NAME,
+            MediaStore.Video.Media.SIZE
+        )
+
+        try {
+            contentResolver.query(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                projection,
+                null,
+                null,
+                "${MediaStore.Video.Media.DATE_ADDED} DESC"
+            )?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
+                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
+                val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
+
+                while (cursor.moveToNext()) {
+                    val id = cursor.getLong(idColumn)
+                    val name = cursor.getString(nameColumn) ?: "Video"
+                    val size = cursor.getLong(sizeColumn)
+                    val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
+
+                    val sizeMb = "%.1f MB".format(size / (1024.0 * 1024.0))
+                    mediaItemsList.add(MediaFileItem(contentUri, name, sizeMb, null))
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        gridAdapter.notifyDataSetChanged()
     }
 
     private fun setupVideoFrameProcessor() {
@@ -104,7 +192,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupUIControls() {
-        binding.btnOpenVideo.setOnClickListener {
+        binding.btnSystemFilePicker.setOnClickListener {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "video/*"
@@ -114,6 +202,7 @@ class MainActivity : AppCompatActivity() {
 
         binding.btnRunDiagnostic.setOnClickListener {
             binding.layoutDiagnosticDialog.visibility = View.VISIBLE
+            binding.btnCloseDiagnostic.requestFocus()
         }
 
         binding.btnCloseDiagnostic.setOnClickListener {
@@ -132,17 +221,43 @@ class MainActivity : AppCompatActivity() {
         }
 
         binding.btnRewind.setOnClickListener {
-            player?.let { p ->
-                p.seekTo((p.currentPosition - 10000).coerceAtLeast(0))
-            }
+            performSeek(-10000)
             showPlayerControls()
         }
 
         binding.btnForward.setOnClickListener {
-            player?.let { p ->
-                p.seekTo((p.currentPosition + 10000).coerceAtMost(p.duration))
-            }
+            performSeek(10000)
             showPlayerControls()
+        }
+
+        binding.btnAudioTracks.setOnClickListener {
+            showTrackSelectionDialog(C.TRACK_TYPE_AUDIO, "Audio Tracks")
+        }
+
+        binding.btnSubtitleTracks.setOnClickListener {
+            showTrackSelectionDialog(C.TRACK_TYPE_TEXT, "Subtitle Tracks")
+        }
+
+        binding.btnOpenSettings.setOnClickListener {
+            openSettingsOverlay()
+        }
+
+        binding.btnCloseSettings.setOnClickListener {
+            closeSettingsOverlay()
+        }
+
+        binding.btnSettingsAudioTrack.setOnClickListener {
+            showTrackSelectionDialog(C.TRACK_TYPE_AUDIO, "Audio Tracks")
+        }
+
+        binding.btnSettingsSubtitleTrack.setOnClickListener {
+            showTrackSelectionDialog(C.TRACK_TYPE_TEXT, "Subtitle Tracks")
+        }
+
+        binding.btnSettingsDiagnostics.setOnClickListener {
+            binding.layoutSettingsOverlay.visibility = View.GONE
+            binding.layoutDiagnosticDialog.visibility = View.VISIBLE
+            binding.btnCloseDiagnostic.requestFocus()
         }
 
         binding.seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -168,7 +283,6 @@ class MainActivity : AppCompatActivity() {
             binding.switchRife.text = if (isChecked) "ON" else "OFF"
 
             if (isChecked) {
-                // Attach player output to frame processor surface
                 videoFrameProcessor?.inputSurface?.let { surface ->
                     player?.setVideoSurface(surface)
                 }
@@ -200,7 +314,6 @@ class MainActivity : AppCompatActivity() {
                     else -> RifeResolution.ORIGINAL
                 }
                 videoFrameProcessor?.resolution = res
-                showPlayerControls()
             }
 
             override fun onNothingSelected(parent: AdapterView<*>?) {}
@@ -218,30 +331,155 @@ class MainActivity : AppCompatActivity() {
         showPlayerControls()
     }
 
+    private fun performSeek(offsetMs: Long) {
+        player?.let { p ->
+            val newPosition = (p.currentPosition + offsetMs).coerceIn(0, p.duration.coerceAtLeast(0))
+            p.seekTo(newPosition)
+
+            val text = if (offsetMs > 0) "+${offsetMs / 1000}s" else "${offsetMs / 1000}s"
+            binding.tvSeekFeedback.text = text
+            binding.tvSeekFeedback.visibility = View.VISIBLE
+
+            mainHandler.removeCallbacks(hideSeekFeedbackRunnable)
+            mainHandler.postDelayed(hideSeekFeedbackRunnable, 1200)
+        }
+    }
+
     private fun showPlayerControls() {
         binding.layoutPlayerControls.visibility = View.VISIBLE
+        binding.tvOverlayStats.visibility = View.VISIBLE
+        binding.btnPlayPause.requestFocus()
+
         mainHandler.removeCallbacks(hideControlsRunnable)
         mainHandler.postDelayed(hideControlsRunnable, 5000)
     }
 
     private fun hidePlayerControls() {
-        if (player?.isPlaying == true) {
+        if (player?.isPlaying == true && binding.layoutSettingsOverlay.visibility != View.VISIBLE && binding.layoutDiagnosticDialog.visibility != View.VISIBLE) {
             binding.layoutPlayerControls.visibility = View.GONE
+            binding.tvOverlayStats.visibility = View.GONE
         }
     }
 
+    private fun openSettingsOverlay() {
+        binding.layoutSettingsOverlay.visibility = View.VISIBLE
+        binding.spinnerResolution.requestFocus()
+    }
+
+    private fun closeSettingsOverlay() {
+        binding.layoutSettingsOverlay.visibility = View.GONE
+        if (binding.layoutPlayerControls.visibility == View.VISIBLE) {
+            binding.btnOpenSettings.requestFocus()
+        }
+    }
+
+    private fun showTrackSelectionDialog(trackType: Int, title: String) {
+        val p = player ?: return
+        val tracks = p.currentTracks
+
+        val trackGroups = mutableListOf<Tracks.Group>()
+        val trackNames = mutableListOf<String>()
+
+        trackNames.add("Disabled")
+
+        for (group in tracks.groups) {
+            if (group.type == trackType) {
+                trackGroups.add(group)
+                val mediaTrackGroup = group.mediaTrackGroup
+                for (i in 0 until mediaTrackGroup.length) {
+                    val format = mediaTrackGroup.getFormat(i)
+                    val label = format.label ?: format.language ?: "Track ${trackNames.size}"
+                    trackNames.add(label)
+                }
+            }
+        }
+
+        if (trackNames.size <= 1) {
+            Toast.makeText(this, "No embedded $title found in media", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+            .setTitle(title)
+            .setItems(trackNames.toTypedArray()) { dialog, which ->
+                if (which == 0) {
+                    p.trackSelectionParameters = p.trackSelectionParameters
+                        .buildUpon()
+                        .setTrackTypeDisabled(trackType, true)
+                        .build()
+                } else {
+                    var selectedIdx = 1
+                    for (group in trackGroups) {
+                        val mediaTrackGroup = group.mediaTrackGroup
+                        for (i in 0 until mediaTrackGroup.length) {
+                            if (selectedIdx == which) {
+                                p.trackSelectionParameters = p.trackSelectionParameters
+                                    .buildUpon()
+                                    .setTrackTypeDisabled(trackType, false)
+                                    .setOverrideForType(
+                                        TrackSelectionOverride(mediaTrackGroup, i)
+                                    )
+                                    .build()
+                                break
+                            }
+                            selectedIdx++
+                        }
+                    }
+                }
+                dialog.dismiss()
+            }
+            .show()
+    }
+
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        when (keyCode) {
-            KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_BUTTON_A -> {
-                if (binding.layoutPlayerControls.visibility != View.VISIBLE) {
+        if (binding.layoutDiagnosticDialog.visibility == View.VISIBLE) {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                binding.layoutDiagnosticDialog.visibility = View.GONE
+                return true
+            }
+            return super.onKeyDown(keyCode, event)
+        }
+
+        if (binding.layoutSettingsOverlay.visibility == View.VISIBLE) {
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                closeSettingsOverlay()
+                return true
+            }
+            return super.onKeyDown(keyCode, event)
+        }
+
+        if (binding.layoutFilePicker.visibility == View.VISIBLE) {
+            return super.onKeyDown(keyCode, event)
+        }
+
+        if (binding.layoutPlayerControls.visibility != View.VISIBLE) {
+            when (keyCode) {
+                KeyEvent.KEYCODE_DPAD_LEFT -> {
+                    performSeek(-10000)
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    performSeek(10000)
+                    return true
+                }
+                KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_BUTTON_A,
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> {
                     showPlayerControls()
                     return true
                 }
+                KeyEvent.KEYCODE_BACK -> {
+                    binding.layoutFilePicker.visibility = View.VISIBLE
+                    return true
+                }
             }
-            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                showPlayerControls()
+        } else {
+            showPlayerControls()
+            if (keyCode == KeyEvent.KEYCODE_BACK) {
+                hidePlayerControls()
+                return true
             }
         }
+
         return super.onKeyDown(keyCode, event)
     }
 
