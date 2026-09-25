@@ -38,18 +38,19 @@ jobs:
           ./gradlew assembleDebug --no-daemon
 
       - name: Upload Debug APK
-  uses: actions/upload-artifact@v4
-  with:
-    name: app-debug
-    path: app/build/outputs/apk/debug/app-debug.apk
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
 
-     - name: Upload Native Debug Symbols
-  uses: actions/upload-artifact@v4
-  with:
-    name: native-debug-symbols
-    path: |
-      app/build/intermediates/cxx/Debug/**/obj/**/lib/armeabi-v7a/librife_native.so
-      app/build/intermediates/cxx/Debug/**/obj/**/lib/arm64-v8a/librife_native.so
-      app/build/intermediates/cxx/Debug/**/obj/**/lib/armeabi-v7a/*.so
-      app/build/intermediates/cxx/Debug/**/obj/**/lib/arm64-v8a/*.so
-    if-no-files-found: warn
+      - name: Collect Native Libraries
+        run: |
+          mkdir -p native-libs
+          find app/build -type f -name "librife_native.so" -exec cp --parents {} native-libs/ \;
+
+      - name: Upload Native Libraries
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-libs
+          path: native-libs
+          if-no-files-found: warn
