@@ -40,5 +40,3 @@ jobs:
         with:
           name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
-
-بعد از Commit changes، برو به Actions و "Build Android TV RIFE APK" را انتخاب کن؛ باید Run workflow را ببینی.
