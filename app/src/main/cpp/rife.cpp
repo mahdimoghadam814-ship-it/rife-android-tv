@@ -78,48 +78,89 @@ RIFE::~RIFE()
 }
 
 #if _WIN32
-static void load_param_model(ncnn::Net& net, const std::wstring& modeldir, const wchar_t* name)
+static int load_param_model(ncnn::Net& net, const std::wstring& modeldir, const wchar_t* name)
 {
     wchar_t parampath[256];
     wchar_t modelpath[256];
     swprintf(parampath, 256, L"%s/%s.param", modeldir.c_str(), name);
     swprintf(modelpath, 256, L"%s/%s.bin", modeldir.c_str(), name);
 
+    fwprintf(stderr, L"RIFE: loading %ls\n", name);
+    fwprintf(stderr, L"RIFE: param=%ls\n", parampath);
+    fwprintf(stderr, L"RIFE: model=%ls\n", modelpath);
+
+    FILE* fp = _wfopen(parampath, L"rb");
+    if (!fp)
     {
-        FILE* fp = _wfopen(parampath, L"rb");
-        if (!fp)
-        {
-            fwprintf(stderr, L"_wfopen %ls failed\n", parampath);
-        }
-
-        net.load_param(fp);
-
-        fclose(fp);
+        fwprintf(stderr, L"RIFE: ERROR opening %ls\n", parampath);
+        return -1;
     }
+
+    const int param_ret = net.load_param(fp);
+    fclose(fp);
+
+    if (param_ret != 0)
     {
-        FILE* fp = _wfopen(modelpath, L"rb");
-        if (!fp)
-        {
-            fwprintf(stderr, L"_wfopen %ls failed\n", modelpath);
-        }
-
-        net.load_model(fp);
-
-        fclose(fp);
+        fwprintf(stderr, L"RIFE: ERROR loading %ls.param, return=%d\n", name, param_ret);
+        return param_ret;
     }
+
+    fwprintf(stderr, L"RIFE: %ls.param loaded successfully\n", name);
+
+    fp = _wfopen(modelpath, L"rb");
+    if (!fp)
+    {
+        fwprintf(stderr, L"RIFE: ERROR opening %ls\n", modelpath);
+        return -2;
+    }
+
+    const int model_ret = net.load_model(fp);
+    fclose(fp);
+
+    if (model_ret != 0)
+    {
+        fwprintf(stderr, L"RIFE: ERROR loading %ls.bin, return=%d\n", name, model_ret);
+        return model_ret;
+    }
+
+    fwprintf(stderr, L"RIFE: %ls.bin loaded successfully\n", name);
+    return 0;
 }
 #else
-static void load_param_model(ncnn::Net& net, const std::string& modeldir, const char* name)
+static int load_param_model(ncnn::Net& net, const std::string& modeldir, const char* name)
 {
     char parampath[256];
     char modelpath[256];
     sprintf(parampath, "%s/%s.param", modeldir.c_str(), name);
     sprintf(modelpath, "%s/%s.bin", modeldir.c_str(), name);
 
-    net.load_param(parampath);
-    net.load_model(modelpath);
+    fprintf(stderr, "RIFE: loading %s\n", name);
+    fprintf(stderr, "RIFE: param=%s\n", parampath);
+    fprintf(stderr, "RIFE: model=%s\n", modelpath);
+
+    const int param_ret = net.load_param(parampath);
+
+    if (param_ret != 0)
+    {
+        fprintf(stderr, "RIFE: ERROR loading %s.param, return=%d\n", name, param_ret);
+        return param_ret;
+    }
+
+    fprintf(stderr, "RIFE: %s.param loaded successfully\n", name);
+
+    const int model_ret = net.load_model(modelpath);
+
+    if (model_ret != 0)
+    {
+        fprintf(stderr, "RIFE: ERROR loading %s.bin, return=%d\n", name, model_ret);
+        return model_ret;
+    }
+
+    fprintf(stderr, "RIFE: %s.bin loaded successfully\n", name);
+    return 0;
 }
 #endif
+
 
 #if _WIN32
 int RIFE::load(const std::wstring& modeldir)
@@ -148,18 +189,56 @@ int RIFE::load(const std::string& modeldir)
     fusionnet.register_custom_layer("rife.Warp", Warp_layer_creator);
 
 #if _WIN32
-    load_param_model(flownet, modeldir, L"flownet");
+    {
+        const int ret = load_param_model(flownet, modeldir, L"flownet");
+        if (ret != 0)
+        {
+            fprintf(stderr, "RIFE: flownet load failed, return=%d\n", ret);
+            return -10;
+        }
+    }
+
     if (!rife_v4)
     {
-        load_param_model(contextnet, modeldir, L"contextnet");
-        load_param_model(fusionnet, modeldir, L"fusionnet");
+        const int context_ret = load_param_model(contextnet, modeldir, L"contextnet");
+        if (context_ret != 0)
+        {
+            fprintf(stderr, "RIFE: contextnet load failed, return=%d\n", context_ret);
+            return -20;
+        }
+
+        const int fusion_ret = load_param_model(fusionnet, modeldir, L"fusionnet");
+        if (fusion_ret != 0)
+        {
+            fprintf(stderr, "RIFE: fusionnet load failed, return=%d\n", fusion_ret);
+            return -30;
+        }
     }
 #else
-    load_param_model(flownet, modeldir, "flownet");
+    {
+        const int ret = load_param_model(flownet, modeldir, "flownet");
+        if (ret != 0)
+        {
+            fprintf(stderr, "RIFE: flownet load failed, return=%d\n", ret);
+            return -10;
+        }
+    }
+
     if (!rife_v4)
     {
-        load_param_model(contextnet, modeldir, "contextnet");
-        load_param_model(fusionnet, modeldir, "fusionnet");
+        const int context_ret = load_param_model(contextnet, modeldir, "contextnet");
+        if (context_ret != 0)
+        {
+            fprintf(stderr, "RIFE: contextnet load failed, return=%d\n", context_ret);
+            return -20;
+        }
+
+        const int fusion_ret = load_param_model(fusionnet, modeldir, "fusionnet");
+        if (fusion_ret != 0)
+        {
+            fprintf(stderr, "RIFE: fusionnet load failed, return=%d\n", fusion_ret);
+            return -30;
+        }
     }
 #endif
 
