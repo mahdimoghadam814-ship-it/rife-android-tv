@@ -2425,7 +2425,12 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
             std::vector<ncnn::Mat> inputs(1);
             inputs[0] = flow;
             std::vector<ncnn::Mat> outputs(2);
-            rife_v2_slice_flow->forward(inputs, outputs, opt);
+            LOGE("[RIFE-DEBUG] BEFORE slice_flow forward");
+            int ret_slice = rife_v2_slice_flow->forward(inputs, outputs, opt);
+            LOGE("[RIFE-DEBUG] AFTER slice_flow ret=%d out0=%d:%dx%dx%d out1=%d:%dx%dx%d",
+                 ret_slice,
+                 outputs[0].empty() ? 1 : 0, outputs[0].w, outputs[0].h, outputs[0].c,
+                 outputs[1].empty() ? 1 : 0, outputs[1].w, outputs[1].h, outputs[1].c);
             flow0 = outputs[0];
             flow1 = outputs[1];
         }
@@ -2445,10 +2450,22 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
             {
                 ex.input("flow.0", flow);
             }
-            ex.extract("f1", ctx0[0]);
-            ex.extract("f2", ctx0[1]);
-            ex.extract("f3", ctx0[2]);
-            ex.extract("f4", ctx0[3]);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet0 f1");
+            int ret_ctx0_f1 = ex.extract("f1", ctx0[0]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet0 f1 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx0_f1, ctx0[0].empty() ? 1 : 0, ctx0[0].w, ctx0[0].h, ctx0[0].c);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet0 f2");
+            int ret_ctx0_f2 = ex.extract("f2", ctx0[1]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet0 f2 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx0_f2, ctx0[1].empty() ? 1 : 0, ctx0[1].w, ctx0[1].h, ctx0[1].c);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet0 f3");
+            int ret_ctx0_f3 = ex.extract("f3", ctx0[2]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet0 f3 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx0_f3, ctx0[2].empty() ? 1 : 0, ctx0[2].w, ctx0[2].h, ctx0[2].c);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet0 f4");
+            int ret_ctx0_f4 = ex.extract("f4", ctx0[3]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet0 f4 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx0_f4, ctx0[3].empty() ? 1 : 0, ctx0[3].w, ctx0[3].h, ctx0[3].c);
         }
         {
             ncnn::Extractor ex = contextnet.create_extractor();
@@ -2462,10 +2479,22 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
             {
                 ex.input("flow.1", flow);
             }
-            ex.extract("f1", ctx1[0]);
-            ex.extract("f2", ctx1[1]);
-            ex.extract("f3", ctx1[2]);
-            ex.extract("f4", ctx1[3]);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet1 f1");
+            int ret_ctx1_f1 = ex.extract("f1", ctx1[0]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet1 f1 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx1_f1, ctx1[0].empty() ? 1 : 0, ctx1[0].w, ctx1[0].h, ctx1[0].c);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet1 f2");
+            int ret_ctx1_f2 = ex.extract("f2", ctx1[1]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet1 f2 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx1_f2, ctx1[1].empty() ? 1 : 0, ctx1[1].w, ctx1[1].h, ctx1[1].c);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet1 f3");
+            int ret_ctx1_f3 = ex.extract("f3", ctx1[2]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet1 f3 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx1_f3, ctx1[2].empty() ? 1 : 0, ctx1[2].w, ctx1[2].h, ctx1[2].c);
+            LOGE("[RIFE-DEBUG] BEFORE contextnet1 f4");
+            int ret_ctx1_f4 = ex.extract("f4", ctx1[3]);
+            LOGE("[RIFE-DEBUG] AFTER contextnet1 f4 ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_ctx1_f4, ctx1[3].empty() ? 1 : 0, ctx1[3].w, ctx1[3].h, ctx1[3].c);
         }
 
         // fusionnet
@@ -2485,7 +2514,10 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
             ex.input("9", ctx1[2]);
             ex.input("10", ctx1[3]);
 
-            ex.extract("output", out_padded);
+            LOGE("[RIFE-DEBUG] BEFORE fusionnet output");
+            int ret_fusion = ex.extract("output", out_padded);
+            LOGE("[RIFE-DEBUG] AFTER fusionnet output ret=%d empty=%d w=%d h=%d c=%d",
+                 ret_fusion, out_padded.empty() ? 1 : 0, out_padded.w, out_padded.h, out_padded.c);
         }
 
         ncnn::Mat out_padded_reversed;
