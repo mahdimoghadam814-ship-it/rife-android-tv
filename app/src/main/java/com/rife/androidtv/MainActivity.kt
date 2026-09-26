@@ -11,13 +11,42 @@ import android.view.Surface
 import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
-import android.widget.AdapterView
-import android.widget.ArrayAdapter
-import android.widget.SeekBar
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
@@ -27,6 +56,10 @@ import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import com.rife.androidtv.databinding.ActivityMainBinding
+import com.rife.androidtv.ui.components.EngineStatusOverlay
+import com.rife.androidtv.ui.components.NextPlayerControls
+import com.rife.androidtv.ui.components.NextPlayerSettingsSheet
+import com.rife.androidtv.ui.theme.NextPlayerTheme
 
 @androidx.media3.common.util.UnstableApi
 class MainActivity : AppCompatActivity() {
@@ -42,26 +75,40 @@ class MainActivity : AppCompatActivity() {
     private var videoName = "None"
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val hideControlsRunnable = Runnable { hidePlayerControls() }
-    private val hideSeekFeedbackRunnable = Runnable { binding.tvSeekFeedback.visibility = View.GONE }
 
-    /**
-     * Guards the RIFE / FastDVDnet switch listeners against the extra callback that
-     * `Switch.setChecked()` triggers while the listener is normalising a state (for example when the
-     * RIFE model is not loaded). Without it the same transition would be applied twice.
-     */
-    private var isUpdatingProcessingSwitches = false
+    // Compose State Holders
+    private val isControlsVisible = mutableStateOf(true)
+    private val isSettingsOpen = mutableStateOf(false)
+    private val isEngineOverlayVisible = mutableStateOf(false)
+    private val isVideoLoaded = mutableStateOf(false)
+    private val isPlayingState = mutableStateOf(false)
+    private val currentTimeMsState = mutableStateOf(0L)
+    private val durationMsState = mutableStateOf(0L)
+    private val isRifeEnabledState = mutableStateOf(false)
+    private val isFastDvdNetEnabledState = mutableStateOf(false)
+    private val rifeResolutionState = mutableStateOf(RifeResolution.ORIGINAL)
+    private val audioOffsetState = mutableStateOf(0L)
+    private val subtitleOffsetState = mutableStateOf(0L)
+    private val currentStatsState = mutableStateOf<Statistics?>(null)
+
+    private val hideControlsRunnable = Runnable {
+        if (isPlayingState.value && !isSettingsOpen.value) {
+            isControlsVisible.value = false
+        }
+    }
+
+    private val hideEngineOverlayRunnable = Runnable {
+        isEngineOverlayVisible.value = false
+    }
 
     private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
             val uri: Uri? = result.data?.data
             uri?.let {
                 videoName = it.lastPathSegment ?: "Local Video"
-                // A new video invalidates every buffered frame of the previous one, independently of
-                // the player callbacks, which may not fire for an identical media source.
                 videoFrameProcessor?.resetForNewStream("new_video_selected")
                 mediaPlaybackManager?.setVideoSource(it)
-                binding.layoutFilePicker.visibility = View.GONE
+                isVideoLoaded.value = true
                 showPlayerControls()
             }
         }
@@ -98,9 +145,8 @@ class MainActivity : AppCompatActivity() {
 
         setupVideoFrameProcessor()
         setupPlayer()
-        setupUIControls()
-        setupResolutionSpinner()
         runDiagnosticsAndInitializeRife()
+        setupComposeUI()
 
         startProgressUpdater()
     }
@@ -110,19 +156,7 @@ class MainActivity : AppCompatActivity() {
             displaySurfaceView = binding.displaySurfaceView,
             onStatisticsUpdated = { stats ->
                 runOnUiThread {
-                    val audioOff = mediaPlaybackManager?.audioOffsetMs ?: 0L
-                    val subOff = mediaPlaybackManager?.subtitleOffsetMs ?: 0L
-                    val extAud = if (mediaPlaybackManager?.isExternalAudioSelected == true) mediaPlaybackManager?.externalAudioName else "None"
-                    val extSub = if (mediaPlaybackManager?.isExternalSubtitleEnabled == true) mediaPlaybackManager?.externalSubtitleName else "None"
-
-                    binding.tvOverlayStats.text = """
-                        Video: $videoName
-                        Ext Audio: $extAud | Ext Sub: $extSub
-                        Audio Offset: ${audioOff}ms | Sub Offset: ${subOff}ms
-                        Input FPS: ${"%.1f".format(stats.inputFps)} | Output FPS: ${"%.1f".format(stats.outputFps)}
-                        Resolution: ${stats.currentResolution} | RIFE: ${if (videoFrameProcessor?.isRifeEnabled == true) "ON" else "OFF"} | FastDVDnet (scaffold): ${if (videoFrameProcessor?.fastDvdNetEngine?.isEnabled == true) "ON" else "OFF"}
-                        Processing Time: ${stats.processingTimeMs} ms | Dropped: ${stats.droppedFrames}
-                    """.trimIndent()
+                    currentStatsState.value = stats
                 }
             },
             onError = { error ->
@@ -131,36 +165,20 @@ class MainActivity : AppCompatActivity() {
                 }
             },
             onInputSurfaceCreated = { surface ->
-                // Called on the main thread by the processor. The processor owns this Surface: it is
-                // only attached while a processing stage is intercepting frames, and the processor is
-                // told once the player has actually taken it over.
                 attachProcessingInputSurface(surface)
             },
             onInputSurfaceFailed = {
-                // No input surface means no decoded frames can be intercepted. Rather than leaving the
-                // processing output surface in front of the user with a stale picture, both stages
-                // are switched off and normal PlayerView playback is restored.
                 fallBackToNormalPlayback("Input surface unavailable, processing disabled")
             }
         )
         videoFrameProcessor?.start()
     }
 
-    /**
-     * Single place where the video output surface is decided.
-     *
-     * While RIFE or FastDVDnet is on, the processor owns the input Surface and the decoded frames
-     * are rendered into it, with the processed result drawn on [displaySurfaceView]. While both are
-     * off, normal PlayerView playback is restored through the explicit Media3 surface setters — no
-     * `setVideoSurface(null)` + `PlayerView.setPlayer(player)` dance, which is a no-op when the
-     * PlayerView already owns the same player instance, and no second competing output surface.
-     */
     private fun applyProcessingSurfaces() {
         val processor = videoFrameProcessor ?: return
         val currentPlayer = player ?: return
 
         if (processor.isProcessingEnabled) {
-            // Show the processing output surface first so the processor has somewhere to render to.
             binding.displaySurfaceView.visibility = View.VISIBLE
             binding.playerView.visibility = View.GONE
             processor.rifeInputSurface?.let { surface ->
@@ -168,69 +186,43 @@ class MainActivity : AppCompatActivity() {
                 processor.onInputSurfaceAttached()
             }
         } else {
-            // The processor has already released its output surface and dropped its frames.
             binding.displaySurfaceView.visibility = View.GONE
             binding.playerView.visibility = View.VISIBLE
             restorePlayerSurface()
         }
     }
 
-    /**
-     * Attaches the processor-owned input Surface to the player so that MediaCodec decodes straight
-     * into the processing pipeline. Called for every surface the processor hands over, including the
-     * re-created ones after a toggle.
-     */
     private fun attachProcessingInputSurface(surface: Surface) {
         val currentPlayer = player ?: return
         val processor = videoFrameProcessor ?: return
         if (!processor.isProcessingEnabled) {
-            // Processing was switched off again before the worker finished creating the surface.
             return
         }
         currentPlayer.setVideoSurface(surface)
         processor.onInputSurfaceAttached()
     }
 
-    /**
-     * Gives rendering back to the PlayerView after both processing stages have been switched off.
-     *
-     * The surface is never left detached: the PlayerView's own SurfaceView/TextureView is handed
-     * back to the player through the explicit Media3 setters, which also replaces the processor's
-     * surface instead of adding a second one.
-     */
     private fun restorePlayerSurface() {
         val currentPlayer = player ?: return
-        // The processor must know that the player no longer writes into its surface, otherwise the
-        // next enable would assume the surface is still attached and skip re-creating it.
         videoFrameProcessor?.onInputSurfaceDetached()
         when (val playerViewSurface = binding.playerView.getVideoSurfaceView()) {
             is SurfaceView -> {
                 currentPlayer.clearVideoSurface()
                 currentPlayer.setVideoSurfaceView(playerViewSurface)
             }
-
             is TextureView -> {
                 currentPlayer.clearVideoSurface()
                 currentPlayer.setVideoTextureView(playerViewSurface)
             }
-
             else -> {
                 Toast.makeText(this, "Could not restore the player surface", Toast.LENGTH_LONG).show()
             }
         }
     }
 
-    /**
-     * Safety net for the "the processor cannot intercept frames" case: both stages are switched off,
-     * the switches are brought back in sync and the PlayerView is restored.
-     */
     private fun fallBackToNormalPlayback(reason: String) {
-        isUpdatingProcessingSwitches = true
-        binding.switchRife.isChecked = false
-        binding.switchFastDvdNet.isChecked = false
-        isUpdatingProcessingSwitches = false
-        binding.switchRife.text = "OFF"
-        binding.switchFastDvdNet.text = "OFF"
+        isRifeEnabledState.value = false
+        isFastDvdNetEnabledState.value = false
 
         videoFrameProcessor?.setRifeEnabled(false)
         videoFrameProcessor?.setFastDvdNetEnabled(false)
@@ -259,17 +251,12 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
-                binding.btnPlayPause.text = if (isPlaying) "Pause" else "Play"
-                if (isPlaying) {
-                    binding.layoutFilePicker.visibility = View.GONE
-                }
+                isPlayingState.value = isPlaying
             }
 
             override fun onPlaybackStateChanged(playbackState: Int) {
                 if (playbackState == Player.STATE_READY) {
-                    val duration = player?.duration ?: 0L
-                    binding.seekBar.max = duration.toInt()
-                    binding.tvDuration.text = formatTime(duration)
+                    durationMsState.value = player?.duration ?: 0L
                 }
             }
 
@@ -277,12 +264,6 @@ class MainActivity : AppCompatActivity() {
                 Toast.makeText(this@MainActivity, "Playback Error: ${error.message}", Toast.LENGTH_LONG).show()
             }
 
-            /**
-             * K3: a seek must not interpolate a frame from before the seek against the first frame
-             * after it, so every frame of pipeline state is dropped on a position discontinuity.
-             * All seek entry points (seek bar, -10s/+10s, D-pad) end up here, so this stays the one
-             * place that resets on a seek.
-             */
             override fun onPositionDiscontinuity(
                 oldPosition: Player.PositionInfo,
                 newPosition: Player.PositionInfo,
@@ -296,267 +277,213 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            /** K3: a new media item must not be paired with frames of the previous one. */
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 videoFrameProcessor?.resetForNewStream("media_item_transition_$reason")
             }
 
-            /** The decoded size drives the real readback size used before RIFE. */
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 videoFrameProcessor?.setInputFrameSize(videoSize.width, videoSize.height)
             }
         })
     }
 
-    private fun setupUIControls() {
-        binding.btnOpenVideo.setOnClickListener {
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "video/*"
-            }
-            filePickerLauncher.launch(intent)
-        }
+    @OptIn(ExperimentalMaterial3Api::class)
+    private fun setupComposeUI() {
+        binding.composeView.setContent {
+            NextPlayerTheme {
+                val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-        binding.btnExtAudio.setOnClickListener {
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "audio/*"
-            }
-            audioPickerLauncher.launch(intent)
-        }
+                Box(modifier = Modifier.fillMaxSize()) {
+                    // INITIAL HOME / NO VIDEO STATE
+                    if (!isVideoLoaded.value) {
+                        Surface(
+                            modifier = Modifier.fillMaxSize(),
+                            color = MaterialTheme.colorScheme.background
+                        ) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Text(
+                                        text = "Next Player",
+                                        style = MaterialTheme.typography.headlineLarge.copy(
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
 
-        binding.btnExtSub.setOnClickListener {
-            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                addCategory(Intent.CATEGORY_OPENABLE)
-                type = "*/*"
-            }
-            subPickerLauncher.launch(intent)
-        }
+                                    Spacer(modifier = Modifier.height(24.dp))
 
-        binding.btnAudioDelayMinus.setOnClickListener {
-            val current = mediaPlaybackManager?.audioOffsetMs ?: 0L
-            val updated = (current - 500L).coerceAtLeast(-5000L)
-            mediaPlaybackManager?.setAudioOffset(updated)
-            binding.tvAudioDelay.text = "A: ${updated}ms"
-            showPlayerControls()
-        }
+                                    Button(
+                                        onClick = { launchFilePicker() },
+                                        modifier = Modifier.width(240.dp)
+                                    ) {
+                                        Icon(imageVector = Icons.Default.FolderOpen, contentDescription = null)
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        Text("Open Video File")
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        // NEXT PLAYER CONTROLS OVERLAY
+                        NextPlayerControls(
+                            visible = isControlsVisible.value,
+                            isPlaying = isPlayingState.value,
+                            title = videoName,
+                            currentTimeMs = currentTimeMsState.value,
+                            durationMs = durationMsState.value,
+                            onPlayPauseToggle = { togglePlayPause() },
+                            onSeek = { offsetMs -> performSeek(offsetMs) },
+                            onSeekTo = { targetMs ->
+                                player?.seekTo(targetMs)
+                                currentTimeMsState.value = targetMs
+                            },
+                            onOpenFile = { launchFilePicker() },
+                            onOpenAudioTracks = { showTrackSelectionDialog(C.TRACK_TYPE_AUDIO, "Audio Tracks") },
+                            onOpenSubTracks = { showTrackSelectionDialog(C.TRACK_TYPE_TEXT, "Subtitle Tracks") },
+                            onOpenSettings = { isSettingsOpen.value = true },
+                            onUserInteraction = { showPlayerControls() }
+                        )
 
-        binding.btnAudioDelayPlus.setOnClickListener {
-            val current = mediaPlaybackManager?.audioOffsetMs ?: 0L
-            val updated = (current + 500L).coerceAtMost(5000L)
-            mediaPlaybackManager?.setAudioOffset(updated)
-            binding.tvAudioDelay.text = "A: ${updated}ms"
-            showPlayerControls()
-        }
+                        // 5-SECOND TEMPORARY ENGINE STATUS OVERLAY (TOP LEFT)
+                        EngineStatusOverlay(
+                            visible = isEngineOverlayVisible.value,
+                            videoName = videoName,
+                            extAudioName = if (mediaPlaybackManager?.isExternalAudioSelected == true) mediaPlaybackManager?.externalAudioName ?: "None" else "None",
+                            extSubName = if (mediaPlaybackManager?.isExternalSubtitleEnabled == true) mediaPlaybackManager?.externalSubtitleName ?: "None" else "None",
+                            audioOffsetMs = audioOffsetState.value,
+                            subOffsetMs = subtitleOffsetState.value,
+                            isRifeEnabled = isRifeEnabledState.value,
+                            isFastDvdNetEnabled = isFastDvdNetEnabledState.value,
+                            stats = currentStatsState.value,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(16.dp)
+                        )
 
-        binding.btnSubDelayMinus.setOnClickListener {
-            val current = mediaPlaybackManager?.subtitleOffsetMs ?: 0L
-            val updated = (current - 500L).coerceAtLeast(-5000L)
-            mediaPlaybackManager?.setSubtitleOffset(updated)
-            binding.tvSubDelay.text = "S: ${updated}ms"
-            showPlayerControls()
-        }
-
-        binding.btnSubDelayPlus.setOnClickListener {
-            val current = mediaPlaybackManager?.subtitleOffsetMs ?: 0L
-            val updated = (current + 500L).coerceAtMost(5000L)
-            mediaPlaybackManager?.setSubtitleOffset(updated)
-            binding.tvSubDelay.text = "S: ${updated}ms"
-            showPlayerControls()
-        }
-
-        binding.btnRunDiagnostic.setOnClickListener {
-            binding.layoutDiagnosticDialog.visibility = View.VISIBLE
-            binding.btnCloseDiagnostic.requestFocus()
-        }
-
-        binding.btnCloseDiagnostic.setOnClickListener {
-            binding.layoutDiagnosticDialog.visibility = View.GONE
-        }
-
-        binding.btnPlayPause.setOnClickListener {
-            player?.let { p ->
-                if (p.isPlaying) {
-                    p.pause()
-                } else {
-                    p.play()
+                        // NEXT PLAYER SETTINGS SHEET
+                        if (isSettingsOpen.value) {
+                            NextPlayerSettingsSheet(
+                                sheetState = sheetState,
+                                onDismissRequest = { isSettingsOpen.value = false },
+                                isRifeEnabled = isRifeEnabledState.value,
+                                onRifeToggle = { enabled -> toggleRife(enabled) },
+                                rifeResolution = rifeResolutionState.value,
+                                onResolutionSelect = { res -> setResolution(res) },
+                                isFastDvdNetEnabled = isFastDvdNetEnabledState.value,
+                                onFastDvdNetToggle = { enabled -> toggleFastDvdNet(enabled) },
+                                onOpenAudioTracks = { showTrackSelectionDialog(C.TRACK_TYPE_AUDIO, "Audio Tracks") },
+                                onOpenSubTracks = { showTrackSelectionDialog(C.TRACK_TYPE_TEXT, "Subtitle Tracks") },
+                                onOpenExternalAudio = { launchAudioPicker() },
+                                onOpenExternalSub = { launchSubPicker() },
+                                audioOffsetMs = audioOffsetState.value,
+                                onAudioOffsetChange = { offset -> setAudioOffset(offset) },
+                                subtitleOffsetMs = subtitleOffsetState.value,
+                                onSubtitleOffsetChange = { offset -> setSubtitleOffset(offset) }
+                            )
+                        }
+                    }
                 }
             }
-            showPlayerControls()
-        }
-
-        binding.btnRewind.setOnClickListener {
-            performSeek(-SEEK_STEP_MS)
-            showPlayerControls()
-        }
-
-        binding.btnForward.setOnClickListener {
-            performSeek(SEEK_STEP_MS)
-            showPlayerControls()
-        }
-
-        binding.btnOpenSettings.setOnClickListener {
-            openSettingsOverlay()
-        }
-
-        binding.btnCloseSettings.setOnClickListener {
-            closeSettingsOverlay()
-        }
-
-        binding.btnSettingsAudioTrack.setOnClickListener {
-            showTrackSelectionDialog(C.TRACK_TYPE_AUDIO, "Audio Tracks")
-        }
-
-        binding.btnSettingsSubtitleTrack.setOnClickListener {
-            showTrackSelectionDialog(C.TRACK_TYPE_TEXT, "Subtitle Tracks")
-        }
-
-        binding.btnSettingsDiagnostics.setOnClickListener {
-            binding.layoutSettingsOverlay.visibility = View.GONE
-            binding.layoutDiagnosticDialog.visibility = View.VISIBLE
-            binding.btnCloseDiagnostic.requestFocus()
-        }
-
-        binding.seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser) {
-                    // The processor state is dropped by onPositionDiscontinuity below, so this path
-                    // does not reset the pipeline a second time.
-                    player?.seekTo(progress.toLong())
-                    binding.tvCurrentTime.text = formatTime(progress.toLong())
-                }
-            }
-
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
-
-        binding.switchFastDvdNet.setOnCheckedChangeListener { _, isChecked ->
-            if (isUpdatingProcessingSwitches) {
-                return@setOnCheckedChangeListener
-            }
-            // Reseeds the pipeline: frames captured with a different stage combination must not be
-            // paired with frames captured after the toggle.
-            videoFrameProcessor?.setFastDvdNetEnabled(isChecked)
-            binding.switchFastDvdNet.text = if (isChecked) "ON" else "OFF"
-            applyProcessingSurfaces()
-            if (isChecked) {
-                Toast.makeText(
-                    this,
-                    "FastDVDnet pre-processing active (scaffold: frames pass through)",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-            showPlayerControls()
-        }
-
-        binding.switchRife.setOnCheckedChangeListener { _, isChecked ->
-            if (isUpdatingProcessingSwitches) {
-                return@setOnCheckedChangeListener
-            }
-            if (isChecked && !isRifeModelLoaded) {
-                isUpdatingProcessingSwitches = true
-                binding.switchRife.isChecked = false
-                isUpdatingProcessingSwitches = false
-                Toast.makeText(this, "Cannot enable RIFE: Model not loaded.", Toast.LENGTH_LONG).show()
-                return@setOnCheckedChangeListener
-            }
-
-            binding.switchRife.text = if (isChecked) "ON" else "OFF"
-
-            // Resets every piece of pipeline state and (re)creates the Media3 input surface, which
-            // comes back through onInputSurfaceCreated -> attachProcessingInputSurface().
-            videoFrameProcessor?.setRifeEnabled(isChecked)
-            applyProcessingSurfaces()
-
-            val processingOn = videoFrameProcessor?.isProcessingEnabled == true
-            Toast.makeText(
-                this,
-                if (processingOn) "RIFE Frame Interpolation Active" else "Normal ExoPlayer Playback Active",
-                Toast.LENGTH_SHORT
-            ).show()
-            showPlayerControls()
         }
     }
 
-    private fun setupResolutionSpinner() {
-        val options = arrayOf("Original", "1080p", "720p", "480p")
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, options)
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        binding.spinnerResolution.adapter = adapter
-
-        binding.spinnerResolution.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                val res = when (position) {
-                    1 -> RifeResolution.RES_1080P
-                    2 -> RifeResolution.RES_720P
-                    3 -> RifeResolution.RES_480P
-                    else -> RifeResolution.ORIGINAL
-                }
-                videoFrameProcessor?.resolution = res
-                showPlayerControls()
-            }
-
-            override fun onNothingSelected(parent: AdapterView<*>?) {}
+    private fun launchFilePicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "video/*"
         }
+        filePickerLauncher.launch(intent)
     }
 
-    /**
-     * Seeks by [offsetMs] and shows the on-screen seek feedback. The pipeline reset is intentionally
-     * not done here: `onPositionDiscontinuity` is the single reset point for every seek.
-     */
+    private fun launchAudioPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "audio/*"
+        }
+        audioPickerLauncher.launch(intent)
+    }
+
+    private fun launchSubPicker() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+        }
+        subPickerLauncher.launch(intent)
+    }
+
+    private fun togglePlayPause() {
+        player?.let { p ->
+            if (p.isPlaying) {
+                p.pause()
+            } else {
+                p.play()
+            }
+        }
+        showPlayerControls()
+    }
+
     private fun performSeek(offsetMs: Long) {
         player?.let { p ->
-            val newPosition = (p.currentPosition + offsetMs)
-                .coerceIn(0, p.duration.coerceAtLeast(0))
+            val newPosition = (p.currentPosition + offsetMs).coerceIn(0, p.duration.coerceAtLeast(0))
             p.seekTo(newPosition)
-
-            val text = if (offsetMs > 0) {
-                "+${offsetMs / 1000}s"
-            } else {
-                "${offsetMs / 1000}s"
-            }
-
-            binding.tvSeekFeedback.text = text
-            binding.tvSeekFeedback.visibility = View.VISIBLE
-
-            mainHandler.removeCallbacks(hideSeekFeedbackRunnable)
-            mainHandler.postDelayed(hideSeekFeedbackRunnable, 1200)
+            currentTimeMsState.value = newPosition
         }
+        showPlayerControls()
+    }
+
+    private fun toggleRife(enabled: Boolean) {
+        if (enabled && !isRifeModelLoaded) {
+            Toast.makeText(this, "Cannot enable RIFE: Model not loaded.", Toast.LENGTH_LONG).show()
+            isRifeEnabledState.value = false
+            return
+        }
+
+        isRifeEnabledState.value = enabled
+        videoFrameProcessor?.setRifeEnabled(enabled)
+        applyProcessingSurfaces()
+
+        triggerEngineStatusOverlay()
+        showPlayerControls()
+    }
+
+    private fun toggleFastDvdNet(enabled: Boolean) {
+        isFastDvdNetEnabledState.value = enabled
+        videoFrameProcessor?.setFastDvdNetEnabled(enabled)
+        applyProcessingSurfaces()
+
+        triggerEngineStatusOverlay()
+        showPlayerControls()
+    }
+
+    private fun setResolution(res: RifeResolution) {
+        rifeResolutionState.value = res
+        videoFrameProcessor?.resolution = res
+        triggerEngineStatusOverlay()
+        showPlayerControls()
+    }
+
+    private fun setAudioOffset(offsetMs: Long) {
+        audioOffsetState.value = offsetMs
+        mediaPlaybackManager?.setAudioOffset(offsetMs)
+        triggerEngineStatusOverlay()
+    }
+
+    private fun setSubtitleOffset(offsetMs: Long) {
+        subtitleOffsetState.value = offsetMs
+        mediaPlaybackManager?.setSubtitleOffset(offsetMs)
+        triggerEngineStatusOverlay()
+    }
+
+    private fun triggerEngineStatusOverlay() {
+        isEngineOverlayVisible.value = true
+        mainHandler.removeCallbacks(hideEngineOverlayRunnable)
+        mainHandler.postDelayed(hideEngineOverlayRunnable, 5000)
     }
 
     private fun showPlayerControls() {
-        binding.layoutPlayerControls.visibility = View.VISIBLE
-        binding.tvOverlayStats.visibility = View.VISIBLE
-        // Never steal the focus out of the settings overlay while it is open.
-        if (binding.layoutSettingsOverlay.visibility != View.VISIBLE) {
-            binding.btnPlayPause.requestFocus()
-        }
-
+        isControlsVisible.value = true
         mainHandler.removeCallbacks(hideControlsRunnable)
         mainHandler.postDelayed(hideControlsRunnable, 5000)
-    }
-
-    private fun hidePlayerControls() {
-        if (player?.isPlaying == true &&
-            binding.layoutSettingsOverlay.visibility != View.VISIBLE &&
-            binding.layoutDiagnosticDialog.visibility != View.VISIBLE
-        ) {
-            binding.layoutPlayerControls.visibility = View.GONE
-            binding.tvOverlayStats.visibility = View.GONE
-        }
-    }
-
-    private fun openSettingsOverlay() {
-        binding.layoutSettingsOverlay.visibility = View.VISIBLE
-        binding.spinnerResolution.requestFocus()
-    }
-
-    private fun closeSettingsOverlay() {
-        binding.layoutSettingsOverlay.visibility = View.GONE
-        if (binding.layoutPlayerControls.visibility == View.VISIBLE) {
-            binding.btnOpenSettings.requestFocus()
-        }
     }
 
     private fun showTrackSelectionDialog(trackType: Int, title: String) {
@@ -618,36 +545,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
-        if (binding.layoutDiagnosticDialog.visibility == View.VISIBLE) {
+        if (isSettingsOpen.value) {
             if (keyCode == KeyEvent.KEYCODE_BACK) {
-                binding.layoutDiagnosticDialog.visibility = View.GONE
+                isSettingsOpen.value = false
                 return true
             }
             return super.onKeyDown(keyCode, event)
         }
 
-        if (binding.layoutSettingsOverlay.visibility == View.VISIBLE) {
-            // Navigation inside the settings overlay must stay normal, so LEFT/RIGHT are not
-            // hijacked for seeking while it is open.
-            if (keyCode == KeyEvent.KEYCODE_BACK) {
-                closeSettingsOverlay()
-                return true
-            }
+        if (!isVideoLoaded.value) {
             return super.onKeyDown(keyCode, event)
         }
 
-        if (binding.layoutFilePicker.visibility == View.VISIBLE) {
-            return super.onKeyDown(keyCode, event)
-        }
-
-        if (binding.layoutPlayerControls.visibility != View.VISIBLE) {
+        if (!isControlsVisible.value) {
             when (keyCode) {
                 KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    performSeek(-SEEK_STEP_MS)
+                    performSeek(-10000L)
                     return true
                 }
                 KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                    performSeek(SEEK_STEP_MS)
+                    performSeek(10000L)
                     return true
                 }
                 KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_BUTTON_A,
@@ -656,14 +573,14 @@ class MainActivity : AppCompatActivity() {
                     return true
                 }
                 KeyEvent.KEYCODE_BACK -> {
-                    binding.layoutFilePicker.visibility = View.VISIBLE
+                    isVideoLoaded.value = false
                     return true
                 }
             }
         } else {
             showPlayerControls()
             if (keyCode == KeyEvent.KEYCODE_BACK) {
-                hidePlayerControls()
+                isControlsVisible.value = false
                 return true
             }
         }
@@ -672,45 +589,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runDiagnosticsAndInitializeRife() {
-        binding.tvDiagnosticDetails.text = "Running Vulkan / RIFE diagnostics..."
-        // Model initialisation loads the RIFE network from assets and can take seconds, so it must
-        // not run on the main thread.
         Thread {
-            val primaryAbi = if (Build.SUPPORTED_ABIS.isNotEmpty()) Build.SUPPORTED_ABIS[0] else "Unknown"
-            val sb = StringBuilder()
-
-            sb.append("=== SYSTEM & VULKAN DIAGNOSTICS ===\n")
-            sb.append("Primary Target ABI: $primaryAbi\n")
-
             try {
-                val vkRes = NativeEngine.runDiagnostics()
-                sb.append("Vulkan Available: ${if (vkRes.vulkanSupported) "YES" else "NO"}\n")
-                sb.append("GPU Device: ${vkRes.gpuName}\n")
-                sb.append("Vulkan API Version: ${vkRes.vulkanApiVersion}\n")
-                sb.append("ncnn Version: ${vkRes.ncnnVersion}\n\n")
-
-                sb.append("=== RIFE MODEL INITIALIZATION ===\n")
                 val initSuccess = NativeEngine.initRife(0)
                 if (initSuccess) {
                     val baseCacheDir = cacheDir.absolutePath
                     val loadSuccess = NativeEngine.loadRifeModel(assets, baseCacheDir, "rife-v2.4", isV2 = true, isV4 = false)
                     isRifeModelLoaded = loadSuccess
-                    sb.append("RIFE Model Loaded: ${if (loadSuccess) "YES (rife-v2.4)" else "FAILED"}\n")
-                } else {
-                    sb.append("RIFE Engine Init: FAILED\n")
-                }
-
-                val rifeStatus = NativeEngine.getRifeStatus()
-                if (rifeStatus.lastError.isNotEmpty()) {
-                    sb.append("Error: ${rifeStatus.lastError}\n")
                 }
             } catch (e: Throwable) {
-                sb.append("Diagnostics Exception: ${e.message}\n")
                 e.printStackTrace()
-            }
-
-            runOnUiThread {
-                binding.tvDiagnosticDetails.text = sb.toString()
             }
         }.start()
     }
@@ -720,21 +608,12 @@ class MainActivity : AppCompatActivity() {
             override fun run() {
                 player?.let { p ->
                     if (p.isPlaying) {
-                        val current = p.currentPosition
-                        binding.seekBar.progress = current.toInt()
-                        binding.tvCurrentTime.text = formatTime(current)
+                        currentTimeMsState.value = p.currentPosition
                     }
                 }
                 mainHandler.postDelayed(this, 1000)
             }
         })
-    }
-
-    private fun formatTime(timeMs: Long): String {
-        val totalSec = timeMs / 1000
-        val min = totalSec / 60
-        val sec = totalSec % 60
-        return String.format("%02d:%02d", min, sec)
     }
 
     override fun onStart() {
@@ -749,15 +628,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Detach the processor-owned surface before it is released, so the player never renders
-        // into a Surface that no longer exists.
         player?.clearVideoSurface()
         videoFrameProcessor?.stop()
         player?.release()
         player = null
-    }
-
-    companion object {
-        private const val SEEK_STEP_MS = 10000L
     }
 }
