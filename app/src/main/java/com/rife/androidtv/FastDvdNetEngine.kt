@@ -124,10 +124,17 @@ class FastDvdNetEngine {
 
         synchronized(lock) {
             val slot = writeIndex
-            var buffer = history[slot]
-            if (buffer == null || buffer.capacity() < requiredBytes) {
-                buffer = pool.pollFirst()?.takeIf { it.capacity() >= requiredBytes }
+            // Select the working buffer as a single non-null value (see OesFrameGrabber.grabFrame
+            // for why a `var` reassigned inside the null check is not smart-cast). removeFirstOrNull
+            // is the kotlin.collections.ArrayDeque equivalent of the intended pool.pollFirst(): it
+            // returns the first pooled buffer or null when the pool is empty. Behaviour is unchanged:
+            // reuse a pooled buffer that is big enough, otherwise allocate a new direct buffer.
+            val currentBuffer = history[slot]
+            val buffer = if (currentBuffer == null || currentBuffer.capacity() < requiredBytes) {
+                pool.removeFirstOrNull()?.takeIf { it.capacity() >= requiredBytes }
                     ?: ByteBuffer.allocateDirect(requiredBytes)
+            } else {
+                currentBuffer
             }
             buffer.clear()
             val windowCopy = buffer.duplicate()

@@ -22,7 +22,6 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
-import androidx.media3.common.PositionInfo
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
@@ -285,8 +284,8 @@ class MainActivity : AppCompatActivity() {
              * place that resets on a seek.
              */
             override fun onPositionDiscontinuity(
-                oldPosition: PositionInfo,
-                newPosition: PositionInfo,
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
                 reason: Int
             ) {
                 if (reason == Player.DISCONTINUITY_REASON_SEEK ||

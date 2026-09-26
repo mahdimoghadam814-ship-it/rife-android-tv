@@ -316,11 +316,17 @@ class OesFrameGrabber {
         if (requiredBytes <= 0) {
             return false
         }
-        var staging = pixelBuffer
-        if (staging == null || staging.capacity() < requiredBytes) {
-            staging = ByteBuffer.allocateDirect(requiredBytes).order(ByteOrder.nativeOrder())
-            pixelBuffer = staging
+        // Select the reuse buffer as a single non-null value: a `var` reassigned inside the null
+        // check above is not smart-cast to non-null by the Kotlin compiler, so the nullable state
+        // would leak into read()/copyPixelsFromBuffer(). The observable behaviour is identical:
+        // reuse pixelBuffer while its capacity suffices, otherwise allocate and publish the new one.
+        val currentBuffer = pixelBuffer
+        val staging = if (currentBuffer == null || currentBuffer.capacity() < requiredBytes) {
+            ByteBuffer.allocateDirect(requiredBytes).order(ByteOrder.nativeOrder())
+        } else {
+            currentBuffer
         }
+        pixelBuffer = staging
         if (!read(surfaceTexture, targetWidth, targetHeight, staging)) {
             return false
         }
