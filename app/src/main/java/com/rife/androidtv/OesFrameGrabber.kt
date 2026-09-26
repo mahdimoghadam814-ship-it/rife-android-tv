@@ -1,8 +1,6 @@
 package com.rife.androidtv
 
 import android.graphics.Bitmap
-import android.graphics.SurfaceTexture
-import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.util.Log
 import java.nio.ByteBuffer
@@ -10,7 +8,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 
 /**
- * Renders a GL_TEXTURE_EXTERNAL_OES texture from SurfaceTexture into an FBO
+ * Renders the active GL_TEXTURE_EXTERNAL_OES texture from EGLSurfaceTexture into an FBO
  * at target (pre-RIFE) resolution and reads RGBA pixels into a Bitmap.
  */
 class OesFrameGrabber {
@@ -20,12 +18,11 @@ class OesFrameGrabber {
 
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
-            attribute vec4 aTextureCoord;
-            uniform mat4 uSTMatrix;
+            attribute vec2 aTextureCoord;
             varying vec2 vTextureCoord;
             void main() {
                 gl_Position = aPosition;
-                vTextureCoord = (uSTMatrix * aTextureCoord).xy;
+                vTextureCoord = aTextureCoord;
             }
         """
 
@@ -47,17 +44,16 @@ class OesFrameGrabber {
         )
 
         private val FULL_QUAD_TEX_COORDS = floatArrayOf(
-            0.0f, 0.0f,
-            1.0f, 0.0f,
             0.0f, 1.0f,
-            1.0f, 1.0f
+            1.0f, 1.0f,
+            0.0f, 0.0f,
+            1.0f, 0.0f
         )
     }
 
     private var program = 0
     private var aPositionHandle = 0
     private var aTextureCoordHandle = 0
-    private var uSTMatrixHandle = 0
     private var uTextureHandle = 0
 
     private var fbo = 0
@@ -81,7 +77,6 @@ class OesFrameGrabber {
             position(0)
         }
 
-    private val stMatrix = FloatArray(16)
     private var pixelBuffer: ByteBuffer? = null
 
     fun init() {
@@ -95,12 +90,10 @@ class OesFrameGrabber {
 
         aPositionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         aTextureCoordHandle = GLES20.glGetAttribLocation(program, "aTextureCoord")
-        uSTMatrixHandle = GLES20.glGetUniformLocation(program, "uSTMatrix")
         uTextureHandle = GLES20.glGetUniformLocation(program, "uTexture")
     }
 
     fun grabFrame(
-        surfaceTexture: SurfaceTexture,
         targetWidth: Int,
         targetHeight: Int,
         outBitmap: Bitmap
@@ -109,9 +102,6 @@ class OesFrameGrabber {
             init()
         }
 
-        surfaceTexture.updateTexImage()
-        surfaceTexture.getTransformMatrix(stMatrix)
-
         ensureFbo(targetWidth, targetHeight)
 
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
@@ -119,7 +109,7 @@ class OesFrameGrabber {
 
         GLES20.glUseProgram(program)
 
-        GLES20.glUniformMatrix4fv(uSTMatrixHandle, 1, false, stMatrix, 0)
+        GLES20.glUniform1i(uTextureHandle, 0)
 
         vertexBuffer.position(0)
         GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)

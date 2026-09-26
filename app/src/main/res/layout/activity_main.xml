@@ -1,118 +1,74 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
-    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000"
     android:keepScreenOn="true">
 
-    <!-- Video Output Views -->
+    <!-- Normal ExoPlayer Output View -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        app:use_controller="false"
-        android:focusable="false" />
+        android:focusable="true" />
 
+    <!-- Interpolated / Intercepted Video Surface -->
     <SurfaceView
         android:id="@+id/displaySurfaceView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:visibility="gone" />
 
-    <!-- In-App USB / Local Video Media Browser -->
+    <!-- Main Home Screen Overlay (Simple File Picker Model) -->
     <LinearLayout
         android:id="@+id/layoutFilePicker"
-        android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:orientation="vertical"
-        android:background="#F00A0A0A"
-        android:padding="24dp">
-
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:layout_marginBottom="16dp">
-
-            <TextView
-                android:layout_width="0dp"
-                android:layout_height="wrap_content"
-                android:layout_weight="1"
-                android:text="RIFE Android TV - Local Videos"
-                android:textColor="#FFFFFF"
-                android:textSize="24sp"
-                android:textStyle="bold" />
-
-            <Button
-                android:id="@+id/btnSystemFilePicker"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="System File Picker"
-                android:textSize="14sp"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="16dp"
-                android:paddingEnd="16dp"
-                android:focusable="true"
-                android:layout_marginEnd="12dp" />
-
-            <Button
-                android:id="@+id/btnRunDiagnostic"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Diagnostics"
-                android:textSize="14sp"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="16dp"
-                android:paddingEnd="16dp"
-                android:focusable="true" />
-        </LinearLayout>
-
-        <GridView
-            android:id="@+id/gridVideos"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent"
-            android:numColumns="4"
-            android:horizontalSpacing="16dp"
-            android:verticalSpacing="16dp"
-            android:stretchMode="columnWidth"
-            android:focusable="true"
-            android:clipToPadding="false"
-            android:paddingBottom="16dp" />
-    </LinearLayout>
-
-    <!-- Overlay Diagnostic & Statistics HUD -->
-    <TextView
-        android:id="@+id/tvOverlayStats"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="top|start"
-        android:layout_margin="20dp"
-        android:padding="12dp"
-        android:background="#D0000000"
-        android:textColor="#00E676"
-        android:textSize="13sp"
-        android:fontFamily="monospace"
-        android:visibility="gone"
-        android:text="RIFE Status: Ready" />
+        android:layout_gravity="center"
+        android:orientation="vertical"
+        android:gravity="center"
+        android:padding="36dp"
+        android:background="#E0101010">
 
-    <!-- Lightweight Seek Indicator HUD -->
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="RIFE Android TV Player"
+            android:textColor="#FFFFFF"
+            android:textSize="32sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="24dp" />
+
+        <Button
+            android:id="@+id/btnOpenVideo"
+            android:layout_width="280dp"
+            android:layout_height="60dp"
+            android:text="Open Video File"
+            android:textSize="20sp"
+            android:textStyle="bold"
+            android:focusable="true"
+            android:layout_marginBottom="16dp" />
+
+        <Button
+            android:id="@+id/btnRunDiagnostic"
+            android:layout_width="280dp"
+            android:layout_height="50dp"
+            android:text="System Diagnostics"
+            android:textSize="16sp"
+            android:focusable="true" />
+    </LinearLayout>
+
+    <!-- On-Screen Seek Feedback Overlay -->
     <TextView
         android:id="@+id/tvSeekFeedback"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_gravity="center"
-        android:background="#D0000000"
-        android:textColor="#FFFFFF"
-        android:textSize="28sp"
+        android:padding="16dp"
+        android:background="#C0000000"
+        android:textColor="#00E676"
+        android:textSize="36sp"
         android:textStyle="bold"
-        android:paddingStart="24dp"
-        android:paddingEnd="24dp"
-        android:paddingTop="12dp"
-        android:paddingBottom="12dp"
         android:visibility="gone" />
 
     <!-- On-Screen TV Player Controls Overlay -->
@@ -122,11 +78,11 @@
         android:layout_height="wrap_content"
         android:layout_gravity="bottom"
         android:orientation="vertical"
-        android:background="#E6101010"
+        android:background="#E0101010"
         android:padding="20dp"
         android:visibility="gone">
 
-        <!-- Position / Duration Text & Seekbar -->
+        <!-- Position / Duration Seek Bar -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
@@ -140,7 +96,7 @@
                 android:layout_height="wrap_content"
                 android:text="00:00"
                 android:textColor="#FFFFFF"
-                android:textSize="14sp"
+                android:textSize="16sp"
                 android:fontFamily="monospace" />
 
             <SeekBar
@@ -158,293 +114,302 @@
                 android:layout_height="wrap_content"
                 android:text="00:00"
                 android:textColor="#FFFFFF"
-                android:textSize="14sp"
+                android:textSize="16sp"
                 android:fontFamily="monospace" />
         </LinearLayout>
 
-        <!-- Control Buttons Row 1 -->
+        <!-- Player Controls Buttons Row -->
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:gravity="center_vertical"
-            android:layout_marginBottom="8dp">
+            android:gravity="center">
 
             <Button
                 android:id="@+id/btnRewind"
-                android:layout_width="wrap_content"
-                android:layout_height="38dp"
+                android:layout_width="100dp"
+                android:layout_height="50dp"
                 android:text="-10s"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:focusable="true"
-                android:layout_marginEnd="8dp" />
-
-            <Button
-                android:id="@+id/btnPlayPause"
-                android:layout_width="wrap_content"
-                android:layout_height="38dp"
-                android:text="Pause"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="16dp"
-                android:paddingEnd="16dp"
-                android:focusable="true"
-                android:layout_marginEnd="8dp" />
-
-            <Button
-                android:id="@+id/btnForward"
-                android:layout_width="wrap_content"
-                android:layout_height="38dp"
-                android:text="+10s"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:focusable="true"
-                android:layout_marginEnd="16dp" />
-
-            <Button
-                android:id="@+id/btnAudioTracks"
-                android:layout_width="wrap_content"
-                android:layout_height="38dp"
-                android:text="Audio Tracks"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:focusable="true"
-                android:layout_marginEnd="8dp" />
-
-            <Button
-                android:id="@+id/btnSubtitleTracks"
-                android:layout_width="wrap_content"
-                android:layout_height="38dp"
-                android:text="Subtitles"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:focusable="true"
-                android:layout_marginEnd="16dp" />
-
-            <TextView
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="RIFE:"
-                android:textColor="#FFFFFF"
-                android:textSize="14sp"
-                android:layout_marginEnd="6dp" />
-
-            <Switch
-                android:id="@+id/switchRife"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="OFF"
-                android:textColor="#00E676"
-                android:focusable="true"
-                android:layout_marginEnd="16dp" />
-
-            <Button
-                android:id="@+id/btnOpenSettings"
-                android:layout_width="wrap_content"
-                android:layout_height="38dp"
-                android:text="Settings"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
-                android:paddingStart="12dp"
-                android:paddingEnd="12dp"
-                android:focusable="true" />
-        </LinearLayout>
-
-        <!-- Media & Synchronization Controls Row 2 -->
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:gravity="center_vertical">
-
-            <Button
-                android:id="@+id/btnExtAudio"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Ext Audio"
-                android:textSize="12sp"
-                android:focusable="true"
-                android:layout_marginEnd="4dp" />
-
-            <Button
-                android:id="@+id/btnAudioDelayMinus"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="A -0.5s"
-                android:textSize="12sp"
-                android:focusable="true"
-                android:layout_marginEnd="2dp" />
-
-            <TextView
-                android:id="@+id/tvAudioDelay"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="A: 0ms"
-                android:textColor="#FFEB3B"
-                android:textSize="12sp"
-                android:layout_marginEnd="2dp" />
-
-            <Button
-                android:id="@+id/btnAudioDelayPlus"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="A +0.5s"
-                android:textSize="12sp"
+                android:textSize="16sp"
                 android:focusable="true"
                 android:layout_marginEnd="12dp" />
 
             <Button
-                android:id="@+id/btnExtSub"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="Ext Sub"
-                android:textSize="12sp"
+                android:id="@+id/btnPlayPause"
+                android:layout_width="120dp"
+                android:layout_height="50dp"
+                android:text="Pause"
+                android:textSize="18sp"
+                android:textStyle="bold"
                 android:focusable="true"
-                android:layout_marginEnd="4dp" />
+                android:layout_marginEnd="12dp" />
 
             <Button
-                android:id="@+id/btnSubDelayMinus"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="S -0.5s"
-                android:textSize="12sp"
+                android:id="@+id/btnForward"
+                android:layout_width="100dp"
+                android:layout_height="50dp"
+                android:text="+10s"
+                android:textSize="16sp"
                 android:focusable="true"
-                android:layout_marginEnd="2dp" />
-
-            <TextView
-                android:id="@+id/tvSubDelay"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="S: 0ms"
-                android:textColor="#FFEB3B"
-                android:textSize="12sp"
-                android:layout_marginEnd="2dp" />
+                android:layout_marginEnd="24dp" />
 
             <Button
-                android:id="@+id/btnSubDelayPlus"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:text="S +0.5s"
-                android:textSize="12sp"
+                android:id="@+id/btnOpenSettings"
+                android:layout_width="140dp"
+                android:layout_height="50dp"
+                android:text="Settings"
+                android:textSize="16sp"
+                android:textStyle="bold"
                 android:focusable="true" />
         </LinearLayout>
-
     </LinearLayout>
 
-    <!-- Side-Panel TV Settings Overlay -->
-    <LinearLayout
+    <!-- Dedicated Application Settings TV Overlay Panel -->
+    <ScrollView
         android:id="@+id/layoutSettingsOverlay"
-        android:layout_width="360dp"
+        android:layout_width="380dp"
         android:layout_height="match_parent"
         android:layout_gravity="end"
-        android:background="#F0121212"
-        android:orientation="vertical"
-        android:padding="20dp"
-        android:visibility="gone"
-        android:elevation="8dp">
+        android:background="#F0151515"
+        android:padding="24dp"
+        android:visibility="gone">
 
-        <TextView
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Settings"
-            android:textColor="#FFFFFF"
-            android:textSize="22sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="16dp" />
+            android:orientation="vertical">
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="RIFE Resolution Mode"
-            android:textColor="#00E676"
-            android:textSize="14sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="4dp" />
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Player Settings"
+                android:textColor="#00E676"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="20dp" />
 
-        <Spinner
-            android:id="@+id/spinnerResolution"
-            android:layout_width="match_parent"
-            android:layout_height="48dp"
-            android:focusable="true"
-            android:background="@drawable/selector_tv_button"
-            android:layout_marginBottom="16dp" />
+            <!-- RIFE Settings Group -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="RIFE Frame Interpolation"
+                android:textColor="#FFEB3B"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Audio Track"
-            android:textColor="#00E676"
-            android:textSize="14sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="4dp" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="12dp">
 
-        <Button
-            android:id="@+id/btnSettingsAudioTrack"
-            android:layout_width="match_parent"
-            android:layout_height="40dp"
-            android:text="Select Audio Track"
-            android:textColor="#FFFFFF"
-            android:background="@drawable/selector_tv_button"
-            android:focusable="true"
-            android:layout_marginBottom="16dp" />
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Enable RIFE:"
+                    android:textColor="#FFFFFF"
+                    android:textSize="16sp" />
 
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:text="Subtitle Track"
-            android:textColor="#00E676"
-            android:textSize="14sp"
-            android:textStyle="bold"
-            android:layout_marginBottom="4dp" />
+                <Switch
+                    android:id="@+id/switchRife"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="OFF"
+                    android:textColor="#00E676"
+                    android:focusable="true" />
+            </LinearLayout>
 
-        <Button
-            android:id="@+id/btnSettingsSubtitleTrack"
-            android:layout_width="match_parent"
-            android:layout_height="40dp"
-            android:text="Select Subtitle Track"
-            android:textColor="#FFFFFF"
-            android:background="@drawable/selector_tv_button"
-            android:focusable="true"
-            android:layout_marginBottom="24dp" />
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="20dp">
 
-        <Button
-            android:id="@+id/btnSettingsDiagnostics"
-            android:layout_width="match_parent"
-            android:layout_height="40dp"
-            android:text="System Diagnostics"
-            android:textColor="#FFFFFF"
-            android:background="@drawable/selector_tv_button"
-            android:focusable="true"
-            android:layout_marginBottom="12dp" />
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Processing Quality:"
+                    android:textColor="#FFFFFF"
+                    android:textSize="16sp" />
 
-        <Button
-            android:id="@+id/btnCloseSettings"
-            android:layout_width="match_parent"
-            android:layout_height="40dp"
-            android:text="Close Settings"
-            android:textColor="#FFFFFF"
-            android:background="@drawable/selector_tv_button"
-            android:focusable="true" />
-    </LinearLayout>
+                <Spinner
+                    android:id="@+id/spinnerResolution"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:focusable="true" />
+            </LinearLayout>
 
-    <!-- Diagnostic Log Dialog Overlay -->
+            <!-- Audio Settings Group -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Audio Sync &amp; Tracks"
+                android:textColor="#FFEB3B"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnExtAudio"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Attach External Audio File"
+                android:textSize="14sp"
+                android:focusable="true"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnSettingsAudioTrack"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Select Audio Track"
+                android:textSize="14sp"
+                android:focusable="true"
+                android:layout_marginBottom="8dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="20dp">
+
+                <Button
+                    android:id="@+id/btnAudioDelayMinus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="-0.5s"
+                    android:focusable="true" />
+
+                <TextView
+                    android:id="@+id/tvAudioDelay"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="A: 0ms"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <Button
+                    android:id="@+id/btnAudioDelayPlus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="+0.5s"
+                    android:focusable="true" />
+            </LinearLayout>
+
+            <!-- Subtitle Settings Group -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Subtitle Sync &amp; Tracks"
+                android:textColor="#FFEB3B"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnExtSub"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Attach External Subtitle File"
+                android:textSize="14sp"
+                android:focusable="true"
+                android:layout_marginBottom="8dp" />
+
+            <Button
+                android:id="@+id/btnSettingsSubtitleTrack"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Select Subtitle Track"
+                android:textSize="14sp"
+                android:focusable="true"
+                android:layout_marginBottom="8dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="24dp">
+
+                <Button
+                    android:id="@+id/btnSubDelayMinus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="-0.5s"
+                    android:focusable="true" />
+
+                <TextView
+                    android:id="@+id/tvSubDelay"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="S: 0ms"
+                    android:textColor="#FFFFFF"
+                    android:textSize="14sp"
+                    android:paddingStart="8dp"
+                    android:paddingEnd="8dp" />
+
+                <Button
+                    android:id="@+id/btnSubDelayPlus"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="+0.5s"
+                    android:focusable="true" />
+            </LinearLayout>
+
+            <Button
+                android:id="@+id/btnSettingsDiagnostics"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="System Diagnostics"
+                android:textSize="14sp"
+                android:focusable="true"
+                android:layout_marginBottom="12dp" />
+
+            <Button
+                android:id="@+id/btnCloseSettings"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Close Settings"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:focusable="true" />
+        </LinearLayout>
+    </ScrollView>
+
+    <!-- Overlay Diagnostic & Statistics HUD -->
+    <TextView
+        android:id="@+id/tvOverlayStats"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|start"
+        android:layout_margin="16dp"
+        android:padding="8dp"
+        android:background="#C0000000"
+        android:textColor="#00E676"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:text="RIFE Status: Ready" />
+
+    <!-- Diagnostic Log Dialog / Sheet Overlay -->
     <ScrollView
         android:id="@+id/layoutDiagnosticDialog"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:background="#F0101010"
         android:padding="24dp"
-        android:visibility="gone"
-        android:elevation="10dp">
+        android:visibility="gone">
 
         <LinearLayout
             android:layout_width="match_parent"
@@ -473,10 +438,8 @@
             <Button
                 android:id="@+id/btnCloseDiagnostic"
                 android:layout_width="200dp"
-                android:layout_height="40dp"
+                android:layout_height="wrap_content"
                 android:text="Close Diagnostics"
-                android:textColor="#FFFFFF"
-                android:background="@drawable/selector_tv_button"
                 android:focusable="true" />
         </LinearLayout>
     </ScrollView>

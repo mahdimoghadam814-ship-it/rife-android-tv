@@ -17,6 +17,7 @@ import java.util.concurrent.ArrayBlockingQueue
 
 enum class RifeResolution {
     ORIGINAL,
+    RES_1080P,
     RES_720P,
     RES_480P
 }
@@ -68,10 +69,11 @@ class VideoFrameProcessor(
     private var displaySurfaceWidth = 0
     private var displaySurfaceHeight = 0
 
-    private val frameQueue = ArrayBlockingQueue<FrameData>(4)
+    // Bounded frame queue (capacity = 2) for explicit backpressure
+    private val frameQueue = ArrayBlockingQueue<FrameData>(2)
 
-    private var workerThread: HandlerThread? = null
-    private var workerHandler: Handler? = null
+    private var captureThread: HandlerThread? = null
+    private var captureHandler: Handler? = null
 
     private var inferenceThread: HandlerThread? = null
     private var inferenceHandler: Handler? = null
@@ -103,15 +105,15 @@ class VideoFrameProcessor(
         if (width > 0 && height > 0) {
             sourceWidth = width
             sourceHeight = height
-            Log.i(TAG, "Source video dimensions updated: ${width}x${height}")
+            Log.i(TAG, "Source video dimensions set: ${width}x${height}")
         }
     }
 
     fun start() {
-        if (workerThread == null) {
-            workerThread = HandlerThread("RifeCaptureThread").apply {
+        if (captureThread == null) {
+            captureThread = HandlerThread("RifeCaptureThread").apply {
                 start()
-                workerHandler = Handler(looper)
+                captureHandler = Handler(looper)
             }
         }
 
@@ -128,7 +130,7 @@ class VideoFrameProcessor(
     fun stop() {
         isRifeEnabled = false
 
-        val handler = workerHandler
+        val handler = captureHandler
         val egl = eglSurfaceTexture
 
         if (handler != null) {
@@ -177,9 +179,9 @@ class VideoFrameProcessor(
         cachedIn1Buf = null
         cachedOutBuf = null
 
-        workerThread?.quitSafely()
-        workerThread = null
-        workerHandler = null
+        captureThread?.quitSafely()
+        captureThread = null
+        captureHandler = null
 
         inferenceThread?.quitSafely()
         inferenceThread = null
@@ -187,7 +189,7 @@ class VideoFrameProcessor(
     }
 
     private fun createInputSurface() {
-        val handler = workerHandler ?: return
+        val handler = captureHandler ?: return
 
         handler.post {
             try {
@@ -222,20 +224,12 @@ class VideoFrameProcessor(
             return
         }
 
-        val egl = eglSurfaceTexture ?: return
-        val surfaceTex = egl.surfaceTexture
-
         frameCountInput++
 
         val srcW = sourceWidth
         val srcH = sourceHeight
 
         val (preRifeW, preRifeH) = calculateTargetDimensions(srcW, srcH, resolution)
-
-        Log.d(
-            TAG,
-            "FRAME CAPTURE LOG: sourceDimensions=${srcW}x${srcH} -> preRifeDimensions=${preRifeW}x${preRifeH}"
-        )
 
         var captureBitmap = cachedCaptureBitmap
         if (captureBitmap == null || captureBitmap.width != preRifeW || captureBitmap.height != preRifeH) {
@@ -250,7 +244,6 @@ class VideoFrameProcessor(
 
         val grabbed = try {
             frameGrabber?.grabFrame(
-                surfaceTexture = surfaceTex,
                 targetWidth = preRifeW,
                 targetHeight = preRifeH,
                 outBitmap = captureBitmap
@@ -275,12 +268,11 @@ class VideoFrameProcessor(
             sourceHeight = srcH
         )
 
+        // Enforce explicit backpressure drop policy
         if (!frameQueue.offer(frameData)) {
             droppedFrameCount++
-
             val dropped = frameQueue.poll()
             dropped?.bitmap?.recycle()
-
             frameQueue.offer(frameData)
         }
 
@@ -434,8 +426,18 @@ class VideoFrameProcessor(
         res: RifeResolution
     ): Pair<Int, Int> {
         return when (res) {
-            RifeResolution.ORIGINAL ->
-                Pair(srcW, srcH)
+            RifeResolution.ORIGINAL -> Pair(srcW, srcH)
+
+            RifeResolution.RES_1080P -> {
+                val maxDim = 1920
+                if (srcW > srcH && srcW > maxDim) {
+                    Pair(maxDim, (srcH * maxDim) / srcW)
+                } else if (srcH >= srcW && srcH > maxDim) {
+                    Pair((srcW * maxDim) / srcH, maxDim)
+                } else {
+                    Pair(srcW, srcH)
+                }
+            }
 
             RifeResolution.RES_720P -> {
                 val maxDim = 1280
@@ -473,6 +475,7 @@ class VideoFrameProcessor(
 
             val resStr = when (resolution) {
                 RifeResolution.ORIGINAL -> "Original"
+                RifeResolution.RES_1080P -> "1080p"
                 RifeResolution.RES_720P -> "720p"
                 RifeResolution.RES_480P -> "480p"
             }

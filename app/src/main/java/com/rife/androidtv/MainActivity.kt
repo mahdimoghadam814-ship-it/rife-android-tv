@@ -1,14 +1,11 @@
 package com.rife.androidtv
 
-import android.content.ContentUris
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import android.provider.MediaStore
 import android.view.KeyEvent
 import android.view.View
 import android.widget.AdapterView
@@ -18,10 +15,7 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
 import androidx.media3.common.C
-import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
@@ -44,9 +38,6 @@ class MainActivity : AppCompatActivity() {
     private val mainHandler = Handler(Looper.getMainLooper())
     private val hideControlsRunnable = Runnable { hidePlayerControls() }
     private val hideSeekFeedbackRunnable = Runnable { binding.tvSeekFeedback.visibility = View.GONE }
-
-    private val mediaItemsList = mutableListOf<MediaFileItem>()
-    private lateinit var gridAdapter: VideoGridAdapter
 
     private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         if (result.resultCode == RESULT_OK && result.data != null) {
@@ -88,93 +79,18 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-        scanLocalMediaFiles()
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        setupVideoGridBrowser()
         setupVideoFrameProcessor()
         setupPlayer()
         setupUIControls()
         setupResolutionSpinner()
         runDiagnosticsAndInitializeRife()
 
-        checkPermissionsAndLoadMedia()
         startProgressUpdater()
-    }
-
-    private fun setupVideoGridBrowser() {
-        gridAdapter = VideoGridAdapter(this, mediaItemsList)
-        binding.gridVideos.adapter = gridAdapter
-
-        binding.gridVideos.setOnItemClickListener { _, _, position, _ ->
-            if (position in mediaItemsList.indices) {
-                val item = mediaItemsList[position]
-                videoName = item.title
-                playVideo(item.uri)
-            }
-        }
-    }
-
-    private fun checkPermissionsAndLoadMedia() {
-        val permissionsToRequest = mutableListOf<String>()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_MEDIA_VIDEO) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(android.Manifest.permission.READ_MEDIA_VIDEO)
-            }
-        } else {
-            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(android.Manifest.permission.READ_EXTERNAL_STORAGE)
-            }
-        }
-
-        if (permissionsToRequest.isNotEmpty()) {
-            permissionLauncher.launch(permissionsToRequest.toTypedArray())
-        } else {
-            scanLocalMediaFiles()
-        }
-    }
-
-    private fun scanLocalMediaFiles() {
-        mediaItemsList.clear()
-        val projection = arrayOf(
-            MediaStore.Video.Media._ID,
-            MediaStore.Video.Media.DISPLAY_NAME,
-            MediaStore.Video.Media.SIZE
-        )
-
-        try {
-            contentResolver.query(
-                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
-                projection,
-                null,
-                null,
-                "${MediaStore.Video.Media.DATE_ADDED} DESC"
-            )?.use { cursor ->
-                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media._ID)
-                val nameColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.DISPLAY_NAME)
-                val sizeColumn = cursor.getColumnIndexOrThrow(MediaStore.Video.Media.SIZE)
-
-                while (cursor.moveToNext()) {
-                    val id = cursor.getLong(idColumn)
-                    val name = cursor.getString(nameColumn) ?: "Video"
-                    val size = cursor.getLong(sizeColumn)
-                    val contentUri = ContentUris.withAppendedId(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, id)
-
-                    val sizeMb = "%.1f MB".format(size / (1024.0 * 1024.0))
-                    mediaItemsList.add(MediaFileItem(contentUri, name, sizeMb, null))
-                }
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-        }
-
-        gridAdapter.notifyDataSetChanged()
     }
 
     private fun setupVideoFrameProcessor() {
@@ -254,7 +170,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupUIControls() {
-        binding.btnSystemFilePicker.setOnClickListener {
+        binding.btnOpenVideo.setOnClickListener {
             val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                 addCategory(Intent.CATEGORY_OPENABLE)
                 type = "video/*"
@@ -340,14 +256,6 @@ class MainActivity : AppCompatActivity() {
             showPlayerControls()
         }
 
-        binding.btnAudioTracks.setOnClickListener {
-            showTrackSelectionDialog(C.TRACK_TYPE_AUDIO, "Audio Tracks")
-        }
-
-        binding.btnSubtitleTracks.setOnClickListener {
-            showTrackSelectionDialog(C.TRACK_TYPE_TEXT, "Subtitle Tracks")
-        }
-
         binding.btnOpenSettings.setOnClickListener {
             openSettingsOverlay()
         }
@@ -412,7 +320,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupResolutionSpinner() {
-        val options = arrayOf("Original", "720p", "480p")
+        val options = arrayOf("Original", "1080p", "720p", "480p")
         val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, options)
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
         binding.spinnerResolution.adapter = adapter
@@ -420,8 +328,9 @@ class MainActivity : AppCompatActivity() {
         binding.spinnerResolution.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
                 val res = when (position) {
-                    1 -> RifeResolution.RES_720P
-                    2 -> RifeResolution.RES_480P
+                    1 -> RifeResolution.RES_1080P
+                    2 -> RifeResolution.RES_720P
+                    3 -> RifeResolution.RES_480P
                     else -> RifeResolution.ORIGINAL
                 }
                 videoFrameProcessor?.resolution = res
@@ -590,40 +499,44 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun runDiagnosticsAndInitializeRife() {
-        val primaryAbi = if (Build.SUPPORTED_ABIS.isNotEmpty()) Build.SUPPORTED_ABIS[0] else "Unknown"
-        val sb = StringBuilder()
+        Thread {
+            val primaryAbi = if (Build.SUPPORTED_ABIS.isNotEmpty()) Build.SUPPORTED_ABIS[0] else "Unknown"
+            val sb = StringBuilder()
 
-        sb.append("=== SYSTEM & VULKAN DIAGNOSTICS ===\n")
-        sb.append("Primary Target ABI: $primaryAbi\n")
+            sb.append("=== SYSTEM & VULKAN DIAGNOSTICS ===\n")
+            sb.append("Primary Target ABI: $primaryAbi\n")
 
-        try {
-            val vkRes = NativeEngine.runDiagnostics()
-            sb.append("Vulkan Available: ${if (vkRes.vulkanSupported) "YES" else "NO"}\n")
-            sb.append("GPU Device: ${vkRes.gpuName}\n")
-            sb.append("Vulkan API Version: ${vkRes.vulkanApiVersion}\n")
-            sb.append("ncnn Version: ${vkRes.ncnnVersion}\n\n")
+            try {
+                val vkRes = NativeEngine.runDiagnostics()
+                sb.append("Vulkan Available: ${if (vkRes.vulkanSupported) "YES" else "NO"}\n")
+                sb.append("GPU Device: ${vkRes.gpuName}\n")
+                sb.append("Vulkan API Version: ${vkRes.vulkanApiVersion}\n")
+                sb.append("ncnn Version: ${vkRes.ncnnVersion}\n\n")
 
-            sb.append("=== RIFE MODEL INITIALIZATION ===\n")
-            val initSuccess = NativeEngine.initRife(0)
-            if (initSuccess) {
-                val baseCacheDir = cacheDir.absolutePath
-                val loadSuccess = NativeEngine.loadRifeModel(assets, baseCacheDir, "rife-v2.4", isV2 = true, isV4 = false)
-                isRifeModelLoaded = loadSuccess
-                sb.append("RIFE Model Loaded: ${if (loadSuccess) "YES (rife-v2.4)" else "FAILED"}\n")
-            } else {
-                sb.append("RIFE Engine Init: FAILED\n")
+                sb.append("=== RIFE MODEL INITIALIZATION ===\n")
+                val initSuccess = NativeEngine.initRife(0)
+                if (initSuccess) {
+                    val baseCacheDir = cacheDir.absolutePath
+                    val loadSuccess = NativeEngine.loadRifeModel(assets, baseCacheDir, "rife-v2.4", isV2 = true, isV4 = false)
+                    isRifeModelLoaded = loadSuccess
+                    sb.append("RIFE Model Loaded: ${if (loadSuccess) "YES (rife-v2.4)" else "FAILED"}\n")
+                } else {
+                    sb.append("RIFE Engine Init: FAILED\n")
+                }
+
+                val rifeStatus = NativeEngine.getRifeStatus()
+                if (rifeStatus.lastError.isNotEmpty()) {
+                    sb.append("Error: ${rifeStatus.lastError}\n")
+                }
+            } catch (e: Throwable) {
+                sb.append("Diagnostics Exception: ${e.message}\n")
+                e.printStackTrace()
             }
 
-            val rifeStatus = NativeEngine.getRifeStatus()
-            if (rifeStatus.lastError.isNotEmpty()) {
-                sb.append("Error: ${rifeStatus.lastError}\n")
+            runOnUiThread {
+                binding.tvDiagnosticDetails.text = sb.toString()
             }
-        } catch (e: Throwable) {
-            sb.append("Diagnostics Exception: ${e.message}\n")
-            e.printStackTrace()
-        }
-
-        binding.tvDiagnosticDetails.text = sb.toString()
+        }.start()
     }
 
     private fun startProgressUpdater() {
