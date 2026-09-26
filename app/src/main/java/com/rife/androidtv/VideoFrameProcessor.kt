@@ -238,6 +238,9 @@ class VideoFrameProcessor(
             return
         }
 
+        val egl = eglSurfaceTexture ?: return
+        val surfaceTex = egl.surfaceTexture
+
         frameCountInput++
 
         val srcW = sourceWidth
@@ -263,6 +266,7 @@ class VideoFrameProcessor(
 
         val grabbed = try {
             frameGrabber?.grabFrame(
+                surfaceTexture = surfaceTex,
                 targetWidth = preRifeW,
                 targetHeight = preRifeH,
                 outBitmap = captureBitmap

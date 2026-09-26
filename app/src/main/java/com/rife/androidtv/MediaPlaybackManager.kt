@@ -61,6 +61,10 @@ class MediaPlaybackManager(
         this.videoUri = uri
         this.audioOffsetMs = 0L
         this.subtitleOffsetMs = 0L
+
+        player.stop()
+        player.clearMediaItems()
+
         rebuildAndApplyMediaSource(resetPosition = true)
     }
 
