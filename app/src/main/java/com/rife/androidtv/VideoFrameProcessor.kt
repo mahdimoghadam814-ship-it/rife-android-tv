@@ -54,6 +54,8 @@ class VideoFrameProcessor(
     @Volatile
     var resolution = RifeResolution.ORIGINAL
 
+    val fastDvdNetEngine = FastDvdNetEngine()
+
     @Volatile
     private var sourceWidth = 1920
 
@@ -92,6 +94,8 @@ class VideoFrameProcessor(
     private var cachedIn0Buf: ByteBuffer? = null
     private var cachedIn1Buf: ByteBuffer? = null
     private var cachedOutBuf: ByteBuffer? = null
+    private var cachedDenoised0Buf: ByteBuffer? = null
+    private var cachedDenoised1Buf: ByteBuffer? = null
     private var cachedTargetSize = 0
 
     private var cachedCaptureBitmap: Bitmap? = null
@@ -107,6 +111,14 @@ class VideoFrameProcessor(
             sourceHeight = height
             Log.i(TAG, "Source video dimensions set: ${width}x${height}")
         }
+    }
+
+    fun onSeekPerformed() {
+        fastDvdNetEngine.reset()
+        frameQueue.clear()
+        previousFrame?.bitmap?.recycle()
+        previousFrame = null
+        Log.i(TAG, "Cleared frame queues and FastDVDnet history after seek")
     }
 
     fun start() {
@@ -178,6 +190,8 @@ class VideoFrameProcessor(
         cachedIn0Buf = null
         cachedIn1Buf = null
         cachedOutBuf = null
+        cachedDenoised0Buf = null
+        cachedDenoised1Buf = null
 
         captureThread?.quitSafely()
         captureThread = null
@@ -197,7 +211,7 @@ class VideoFrameProcessor(
                     handler,
                     EGLSurfaceTexture.TextureImageListener {
                         handler.post {
-                            if (isRifeEnabled) {
+                            if (isRifeEnabled || fastDvdNetEngine.isEnabled) {
                                 captureFrameFromInputSurface()
                             }
                         }
@@ -220,7 +234,7 @@ class VideoFrameProcessor(
     }
 
     private fun captureFrameFromInputSurface() {
-        if (!isRifeEnabled) {
+        if (!isRifeEnabled && !fastDvdNetEngine.isEnabled) {
             return
         }
 
@@ -230,6 +244,11 @@ class VideoFrameProcessor(
         val srcH = sourceHeight
 
         val (preRifeW, preRifeH) = calculateTargetDimensions(srcW, srcH, resolution)
+
+        Log.d(
+            TAG,
+            "FRAME CAPTURE LOG: sourceDimensions=${srcW}x${srcH} -> preRifeDimensions=${preRifeW}x${preRifeH}"
+        )
 
         var captureBitmap = cachedCaptureBitmap
         if (captureBitmap == null || captureBitmap.width != preRifeW || captureBitmap.height != preRifeH) {
@@ -281,7 +300,7 @@ class VideoFrameProcessor(
 
     private fun scheduleInference() {
         inferenceHandler?.post {
-            if (isRifeEnabled) {
+            if (isRifeEnabled || fastDvdNetEngine.isEnabled) {
                 processNextFramePair()
             }
         }
@@ -315,6 +334,8 @@ class VideoFrameProcessor(
         if (cachedIn0Buf == null || cachedIn1Buf == null || cachedTargetSize != bufferSizeTarget) {
             cachedIn0Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
             cachedIn1Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
+            cachedDenoised0Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
+            cachedDenoised1Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
             cachedTargetSize = bufferSizeTarget
         }
 
@@ -325,10 +346,14 @@ class VideoFrameProcessor(
 
         val in0Buf = cachedIn0Buf!!
         val in1Buf = cachedIn1Buf!!
+        val den0Buf = cachedDenoised0Buf!!
+        val den1Buf = cachedDenoised1Buf!!
         val outBuf = cachedOutBuf!!
 
         in0Buf.rewind()
         in1Buf.rewind()
+        den0Buf.rewind()
+        den1Buf.rewind()
         outBuf.rewind()
 
         prev.bitmap.copyPixelsToBuffer(in0Buf)
@@ -339,53 +364,79 @@ class VideoFrameProcessor(
 
         val startTime = SystemClock.elapsedRealtime()
 
-        val success = NativeEngine.interpolateFrameBuffers(
-            in0Buf,
-            in1Buf,
-            rifeInputW,
-            rifeInputH,
-            rifeOutputW,
-            rifeOutputH,
-            0.5f,
-            outBuf
-        )
-
-        lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
-
-        if (success) {
-            renderBitmapToOutput(prev.bitmap)
-            frameCountOutput++
-
-            outBuf.rewind()
-
-            var interpBitmap = cachedInterpBitmap
-            if (interpBitmap == null || interpBitmap.width != rifeOutputW || interpBitmap.height != rifeOutputH) {
-                interpBitmap?.recycle()
-                interpBitmap = Bitmap.createBitmap(rifeOutputW, rifeOutputH, Bitmap.Config.ARGB_8888)
-                cachedInterpBitmap = interpBitmap
-            }
-
-            interpBitmap.copyPixelsFromBuffer(outBuf)
-            verifyBitmapPixels(interpBitmap, "RIFE_OUTPUT_INTERP_FRAME")
-
-            renderBitmapToOutput(interpBitmap)
-            frameCountOutput++
-
-            renderBitmapToOutput(nextFrame.bitmap)
-            frameCountOutput++
+        // FastDVDnet Denoising Stage (if enabled)
+        if (fastDvdNetEngine.isEnabled) {
+            fastDvdNetEngine.denoiseFrameBuffer(in0Buf, rifeInputW, rifeInputH, den0Buf)
+            fastDvdNetEngine.denoiseFrameBuffer(in1Buf, rifeInputW, rifeInputH, den1Buf)
+            den0Buf.rewind()
+            den1Buf.rewind()
         } else {
-            val status = NativeEngine.getRifeStatus()
+            den0Buf.put(in0Buf)
+            den1Buf.put(in1Buf)
+            den0Buf.rewind()
+            den1Buf.rewind()
+            in0Buf.rewind()
+            in1Buf.rewind()
+        }
 
-            onError(
-                if (status.lastError.isNotEmpty()) {
-                    status.lastError
-                } else {
-                    "RIFE frame interpolation failed"
-                }
+        if (isRifeEnabled) {
+            val success = NativeEngine.interpolateFrameBuffers(
+                den0Buf,
+                den1Buf,
+                rifeInputW,
+                rifeInputH,
+                rifeOutputW,
+                rifeOutputH,
+                0.5f,
+                outBuf
             )
 
-            renderBitmapToOutput(nextFrame.bitmap)
+            lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
+
+            if (success) {
+                renderBitmapToOutput(prev.bitmap)
+                frameCountOutput++
+
+                outBuf.rewind()
+
+                var interpBitmap = cachedInterpBitmap
+                if (interpBitmap == null || interpBitmap.width != rifeOutputW || interpBitmap.height != rifeOutputH) {
+                    interpBitmap?.recycle()
+                    interpBitmap = Bitmap.createBitmap(rifeOutputW, rifeOutputH, Bitmap.Config.ARGB_8888)
+                    cachedInterpBitmap = interpBitmap
+                }
+
+                interpBitmap.copyPixelsFromBuffer(outBuf)
+                verifyBitmapPixels(interpBitmap, "RIFE_OUTPUT_INTERP_FRAME")
+
+                renderBitmapToOutput(interpBitmap)
+                frameCountOutput++
+
+                renderBitmapToOutput(nextFrame.bitmap)
+                frameCountOutput++
+            } else {
+                val status = NativeEngine.getRifeStatus()
+
+                onError(
+                    if (status.lastError.isNotEmpty()) {
+                        status.lastError
+                    } else {
+                        "RIFE frame interpolation failed"
+                    }
+                )
+
+                renderBitmapToOutput(nextFrame.bitmap)
+                frameCountOutput++
+            }
+        } else {
+            // FastDVDnet Denoising Only
+            val denoisedBitmap = Bitmap.createBitmap(rifeInputW, rifeInputH, Bitmap.Config.ARGB_8888)
+            den0Buf.rewind()
+            denoisedBitmap.copyPixelsFromBuffer(den0Buf)
+            renderBitmapToOutput(denoisedBitmap)
+            denoisedBitmap.recycle()
             frameCountOutput++
+            lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
         }
 
         prev.bitmap.recycle()

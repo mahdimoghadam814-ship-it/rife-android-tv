@@ -59,14 +59,16 @@ class MediaPlaybackManager(
 
     fun setVideoSource(uri: Uri) {
         this.videoUri = uri
-        rebuildAndApplyMediaSource()
+        this.audioOffsetMs = 0L
+        this.subtitleOffsetMs = 0L
+        rebuildAndApplyMediaSource(resetPosition = true)
     }
 
     fun setExternalAudioSource(uri: Uri?, label: String? = "External Audio") {
         this.externalAudioUri = uri
         this.externalAudioName = label
         this.isExternalAudioSelected = (uri != null)
-        rebuildAndApplyMediaSource()
+        rebuildAndApplyMediaSource(resetPosition = false)
     }
 
     fun setExternalAudioSelected(selected: Boolean) {
@@ -83,7 +85,7 @@ class MediaPlaybackManager(
         this.externalSubtitleMimeType = mimeType ?: inferSubtitleMimeType(uri)
         this.externalSubtitleName = label
         this.isExternalSubtitleEnabled = (uri != null)
-        rebuildAndApplyMediaSource()
+        rebuildAndApplyMediaSource(resetPosition = false)
     }
 
     fun setExternalSubtitleEnabled(enabled: Boolean) {
@@ -105,15 +107,14 @@ class MediaPlaybackManager(
         val clampedOffset = offsetMs.coerceIn(-5000L, 5000L)
         if (this.subtitleOffsetMs != clampedOffset) {
             this.subtitleOffsetMs = clampedOffset
-            rebuildAndApplyMediaSource()
+            rebuildAndApplyMediaSource(resetPosition = false)
         }
     }
 
-    fun rebuildAndApplyMediaSource() {
+    fun rebuildAndApplyMediaSource(resetPosition: Boolean = false) {
         val currentVideoUri = videoUri ?: return
 
-        val wasPlaying = player.isPlaying
-        val currentPos = player.currentPosition
+        val currentPos = if (resetPosition) 0L else player.currentPosition
 
         val mediaSources = mutableListOf<MediaSource>()
 
@@ -164,12 +165,16 @@ class MediaPlaybackManager(
             MergingMediaSource(true, *mediaSources.toTypedArray())
         }
 
+        player.clearMediaItems()
         player.setMediaSource(finalSource)
         player.prepare()
+
         if (currentPos > 0) {
             player.seekTo(currentPos)
+        } else {
+            player.seekTo(0, 0L)
         }
-        player.playWhenReady = wasPlaying
+        player.playWhenReady = true
 
         updateTrackSelection()
         applyOffsetsToPlayer()

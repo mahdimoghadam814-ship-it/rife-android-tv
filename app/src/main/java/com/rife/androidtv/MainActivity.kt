@@ -102,13 +102,14 @@ class MainActivity : AppCompatActivity() {
                     val subOff = mediaPlaybackManager?.subtitleOffsetMs ?: 0L
                     val extAud = if (mediaPlaybackManager?.isExternalAudioSelected == true) mediaPlaybackManager?.externalAudioName else "None"
                     val extSub = if (mediaPlaybackManager?.isExternalSubtitleEnabled == true) mediaPlaybackManager?.externalSubtitleName else "None"
+                    val fastDvdNetOn = videoFrameProcessor?.fastDvdNetEngine?.isEnabled == true
 
                     binding.tvOverlayStats.text = """
                         Video: $videoName
                         Ext Audio: $extAud | Ext Sub: $extSub
                         Audio Offset: ${audioOff}ms | Sub Offset: ${subOff}ms
                         Input FPS: ${"%.1f".format(stats.inputFps)} | Output FPS: ${"%.1f".format(stats.outputFps)}
-                        Resolution: ${stats.currentResolution} | RIFE: ${if (videoFrameProcessor?.isRifeEnabled == true) "ON" else "OFF"}
+                        Resolution: ${stats.currentResolution} | RIFE: ${if (videoFrameProcessor?.isRifeEnabled == true) "ON" else "OFF"} | FastDVDnet: ${if (fastDvdNetOn) "ON" else "OFF"}
                         Processing Time: ${stats.processingTimeMs} ms | Dropped: ${stats.droppedFrames}
                     """.trimIndent()
                 }
@@ -290,6 +291,27 @@ class MainActivity : AppCompatActivity() {
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
 
+        binding.switchFastDvdNet.setOnCheckedChangeListener { _, isChecked ->
+            videoFrameProcessor?.fastDvdNetEngine?.isEnabled = isChecked
+            binding.switchFastDvdNet.text = if (isChecked) "ON" else "OFF"
+
+            val rifeOn = videoFrameProcessor?.isRifeEnabled == true
+            if (isChecked || rifeOn) {
+                videoFrameProcessor?.inputSurface?.let { surface ->
+                    player?.setVideoSurface(surface)
+                }
+                binding.playerView.visibility = View.GONE
+                binding.displaySurfaceView.visibility = View.VISIBLE
+            } else {
+                binding.displaySurfaceView.visibility = View.GONE
+                binding.playerView.visibility = View.VISIBLE
+                binding.playerView.post {
+                    binding.playerView.player = player
+                }
+            }
+            showPlayerControls()
+        }
+
         binding.switchRife.setOnCheckedChangeListener { _, isChecked ->
             if (isChecked && !isRifeModelLoaded) {
                 binding.switchRife.isChecked = false
@@ -300,7 +322,9 @@ class MainActivity : AppCompatActivity() {
             videoFrameProcessor?.isRifeEnabled = isChecked
             binding.switchRife.text = if (isChecked) "ON" else "OFF"
 
-            if (isChecked) {
+            val fastDvdNetOn = videoFrameProcessor?.fastDvdNetEngine?.isEnabled == true
+
+            if (isChecked || fastDvdNetOn) {
                 videoFrameProcessor?.inputSurface?.let { surface ->
                     player?.setVideoSurface(surface)
                 }
@@ -345,6 +369,8 @@ class MainActivity : AppCompatActivity() {
             val newPosition = (p.currentPosition + offsetMs)
                 .coerceIn(0, p.duration.coerceAtLeast(0))
             p.seekTo(newPosition)
+
+            videoFrameProcessor?.onSeekPerformed()
 
             val text = if (offsetMs > 0) {
                 "+${offsetMs / 1000}s"

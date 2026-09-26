@@ -1,18 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#000000"
     android:keepScreenOn="true">
 
-    <!-- Normal ExoPlayer Output View -->
+    <!-- Normal ExoPlayer Output View (using TextureView for zero-copy frame interception) -->
     <androidx.media3.ui.PlayerView
         android:id="@+id/playerView"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
+        app:surface_type="texture_view"
+        app:use_controller="false"
         android:focusable="true" />
 
-    <!-- Interpolated / Intercepted Video Surface -->
+    <!-- Interpolated / Intercepted Video Display Surface -->
     <SurfaceView
         android:id="@+id/displaySurfaceView"
         android:layout_width="match_parent"
@@ -215,6 +218,40 @@
 
                 <Switch
                     android:id="@+id/switchRife"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="OFF"
+                    android:textColor="#00E676"
+                    android:focusable="true" />
+            </LinearLayout>
+
+            <!-- FastDVDnet Settings Group -->
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="FastDVDnet Denoising"
+                android:textColor="#FFEB3B"
+                android:textSize="16sp"
+                android:textStyle="bold"
+                android:layout_marginBottom="8dp" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="12dp">
+
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Enable FastDVDnet:"
+                    android:textColor="#FFFFFF"
+                    android:textSize="16sp" />
+
+                <Switch
+                    android:id="@+id/switchFastDvdNet"
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="OFF"
