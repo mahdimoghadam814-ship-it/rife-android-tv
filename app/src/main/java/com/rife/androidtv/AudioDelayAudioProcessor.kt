@@ -104,8 +104,8 @@ class AudioDelayAudioProcessor : AudioProcessor {
 
         // Handle Positive Delay (Ring Buffering audio bytes)
         if (delayMs > 0 && delayBytesCount > 0) {
-            if (outputBuffer.capacity() < remaining + delayBytesCount) {
-                outputBuffer = ByteBuffer.allocateDirect(remaining + delayBytesCount)
+            if (outputBuffer.capacity() < remaining) {
+                outputBuffer = ByteBuffer.allocateDirect(remaining)
                     .order(ByteOrder.nativeOrder())
             } else {
                 outputBuffer.clear()
@@ -121,9 +121,9 @@ class AudioDelayAudioProcessor : AudioProcessor {
                     val bOut = delayBuffer[bufferReadIndex]
                     outputBuffer.put(bOut)
 
-                    delayBuffer[bufferWriteIndex] = bIn
+                    delayBuffer[bufferReadIndex] = bIn
                     bufferReadIndex = (bufferReadIndex + 1) % delayBuffer.size
-                    bufferWriteIndex = (bufferWriteIndex + 1) % delayBuffer.size
+                    bufferWriteIndex = bufferReadIndex
                 }
             }
             outputBuffer.flip()

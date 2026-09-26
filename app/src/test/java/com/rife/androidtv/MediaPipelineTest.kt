@@ -36,17 +36,18 @@ class MediaPipelineTest {
 
     @Test
     fun testTargetDimensionCalculation() {
-        // Test 1080p source -> 720p reduction
+        val (res1080W, res1080H) = calculateTargetDimensions(3840, 2160, RifeResolution.RES_1080P)
+        assertEquals(1920, res1080W)
+        assertEquals(1080, res1080H)
+
         val (res720W, res720H) = calculateTargetDimensions(1920, 1080, RifeResolution.RES_720P)
         assertEquals(1280, res720W)
         assertEquals(720, res720H)
 
-        // Test 1080p source -> 480p reduction
         val (res480W, res480H) = calculateTargetDimensions(1920, 1080, RifeResolution.RES_480P)
         assertEquals(854, res480W)
         assertEquals(480, res480H)
 
-        // Test Original
         val (origW, origH) = calculateTargetDimensions(1920, 1080, RifeResolution.ORIGINAL)
         assertEquals(1920, origW)
         assertEquals(1080, origH)
@@ -70,6 +71,16 @@ class MediaPipelineTest {
     ): Pair<Int, Int> {
         return when (res) {
             RifeResolution.ORIGINAL -> Pair(srcW, srcH)
+            RifeResolution.RES_1080P -> {
+                val maxDim = 1920
+                if (srcW > srcH && srcW > maxDim) {
+                    Pair(maxDim, (srcH * maxDim) / srcW)
+                } else if (srcH >= srcW && srcH > maxDim) {
+                    Pair((srcW * maxDim) / srcH, maxDim)
+                } else {
+                    Pair(srcW, srcH)
+                }
+            }
             RifeResolution.RES_720P -> {
                 val maxDim = 1280
                 if (srcW > srcH && srcW > maxDim) {
