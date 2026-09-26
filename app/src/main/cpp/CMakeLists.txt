@@ -71,6 +71,7 @@ add_library(
     rife_engine.cpp
     rife.cpp
     warp.cpp
+    fastdvdnet.cpp
 )
 
 add_dependencies(rife_native generate-rife-spirv)

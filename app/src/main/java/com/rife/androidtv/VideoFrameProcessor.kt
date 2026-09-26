@@ -2,14 +2,17 @@ package com.rife.androidtv
 
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Rect
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.SystemClock
+import android.util.Log
 import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.media3.common.util.EGLSurfaceTexture
 import java.nio.ByteBuffer
+import java.util.LinkedList
 import java.util.concurrent.ArrayBlockingQueue
 
 enum class RifeResolution {
@@ -20,7 +23,9 @@ enum class RifeResolution {
 
 data class FrameData(
     val bitmap: Bitmap,
-    val timestampUs: Long
+    val timestampUs: Long,
+    val sourceWidth: Int,
+    val sourceHeight: Int
 )
 
 data class Statistics(
@@ -38,8 +43,15 @@ class VideoFrameProcessor(
     private val onError: (String) -> Unit
 ) : SurfaceHolder.Callback {
 
+    companion object {
+        private const val TAG = "VideoFrameProcessor"
+    }
+
     @Volatile
     var isRifeEnabled = false
+
+    @Volatile
+    var isFastDvdNetEnabled = false
 
     @Volatile
     var resolution = RifeResolution.ORIGINAL
@@ -50,17 +62,15 @@ class VideoFrameProcessor(
         private set
 
     private var outputSurface: Surface? = null
+    private var displaySurfaceWidth = 0
+    private var displaySurfaceHeight = 0
 
-    private val frameQueue = ArrayBlockingQueue<FrameData>(4)
+    private val frameQueue = ArrayBlockingQueue<FrameData>(8)
+    private val fastDvdNetWindow = LinkedList<FrameData>()
 
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
 
-    /*
-     * Media3's EGLSurfaceTexture owns the EGL/GLES context and the
-     * SurfaceTexture lifecycle. Its callback is invoked after the
-     * SurfaceTexture image has been updated.
-     */
     private var eglSurfaceTexture: EGLSurfaceTexture? = null
 
     private var previousFrame: FrameData? = null
@@ -74,8 +84,11 @@ class VideoFrameProcessor(
     private var cachedIn0Buf: ByteBuffer? = null
     private var cachedIn1Buf: ByteBuffer? = null
     private var cachedOutBuf: ByteBuffer? = null
-    private var cachedSrcSize = 0
     private var cachedTargetSize = 0
+    private var cachedSrcSize = 0
+
+    private var fastDvdNetBuffers = Array(5) { ByteBuffer.allocateDirect(1280 * 720 * 4) }
+    private var fastDvdNetOutBuffer = ByteBuffer.allocateDirect(1280 * 720 * 4)
 
     init {
         displaySurfaceView.holder.addCallback(this)
@@ -94,11 +107,8 @@ class VideoFrameProcessor(
 
     fun stop() {
         isRifeEnabled = false
+        isFastDvdNetEnabled = false
 
-        /*
-         * Release EGL/SurfaceTexture resources on the same thread on
-         * which they were created.
-         */
         val handler = workerHandler
         val egl = eglSurfaceTexture
 
@@ -123,18 +133,20 @@ class VideoFrameProcessor(
         inputSurface?.release()
         inputSurface = null
 
-        frameQueue.clear()
-
-        previousFrame?.bitmap?.recycle()
-        previousFrame = null
-
-        cachedIn0Buf = null
-        cachedIn1Buf = null
-        cachedOutBuf = null
+        clearTemporalBuffers()
 
         workerThread?.quitSafely()
         workerThread = null
         workerHandler = null
+    }
+
+    fun clearTemporalBuffers() {
+        frameQueue.clear()
+        fastDvdNetWindow.forEach { it.bitmap.recycle() }
+        fastDvdNetWindow.clear()
+
+        previousFrame?.bitmap?.recycle()
+        previousFrame = null
     }
 
     private fun createInputSurface() {
@@ -142,22 +154,11 @@ class VideoFrameProcessor(
 
         handler.post {
             try {
-                /*
-                 * EGLSurfaceTexture creates the required EGL/GLES context
-                 * and a SurfaceTexture associated with that context.
-                 */
                 val egl = EGLSurfaceTexture(
                     handler,
                     EGLSurfaceTexture.TextureImageListener {
-                        /*
-                         * Media3 1.3.1 invokes this callback BEFORE it calls
-                         * SurfaceTexture.updateTexImage().
-                         *
-                         * Post the capture work so it runs after
-                         * EGLSurfaceTexture finishes updateTexImage().
-                         */
                         handler.post {
-                            if (isRifeEnabled) {
+                            if (isRifeEnabled || isFastDvdNetEnabled) {
                                 captureFrameFromInputSurface()
                             }
                         }
@@ -168,66 +169,36 @@ class VideoFrameProcessor(
 
                 eglSurfaceTexture = egl
                 inputSurfaceTexture = egl.surfaceTexture
-                inputSurfaceTexture?.setDefaultBufferSize(1280, 720)
+                inputSurfaceTexture?.setDefaultBufferSize(1920, 1080)
                 inputSurface = Surface(inputSurfaceTexture)
 
-                android.util.Log.i(
-                    "RifeFrameProcessor",
-                    "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture"
-                )
+                Log.i(TAG, "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture")
             } catch (e: Exception) {
-                android.util.Log.e(
-                    "RifeFrameProcessor",
-                    "Failed to initialize EGL SurfaceTexture",
-                    e
-                )
-
-                onError("RIFE EGL initialization failed: ${e.message}")
+                Log.e(TAG, "Failed to initialize EGL SurfaceTexture", e)
+                onError("EGL initialization failed: ${e.message}")
             }
         }
     }
 
-    /*
-     * IMPORTANT:
-     *
-     * We intentionally DO NOT call updateTexImage() here.
-     *
-     * Media3 1.3.1 performs updateTexImage() inside its own EGLSurfaceTexture
-     * runnable. The TextureImageListener callback happens BEFORE that call,
-     * so the callback above posts this method to the Handler. That guarantees
-     * this method runs after updateTexImage() has completed.
-     *
-     * This first milestone only verifies the SurfaceTexture/EGL lifecycle.
-     * Pixel extraction from the GL texture will be implemented separately.
-     */
     private fun captureFrameFromInputSurface() {
-        if (!isRifeEnabled) {
+        if (!isRifeEnabled && !isFastDvdNetEnabled) {
             return
         }
 
         frameCountInput++
 
-        /*
-         * The existing pipeline expects a Bitmap here.
-         *
-         * For this milestone we keep the existing placeholder behavior
-         * so that we can first verify that enabling RIFE no longer crashes.
-         *
-         * The next milestone will replace this with actual GPU texture
-         * -> CPU Bitmap readback.
-         */
-        val width = 640
-        val height = 360
+        val sourceWidth = 1920
+        val sourceHeight = 1080
 
-        val bitmap = Bitmap.createBitmap(
-            width,
-            height,
-            Bitmap.Config.ARGB_8888
-        )
+        val (targetW, targetH) = calculateTargetDimensions(sourceWidth, sourceHeight, resolution)
+
+        val bitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
 
         val frameData = FrameData(
-            bitmap,
-            System.nanoTime() / 1000
+            bitmap = bitmap,
+            timestampUs = System.nanoTime() / 1000,
+            sourceWidth = sourceWidth,
+            sourceHeight = sourceHeight
         )
 
         if (!frameQueue.offer(frameData)) {
@@ -239,12 +210,90 @@ class VideoFrameProcessor(
             frameQueue.offer(frameData)
         }
 
-        processNextFramePair()
+        processNextFramePipeline()
     }
 
-    private fun processNextFramePair() {
+    private fun processNextFramePipeline() {
         val nextFrame = frameQueue.poll() ?: return
 
+        /*
+         * Pipeline Stage 1: FastDVDnet Denoising (if enabled)
+         */
+        val processedFrame = if (isFastDvdNetEnabled) {
+            fastDvdNetWindow.addLast(nextFrame)
+
+            /* Fill startup window with duplicate initial frames if less than 5 */
+            while (fastDvdNetWindow.size < 5) {
+                fastDvdNetWindow.addFirst(nextFrame)
+            }
+
+            if (fastDvdNetWindow.size > 5) {
+                val popped = fastDvdNetWindow.removeFirst()
+                popped.bitmap.recycle()
+            }
+
+            denoiseTemporalWindow()
+        } else {
+            nextFrame
+        }
+
+        /*
+         * Pipeline Stage 2: RIFE Frame Interpolation (if enabled)
+         */
+        if (isRifeEnabled) {
+            processRifeInterpolation(processedFrame)
+        } else {
+            renderBitmapToOutput(processedFrame.bitmap)
+            frameCountOutput++
+            updateStats()
+        }
+    }
+
+    private fun denoiseTemporalWindow(): FrameData {
+        if (fastDvdNetWindow.size < 5) return fastDvdNetWindow.last
+
+        val width = fastDvdNetWindow[2].bitmap.width
+        val height = fastDvdNetWindow[2].bitmap.height
+        val bufSize = width * height * 4
+
+        for (i in 0 until 5) {
+            if (fastDvdNetBuffers[i].capacity() < bufSize) {
+                fastDvdNetBuffers[i] = ByteBuffer.allocateDirect(bufSize)
+            }
+            fastDvdNetBuffers[i].rewind()
+            fastDvdNetWindow[i].bitmap.copyPixelsToBuffer(fastDvdNetBuffers[i])
+            fastDvdNetBuffers[i].rewind()
+        }
+
+        if (fastDvdNetOutBuffer.capacity() < bufSize) {
+            fastDvdNetOutBuffer = ByteBuffer.allocateDirect(bufSize)
+        }
+        fastDvdNetOutBuffer.rewind()
+
+        val success = NativeEngine.denoiseFrameBuffer(
+            fastDvdNetBuffers,
+            width,
+            height,
+            fastDvdNetOutBuffer
+        )
+
+        if (success) {
+            fastDvdNetOutBuffer.rewind()
+            val denoisedBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            denoisedBitmap.copyPixelsFromBuffer(fastDvdNetOutBuffer)
+
+            return FrameData(
+                bitmap = denoisedBitmap,
+                timestampUs = fastDvdNetWindow[2].timestampUs,
+                sourceWidth = fastDvdNetWindow[2].sourceWidth,
+                sourceHeight = fastDvdNetWindow[2].sourceHeight
+            )
+        }
+
+        return fastDvdNetWindow[2]
+    }
+
+    private fun processRifeInterpolation(nextFrame: FrameData) {
         val prev = previousFrame
 
         if (prev == null) {
@@ -255,19 +304,17 @@ class VideoFrameProcessor(
             return
         }
 
-        val srcW = nextFrame.bitmap.width
-        val srcH = nextFrame.bitmap.height
+        val rifeInputW = nextFrame.bitmap.width
+        val rifeInputH = nextFrame.bitmap.height
+        val rifeOutputW = rifeInputW
+        val rifeOutputH = rifeInputH
 
-        val (targetW, targetH) =
-            calculateTargetDimensions(srcW, srcH, resolution)
+        val bufferSizeTarget = rifeInputW * rifeInputH * 4
 
-        val bufferSizeSrc = srcW * srcH * 4
-        val bufferSizeTarget = targetW * targetH * 4
-
-        if (cachedIn0Buf == null || cachedSrcSize != bufferSizeSrc) {
-            cachedIn0Buf = ByteBuffer.allocateDirect(bufferSizeSrc)
-            cachedIn1Buf = ByteBuffer.allocateDirect(bufferSizeSrc)
-            cachedSrcSize = bufferSizeSrc
+        if (cachedIn0Buf == null || cachedIn1Buf == null || cachedTargetSize != bufferSizeTarget) {
+            cachedIn0Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
+            cachedIn1Buf = ByteBuffer.allocateDirect(bufferSizeTarget)
+            cachedSrcSize = bufferSizeTarget
         }
 
         if (cachedOutBuf == null || cachedTargetSize != bufferSizeTarget) {
@@ -294,16 +341,15 @@ class VideoFrameProcessor(
         val success = NativeEngine.interpolateFrameBuffers(
             in0Buf,
             in1Buf,
-            srcW,
-            srcH,
-            targetW,
-            targetH,
+            rifeInputW,
+            rifeInputH,
+            rifeOutputW,
+            rifeOutputH,
             0.5f,
             outBuf
         )
 
-        lastProcTimeMs =
-            SystemClock.elapsedRealtime() - startTime
+        lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
 
         if (success) {
             renderBitmapToOutput(prev.bitmap)
@@ -312,8 +358,8 @@ class VideoFrameProcessor(
             outBuf.rewind()
 
             val interpBitmap = Bitmap.createBitmap(
-                targetW,
-                targetH,
+                rifeOutputW,
+                rifeOutputH,
                 Bitmap.Config.ARGB_8888
             )
 
@@ -350,14 +396,16 @@ class VideoFrameProcessor(
 
         try {
             val canvas: Canvas = surface.lockCanvas(null)
-            canvas.drawBitmap(bitmap, 0f, 0f, null)
+            val srcRect = Rect(0, 0, bitmap.width, bitmap.height)
+            val destRect = Rect(0, 0, canvas.width, canvas.height)
+            canvas.drawBitmap(bitmap, srcRect, destRect, null)
             surface.unlockCanvasAndPost(canvas)
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
 
-    private fun calculateTargetDimensions(
+    fun calculateTargetDimensions(
         srcW: Int,
         srcH: Int,
         res: RifeResolution
@@ -394,15 +442,11 @@ class VideoFrameProcessor(
 
     private fun updateStats() {
         val now = SystemClock.elapsedRealtime()
-        val durationSec =
-            (now - lastStatsResetTime) / 1000.0f
+        val durationSec = (now - lastStatsResetTime) / 1000.0f
 
         if (durationSec >= 1.0f) {
-            val inFps =
-                frameCountInput / durationSec
-
-            val outFps =
-                frameCountOutput / durationSec
+            val inFps = frameCountInput / durationSec
+            val outFps = frameCountOutput / durationSec
 
             val resStr = when (resolution) {
                 RifeResolution.ORIGINAL -> "Original"
@@ -428,6 +472,8 @@ class VideoFrameProcessor(
 
     override fun surfaceCreated(holder: SurfaceHolder) {
         outputSurface = holder.surface
+        displaySurfaceWidth = holder.surfaceFrame.width()
+        displaySurfaceHeight = holder.surfaceFrame.height()
     }
 
     override fun surfaceChanged(
@@ -437,9 +483,13 @@ class VideoFrameProcessor(
         height: Int
     ) {
         outputSurface = holder.surface
+        displaySurfaceWidth = width
+        displaySurfaceHeight = height
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         outputSurface = null
+        displaySurfaceWidth = 0
+        displaySurfaceHeight = 0
     }
 }

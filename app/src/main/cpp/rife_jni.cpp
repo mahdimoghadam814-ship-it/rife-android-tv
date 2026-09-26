@@ -3,8 +3,10 @@
 #include <android/asset_manager_jni.h>
 #include "vulkan_diagnostic.h"
 #include "rife_engine.h"
+#include "fastdvdnet.h"
 
 static RifeEngine g_rife_engine;
+static FastDVDnet g_fastdvdnet;
 
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_rife_androidtv_NativeEngine_runDiagnostics(JNIEnv* env, jclass clazz) {
@@ -87,6 +89,59 @@ Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
         timestep,
         outPtr
     );
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rife_androidtv_NativeEngine_loadFastDvdNetModel(
+    JNIEnv* env, jclass clazz, jstring paramPath, jstring binPath
+) {
+    const char* paramStr = env->GetStringUTFChars(paramPath, nullptr);
+    const char* binStr = env->GetStringUTFChars(binPath, nullptr);
+
+    int res = g_fastdvdnet.load(paramStr, binStr);
+
+    env->ReleaseStringUTFChars(paramPath, paramStr);
+    env->ReleaseStringUTFChars(binPath, binStr);
+
+    return res == 0;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rife_androidtv_NativeEngine_denoiseFrameBuffer(
+    JNIEnv* env, jclass clazz,
+    jobjectArray inBuffers,
+    jint width, jint height,
+    jobject outBuffer
+) {
+    jsize frameCount = env->GetArrayLength(inBuffers);
+    if (frameCount < 5) return false;
+
+    std::vector<ncnn::Mat> inputMats;
+    for (int i = 0; i < 5; ++i) {
+        jobject bufObj = env->GetObjectArrayElement(inBuffers, i);
+        uint8_t* ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(bufObj));
+        if (!ptr) return false;
+
+        ncnn::Mat frame = ncnn::Mat::from_pixels(ptr, ncnn::Mat::PIXEL_RGBA2RGB, width, height);
+        inputMats.push_back(frame);
+    }
+
+    ncnn::Mat outMat;
+    int ret = g_fastdvdnet.process(inputMats, outMat);
+    if (ret != 0) return false;
+
+    uint8_t* outPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(outBuffer));
+    if (!outPtr) return false;
+
+    if (outMat.empty()) {
+        /* Fallback center frame copy */
+        uint8_t* centerPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(env->GetObjectArrayElement(inBuffers, 2)));
+        memcpy(outPtr, centerPtr, width * height * 4);
+        return true;
+    }
+
+    outMat.to_pixels(outPtr, ncnn::Mat::PIXEL_RGB2RGBA);
+    return true;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

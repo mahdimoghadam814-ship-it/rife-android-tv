@@ -18,6 +18,17 @@ object NativeEngine {
     external fun loadRifeModel(assetManager: AssetManager, baseCacheDir: String, modelDir: String, isV2: Boolean, isV4: Boolean): Boolean
 
     @JvmStatic
+    external fun loadFastDvdNetModel(paramPath: String, binPath: String): Boolean
+
+    @JvmStatic
+    external fun denoiseFrameBuffer(
+        inBuffers: Array<ByteBuffer>,
+        width: Int,
+        height: Int,
+        outBuffer: ByteBuffer
+    ): Boolean
+
+    @JvmStatic
     external fun interpolateFrameBuffers(
         in0Buffer: ByteBuffer,
         in1Buffer: ByteBuffer,
