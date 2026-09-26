@@ -498,7 +498,7 @@ class VideoFrameProcessor(
 
     override fun registerInputStream(
         inputType: Int,
-        effects: MutableList<Effect>?,
+        effects: MutableList<Effect>,
         frameInfo: FrameInfo
     ) {
         check(inputType == Media3VideoFrameProcessor.INPUT_TYPE_SURFACE) {
@@ -555,7 +555,7 @@ class VideoFrameProcessor(
         }
     }
 
-    override fun setOnInputFrameProcessedListener(listener: OnInputFrameProcessedListener?) {
+    override fun setOnInputFrameProcessedListener(listener: OnInputFrameProcessedListener) {
         // Frames are consumed and rendered internally as soon as they are read back, so there is
         // no external handshake to drive. Accepted for API compatibility.
     }
