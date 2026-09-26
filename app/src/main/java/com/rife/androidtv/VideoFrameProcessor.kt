@@ -12,7 +12,6 @@ import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import androidx.media3.common.util.EGLSurfaceTexture
-import androidx.media3.common.util.GlUtil
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 
@@ -55,7 +54,6 @@ class VideoFrameProcessor(
     var resolution = RifeResolution.ORIGINAL
 
     private var inputSurfaceTexture: SurfaceTexture? = null
-    private var oesTextureId = 0
 
     var inputSurface: Surface? = null
         private set
@@ -84,6 +82,9 @@ class VideoFrameProcessor(
     private var cachedIn1Buf: ByteBuffer? = null
     private var cachedOutBuf: ByteBuffer? = null
     private var cachedTargetSize = 0
+
+    private var cachedCaptureBitmap: Bitmap? = null
+    private var cachedInterpBitmap: Bitmap? = null
 
     init {
         displaySurfaceView.holder.addCallback(this)
@@ -142,6 +143,12 @@ class VideoFrameProcessor(
         previousFrame?.bitmap?.recycle()
         previousFrame = null
 
+        cachedCaptureBitmap?.recycle()
+        cachedCaptureBitmap = null
+
+        cachedInterpBitmap?.recycle()
+        cachedInterpBitmap = null
+
         cachedIn0Buf = null
         cachedIn1Buf = null
         cachedOutBuf = null
@@ -170,13 +177,11 @@ class VideoFrameProcessor(
                 egl.init(EGLSurfaceTexture.SECURE_MODE_NONE)
 
                 eglSurfaceTexture = egl
-                val tex = GlUtil.createExternalTexture()
-                oesTextureId = tex
                 inputSurfaceTexture = egl.surfaceTexture
                 inputSurfaceTexture?.setDefaultBufferSize(1920, 1080)
                 inputSurface = Surface(inputSurfaceTexture)
 
-                Log.i(TAG, "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture (texId=$tex)")
+                Log.i(TAG, "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture")
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to initialize EGL SurfaceTexture", e)
                 onError("RIFE EGL initialization failed: ${e.message}")
@@ -189,7 +194,8 @@ class VideoFrameProcessor(
             return
         }
 
-        val surfaceTex = inputSurfaceTexture ?: return
+        val egl = eglSurfaceTexture ?: return
+        val surfaceTex = egl.surfaceTexture
 
         frameCountInput++
 
@@ -203,7 +209,12 @@ class VideoFrameProcessor(
             "FRAME CAPTURE LOG: sourceDimensions=${sourceWidth}x${sourceHeight} -> preRifeDimensions=${preRifeW}x${preRifeH}"
         )
 
-        val bitmap = Bitmap.createBitmap(preRifeW, preRifeH, Bitmap.Config.ARGB_8888)
+        var captureBitmap = cachedCaptureBitmap
+        if (captureBitmap == null || captureBitmap.width != preRifeW || captureBitmap.height != preRifeH) {
+            captureBitmap?.recycle()
+            captureBitmap = Bitmap.createBitmap(preRifeW, preRifeH, Bitmap.Config.ARGB_8888)
+            cachedCaptureBitmap = captureBitmap
+        }
 
         if (frameGrabber == null) {
             frameGrabber = OesFrameGrabber()
@@ -212,10 +223,9 @@ class VideoFrameProcessor(
         val grabbed = try {
             frameGrabber?.grabFrame(
                 surfaceTexture = surfaceTex,
-                oesTextureId = oesTextureId,
                 targetWidth = preRifeW,
                 targetHeight = preRifeH,
-                outBitmap = bitmap
+                outBitmap = captureBitmap
             ) ?: false
         } catch (e: Exception) {
             Log.e(TAG, "Error grabbing frame from OES texture", e)
@@ -223,12 +233,15 @@ class VideoFrameProcessor(
         }
 
         if (!grabbed) {
-            bitmap.recycle()
             return
         }
 
+        verifyBitmapPixels(captureBitmap, "CAPTURED_FRAME")
+
+        val frameBitmapCopy = captureBitmap.copy(Bitmap.Config.ARGB_8888, false)
+
         val frameData = FrameData(
-            bitmap = bitmap,
+            bitmap = frameBitmapCopy,
             timestampUs = System.nanoTime() / 1000,
             sourceWidth = sourceWidth,
             sourceHeight = sourceHeight
@@ -317,15 +330,17 @@ class VideoFrameProcessor(
 
             outBuf.rewind()
 
-            val interpBitmap = Bitmap.createBitmap(
-                rifeOutputW,
-                rifeOutputH,
-                Bitmap.Config.ARGB_8888
-            )
+            var interpBitmap = cachedInterpBitmap
+            if (interpBitmap == null || interpBitmap.width != rifeOutputW || interpBitmap.height != rifeOutputH) {
+                interpBitmap?.recycle()
+                interpBitmap = Bitmap.createBitmap(rifeOutputW, rifeOutputH, Bitmap.Config.ARGB_8888)
+                cachedInterpBitmap = interpBitmap
+            }
 
             interpBitmap.copyPixelsFromBuffer(outBuf)
+            verifyBitmapPixels(interpBitmap, "RIFE_OUTPUT_INTERP_FRAME")
+
             renderBitmapToOutput(interpBitmap)
-            interpBitmap.recycle()
             frameCountOutput++
 
             renderBitmapToOutput(nextFrame.bitmap)
@@ -349,6 +364,18 @@ class VideoFrameProcessor(
         previousFrame = nextFrame
 
         updateStats()
+    }
+
+    private fun verifyBitmapPixels(bitmap: Bitmap, label: String) {
+        val w = bitmap.width
+        val h = bitmap.height
+        val centerPixel = bitmap.getPixel(w / 2, h / 2)
+        val isCenterBlack = (centerPixel and 0x00FFFFFF) == 0
+
+        Log.d(
+            TAG,
+            "DIAGNOSTIC PIXEL CHECK [$label]: size=${w}x${h}, centerPixel=0x${Integer.toHexString(centerPixel)}, isBlack=$isCenterBlack"
+        )
     }
 
     private fun renderBitmapToOutput(bitmap: Bitmap) {

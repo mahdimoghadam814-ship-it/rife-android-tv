@@ -101,7 +101,6 @@ class OesFrameGrabber {
 
     fun grabFrame(
         surfaceTexture: SurfaceTexture,
-        oesTextureId: Int,
         targetWidth: Int,
         targetHeight: Int,
         outBitmap: Bitmap
@@ -119,10 +118,6 @@ class OesFrameGrabber {
         GLES20.glViewport(0, 0, targetWidth, targetHeight)
 
         GLES20.glUseProgram(program)
-
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
-        GLES20.glUniform1i(uTextureHandle, 0)
 
         GLES20.glUniformMatrix4fv(uSTMatrixHandle, 1, false, stMatrix, 0)
 
