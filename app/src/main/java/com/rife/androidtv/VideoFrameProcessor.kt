@@ -505,8 +505,10 @@ class VideoFrameProcessor(
             "RIFE only supports INPUT_TYPE_SURFACE"
         }
         if (inputWidth <= 0 || inputHeight <= 0) {
-            inputWidth = frameInfo.width
-            inputHeight = frameInfo.height
+            if (frameInfo.width > 0 && frameInfo.height > 0) {
+                inputWidth = frameInfo.width
+                inputHeight = frameInfo.height
+            }
         }
         val handler = workerHandler ?: run {
             Log.w(TAG, "registerInputStream(): worker thread is gone, skipping")
@@ -972,8 +974,16 @@ class VideoFrameProcessor(
         val (captureWidth, captureHeight) =
             calculateTargetDimensions(sourceWidth, sourceHeight, resolution)
 
+        Log.d(
+            TAG,
+            "ALLOC DIAGNOSTICS: input=${sourceWidth}x$sourceHeight " +
+                "target=${captureWidth}x$captureHeight " +
+                "bytes=${captureWidth.toLong() * captureHeight.toLong() * 4L} " +
+                "pool=${frameBufferPool.size} resolution=$resolution"
+        )
+
         val pixels = obtainFrameBuffer(captureWidth, captureHeight)
-        if (!grabber.read(texture, captureWidth, captureHeight, pixels)) {
+        if (pixels.capacity() <= 0 || !grabber.read(texture, captureWidth, captureHeight, pixels)) {
             releaseFrameBuffer(pixels)
             droppedFrameCount++
             return
@@ -1211,15 +1221,26 @@ class VideoFrameProcessor(
     }
 
     private fun obtainFrameBuffer(width: Int, height: Int): ByteBuffer {
-        val requiredBytes = width * height * 4
+        if (width <= 0 || height <= 0) {
+            Log.e(TAG, "obtainFrameBuffer: invalid dimensions ${width}x$height, dropping frame")
+            droppedFrameCount++
+            return ByteBuffer.allocateDirect(0)
+        }
+        val requiredBytes = width.toLong() * height.toLong() * 4L
+        if (requiredBytes > Int.MAX_VALUE) {
+            Log.e(TAG, "obtainFrameBuffer: dimensions ${width}x$height overflow Int, dropping frame")
+            droppedFrameCount++
+            return ByteBuffer.allocateDirect(0)
+        }
+        val intBytes = requiredBytes.toInt()
         while (true) {
             val pooled = frameBufferPool.poll() ?: break
-            if (pooled.capacity() >= requiredBytes) {
+            if (pooled.capacity() >= intBytes) {
                 pooled.clear()
                 return pooled
             }
         }
-        return ByteBuffer.allocateDirect(requiredBytes)
+        return ByteBuffer.allocateDirect(intBytes)
     }
 
     /**
@@ -1302,43 +1323,46 @@ class VideoFrameProcessor(
         srcH: Int,
         res: RifeResolution
     ): Pair<Int, Int> {
+        val safeSrcW = srcW.coerceAtLeast(1)
+        val safeSrcH = srcH.coerceAtLeast(1)
+
         return when (res) {
             RifeResolution.ORIGINAL ->
-                Pair(srcW, srcH)
+                Pair(safeSrcW, safeSrcH)
 
             RifeResolution.RES_1080P -> {
                 val maxDim = 1920
 
-                if (srcW > srcH && srcW > maxDim) {
-                    Pair(maxDim, (srcH * maxDim) / srcW)
-                } else if (srcH >= srcW && srcH > maxDim) {
-                    Pair((srcW * maxDim) / srcH, maxDim)
+                if (safeSrcW > safeSrcH && safeSrcW > maxDim) {
+                    Pair(maxDim, ((safeSrcH * maxDim) / safeSrcW).coerceAtLeast(1))
+                } else if (safeSrcH >= safeSrcW && safeSrcH > maxDim) {
+                    Pair(((safeSrcW * maxDim) / safeSrcH).coerceAtLeast(1), maxDim)
                 } else {
-                    Pair(srcW, srcH)
+                    Pair(safeSrcW, safeSrcH)
                 }
             }
 
             RifeResolution.RES_720P -> {
                 val maxDim = 1280
 
-                if (srcW > srcH && srcW > maxDim) {
-                    Pair(maxDim, (srcH * maxDim) / srcW)
-                } else if (srcH >= srcW && srcH > maxDim) {
-                    Pair((srcW * maxDim) / srcH, maxDim)
+                if (safeSrcW > safeSrcH && safeSrcW > maxDim) {
+                    Pair(maxDim, ((safeSrcH * maxDim) / safeSrcW).coerceAtLeast(1))
+                } else if (safeSrcH >= safeSrcW && safeSrcH > maxDim) {
+                    Pair(((safeSrcW * maxDim) / safeSrcH).coerceAtLeast(1), maxDim)
                 } else {
-                    Pair(srcW, srcH)
+                    Pair(safeSrcW, safeSrcH)
                 }
             }
 
             RifeResolution.RES_480P -> {
                 val maxDim = 854
 
-                if (srcW > srcH && srcW > maxDim) {
-                    Pair(maxDim, (srcH * maxDim) / srcW)
-                } else if (srcH >= srcW && srcH > maxDim) {
-                    Pair((srcW * maxDim) / srcH, maxDim)
+                if (safeSrcW > safeSrcH && safeSrcW > maxDim) {
+                    Pair(maxDim, ((safeSrcH * maxDim) / safeSrcW).coerceAtLeast(1))
+                } else if (safeSrcH >= safeSrcW && safeSrcH > maxDim) {
+                    Pair(((safeSrcW * maxDim) / safeSrcH).coerceAtLeast(1), maxDim)
                 } else {
-                    Pair(srcW, srcH)
+                    Pair(safeSrcW, safeSrcH)
                 }
             }
         }
