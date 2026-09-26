@@ -7,6 +7,17 @@ pluginManagement {
         mavenCentral()
         gradlePluginPortal()
     }
+    // KSP's plugin marker is not on Google Maven; the aliyun Google mirror
+    // returns HTTP 502 for it, which Gradle treats as a fatal error and aborts
+    // plugin resolution before reaching Maven Central / the plugin portal.
+    // Map the plugin id to its real implementation module instead.
+    resolutionStrategy {
+        eachPlugin {
+            if (requested.id.id == "com.google.devtools.ksp") {
+                useModule("com.google.devtools.ksp:symbol-processing-gradle-plugin:${requested.version}")
+            }
+        }
+    }
 }
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
