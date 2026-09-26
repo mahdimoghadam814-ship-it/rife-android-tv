@@ -7,6 +7,9 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.KeyEvent
+import android.view.Surface
+import android.view.SurfaceView
+import android.view.TextureView
 import android.view.View
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
@@ -15,8 +18,11 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.PositionInfo
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import com.rife.androidtv.databinding.ActivityMainBinding
 
@@ -109,9 +115,59 @@ class MainActivity : AppCompatActivity() {
                 runOnUiThread {
                     Toast.makeText(this, "RIFE Processing Error: $error", Toast.LENGTH_SHORT).show()
                 }
+            },
+            onInputSurfaceCreated = { surface ->
+                // Called on the main thread by the processor. The processor owns this Surface: it is
+                // only attached while RIFE is intercepting frames, and the processor is told once
+                // the player has actually taken it over.
+                attachRifeInputSurface(surface)
             }
         )
         videoFrameProcessor?.start()
+    }
+
+    /**
+     * Attaches the processor-owned input Surface to the player so that MediaCodec decodes straight
+     * into the RIFE pipeline.
+     *
+     * While RIFE is off the PlayerView keeps ownership of rendering, so the surface is deliberately
+     * left unattached; the processor re-notifies on the next enable.
+     */
+    private fun attachRifeInputSurface(surface: Surface) {
+        val currentPlayer = player ?: return
+        if (videoFrameProcessor?.isRifeEnabled != true) {
+            return
+        }
+        currentPlayer.setVideoSurface(surface)
+        videoFrameProcessor?.onInputSurfaceAttached()
+    }
+
+    /**
+     * Gives rendering back to the PlayerView after RIFE has been switched off.
+     *
+     * The surface is never detached with `setVideoSurface(null)`: the PlayerView's own SurfaceView
+     * is re-attached instead, and the player is not re-set through `PlayerView.setPlayer()`, which
+     * would only work if the very same instance were passed back in.
+     */
+    private fun restorePlayerSurface() {
+        val currentPlayer = player ?: return
+        // The PlayerView owns its rendering surface; hand that exact view back to the player
+        // instead of dropping the video surface to null.
+        when (val playerViewSurface = binding.playerView.getVideoSurfaceView()) {
+            is SurfaceView -> {
+                currentPlayer.clearVideoSurface()
+                currentPlayer.setVideoSurfaceView(playerViewSurface)
+            }
+
+            is TextureView -> {
+                currentPlayer.clearVideoSurface()
+                currentPlayer.setVideoTextureView(playerViewSurface)
+            }
+
+            else -> {
+                Toast.makeText(this, "Could not restore the player surface", Toast.LENGTH_LONG).show()
+            }
+        }
     }
 
     private fun setupPlayer() {
@@ -149,8 +205,35 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+            override fun onPlayerError(error: PlaybackException) {
                 Toast.makeText(this@MainActivity, "Playback Error: ${error.message}", Toast.LENGTH_LONG).show()
+            }
+
+            /**
+             * K3: a seek must not interpolate a frame from before the seek against the first frame
+             * after it, so every frame of RIFE state is dropped on a position discontinuity.
+             */
+            override fun onPositionDiscontinuity(
+                oldPosition: PositionInfo,
+                newPosition: PositionInfo,
+                reason: Int
+            ) {
+                if (reason == Player.DISCONTINUITY_REASON_SEEK ||
+                    reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT ||
+                    reason == Player.DISCONTINUITY_REASON_INTERNAL
+                ) {
+                    videoFrameProcessor?.resetPipeline("position_discontinuity_$reason")
+                }
+            }
+
+            /** K3: a new media item must not be paired with frames of the previous one. */
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                videoFrameProcessor?.resetForNewStream("media_item_transition_$reason")
+            }
+
+            /** The decoded size drives the real readback size used before RIFE. */
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                videoFrameProcessor?.setInputFrameSize(videoSize.width, videoSize.height)
             }
         })
     }
@@ -264,21 +347,23 @@ class MainActivity : AppCompatActivity() {
                 return@setOnCheckedChangeListener
             }
 
-            videoFrameProcessor?.isRifeEnabled = isChecked
             binding.switchRife.text = if (isChecked) "ON" else "OFF"
 
             if (isChecked) {
-                videoFrameProcessor?.inputSurface?.let { surface ->
-                    player?.setVideoSurface(surface)
-                }
-                binding.playerView.visibility = View.GONE
+                // Show the RIFE output surface first so the processor has somewhere to render to.
                 binding.displaySurfaceView.visibility = View.VISIBLE
+                binding.playerView.visibility = View.GONE
+                // Resets every piece of RIFE state and (re)creates the Media3 input surface, which
+                // comes back through onInputSurfaceCreated -> attachRifeInputSurface().
+                videoFrameProcessor?.setRifeEnabled(true)
                 Toast.makeText(this, "RIFE Frame Interpolation Active", Toast.LENGTH_SHORT).show()
             } else {
-                player?.setVideoSurface(null)
-                binding.playerView.setPlayer(player)
+                // Releases the RIFE output surface and drops all pending RIFE state. The input
+                // Surface stays owned by the processor, untouched.
+                videoFrameProcessor?.setRifeEnabled(false)
                 binding.displaySurfaceView.visibility = View.GONE
                 binding.playerView.visibility = View.VISIBLE
+                restorePlayerSurface()
                 Toast.makeText(this, "Normal ExoPlayer Playback Active", Toast.LENGTH_SHORT).show()
             }
             showPlayerControls()
@@ -404,6 +489,9 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // Detach the processor-owned surface before it is released, so the player never renders
+        // into a Surface that no longer exists.
+        player?.clearVideoSurface()
         videoFrameProcessor?.stop()
         player?.release()
         player = null
