@@ -1,8 +1,8 @@
 #ifndef FASTDVDNET_H
 #define FASTDVDNET_H
 
-#include <ncnn/net.h>
-#include <ncnn/gpu.h>
+#include "net.h"
+#include "gpu.h"
 #include <vector>
 #include <string>
 
