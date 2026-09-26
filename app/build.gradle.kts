@@ -1,51 +1,58 @@
+import org.jetbrains.kotlin.gradle.dsl.JvmTarget
+
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    alias(libs.plugins.androidApplication)
+    alias(libs.plugins.composeCompiler)
+    alias(libs.plugins.kotlinSerialization)
+    alias(libs.plugins.koinCompiler)
 }
 
 android {
     namespace = "com.rife.androidtv"
-    compileSdk = 34
 
+    compileSdk = libs.versions.android.compileSdk.get().toInt()
     defaultConfig {
+        minSdk = libs.versions.android.minSdk.get().toInt()
+        targetSdk = libs.versions.android.targetSdk.get().toInt()
         applicationId = "com.rife.androidtv"
-        minSdk = 24
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
-
+        versionCode = 2
+        versionName = "2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
 
-        ndk {
-            abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a"))
-        }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+    }
 
-        externalNativeBuild {
-            cmake {
-                cppFlags.addAll(listOf("-std=c++17", "-frtti", "-fexceptions"))
-                arguments.addAll(listOf(
-                    "-DANDROID_STL=c++_shared",
-                    "-DNCNN_VULKAN=ON",
-                    "-DNCNN_BUILD_BENCHMARK=OFF",
-                    "-DNCNN_BUILD_EXAMPLES=OFF",
-                    "-DNCNN_BUILD_TOOLS=OFF"
-                ))
-            }
-        }
+    compileOptions {
+        sourceCompatibility = JavaVersion.toVersion(libs.versions.android.jvm.get().toInt())
+        targetCompatibility = JavaVersion.toVersion(libs.versions.android.jvm.get().toInt())
     }
 
     buildTypes {
-        release {
-            isMinifyEnabled = false
+        getByName("release") {
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                "proguard-rules.pro",
             )
         }
-        debug {
+
+        getByName("debug") {
             isDebuggable = true
         }
     }
+
+    // The RIFE engine (ncnn + Vulkan + SPIR-V shaders) is built from the third_party
+    // submodules through CMake. Only the target TV box ABI is packaged to keep the
+    // multi-gigabyte native build inside the storage budget of the build device.
+    ndk {
+        abiFilters.addAll(listOf("arm64-v8a"))
+    }
+
+    ndkVersion = "26.3.11579264"
 
     externalNativeBuild {
         cmake {
@@ -54,33 +61,82 @@ android {
         }
     }
 
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+    packaging {
+        resources {
+            excludes.add("/META-INF/{AL2.0,LGPL2.1}")
+        }
     }
 
-    kotlinOptions {
-        jvmTarget = "1.8"
+    dependenciesInfo {
+        // Disables dependency metadata when building APKs.
+        includeInApk = false
+        // Disables dependency metadata when building Android App Bundles.
+        includeInBundle = false
     }
+}
 
-    buildFeatures {
-        viewBinding = true
+kotlin {
+    compilerOptions {
+        jvmTarget.set(JvmTarget.fromTarget(libs.versions.android.jvm.get()))
     }
-
-    ndkVersion = "26.3.11579264"
 }
 
 dependencies {
-    val media3Version = "1.3.1"
-    implementation("androidx.media3:media3-exoplayer:$media3Version")
-    implementation("androidx.media3:media3-ui:$media3Version")
-    implementation("androidx.media3:media3-common:$media3Version")
-    implementation("androidx.media3:media3-session:$media3Version")
 
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation(project(":core:common"))
+    implementation(project(":core:data"))
+    implementation(project(":core:media"))
+    implementation(project(":core:model"))
+    implementation(project(":core:ui"))
+    implementation(project(":feature:network"))
+    implementation(project(":feature:playlist"))
+    implementation(project(":feature:videopicker"))
+    implementation(project(":feature:player"))
+    implementation(project(":feature:settings"))
 
-    testImplementation("junit:junit:4.13.2")
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.activity.compose)
+    implementation(libs.androidx.appcompat)
+
+    // Compose
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.androidx.compose.material3.adaptive)
+    implementation(libs.androidx.navigation3.runtime)
+    implementation(libs.androidx.navigation3.ui)
+    implementation(libs.androidx.lifecycle.viewmodel.navigation3)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtimeCompose)
+
+    implementation(libs.google.android.material)
+    implementation(libs.androidx.core.splashscreen)
+
+    implementation(libs.coil.compose)
+    implementation(libs.coil.network.okhttp)
+
+    // Koin
+    implementation(libs.koin.android)
+    implementation(libs.koin.annotations)
+    implementation(libs.koin.compose.viewmodel)
+
+    implementation(libs.accompanist.permissions)
+
+    implementation(libs.github.anilbeesetti.nextlib.mediainfo)
+
+    testImplementation(libs.junit4)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.robolectric)
+    androidTestImplementation(project(":core:domain"))
+    androidTestImplementation(libs.androidx.datastore.core)
+    androidTestImplementation(libs.androidx.media3.session)
+    androidTestImplementation(libs.github.anilbeesetti.nextlib.media3ext)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.test.ext)
+    androidTestImplementation(libs.androidx.test.rules)
+    androidTestImplementation(libs.androidx.test.espresso.core)
+    androidTestImplementation(libs.androidx.compose.ui.test)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+    debugImplementation(libs.androidx.compose.ui.testManifest)
 }
