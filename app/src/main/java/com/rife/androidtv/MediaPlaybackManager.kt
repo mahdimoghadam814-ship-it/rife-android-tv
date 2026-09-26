@@ -58,7 +58,14 @@ class MediaPlaybackManager(
 
     fun setVideoSource(uri: Uri) {
         this.videoUri = uri
-        rebuildAndApplyMediaSource()
+
+        // A new video must start from a clean player: keeping the old playlist, the old position or
+        // the old playWhenReady state made the next video inherit the previous video's timestamp and
+        // could leave it paused, which is also what kept a broken video surface alive across videos.
+        player.stop()
+        player.clearMediaItems()
+
+        rebuildAndApplyMediaSource(resetPosition = true)
     }
 
     fun setExternalAudioSource(uri: Uri?, label: String? = "External Audio") {
@@ -106,11 +113,11 @@ class MediaPlaybackManager(
         applyOffsetsToPlayer()
     }
 
-    fun rebuildAndApplyMediaSource() {
+    fun rebuildAndApplyMediaSource(resetPosition: Boolean = false) {
         val currentVideoUri = videoUri ?: return
 
-        val wasPlaying = player.isPlaying
-        val currentPos = player.currentPosition
+        val currentPos = if (resetPosition) 0L else player.currentPosition
+        val playWhenReady = if (resetPosition) true else player.isPlaying
 
         val mediaSources = mutableListOf<MediaSource>()
 
@@ -155,12 +162,15 @@ class MediaPlaybackManager(
             MergingMediaSource(true, *mediaSources.toTypedArray())
         }
 
+        player.clearMediaItems()
         player.setMediaSource(finalSource)
         player.prepare()
         if (currentPos > 0) {
             player.seekTo(currentPos)
+        } else {
+            player.seekTo(0, 0L)
         }
-        player.playWhenReady = wasPlaying
+        player.playWhenReady = playWhenReady
 
         updateTrackSelection()
         applyOffsetsToPlayer()

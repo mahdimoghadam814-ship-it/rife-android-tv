@@ -33,6 +33,7 @@ import androidx.media3.common.VideoFrameProcessor as Media3VideoFrameProcessor
 
 enum class RifeResolution {
     ORIGINAL,
+    RES_1080P,
     RES_720P,
     RES_480P
 }
@@ -41,7 +42,13 @@ enum class RifeResolution {
  * A single *real* decoded video frame.
  *
  * [pixels] is a direct, tightly packed RGBA (ARGB_8888) buffer read back from the Media3 input
- * surface. It never contains placeholder data.
+ * surface through [OesFrameGrabber]. It never contains placeholder data.
+ *
+ * [timestampUs] comes from [SurfaceTexture.getTimestamp] of the frame the decoder had just queued.
+ * For a surface-rendered producer that value is the producer's frame timestamp, **not** a verified
+ * Media3 media presentation timestamp: it is used for ordering and logging only. Nothing in the
+ * pipeline maps it onto the media timeline, so audio/video sync is left to the player, and no
+ * synthetic `System.nanoTime()` mapping is introduced to disguise that.
  */
 data class FrameData(
     val pixels: ByteBuffer,
@@ -59,53 +66,86 @@ data class Statistics(
 )
 
 /**
- * RIFE frame processor built on the real Media3 [androidx.media3.common.VideoFrameProcessor]
- * surface-input contract.
+ * Frame processor for RIFE interpolation and the (scaffold) FastDVDnet pre-processing stage, built
+ * on the real Media3 [androidx.media3.common.VideoFrameProcessor] surface-input contract.
  *
  * ```
- * MediaCodec (ExoPlayer) -> getInputSurface() -> SurfaceTexture
- *                                         -> GlRgbaFrameReader (real glReadPixels)
- *                                         -> previousFrame / frameQueue
+ * MediaCodec (ExoPlayer) -> getInputSurface() -> SurfaceTexture (OES texture)
+ *                                         -> OesFrameGrabber (FBO + glReadPixels, real pixels)
+ *                                         -> frameQueue (bounded, backpressure)
+ *                                         -> FastDVDnet scaffold (optional pre-processing)
  *                                         -> NativeEngine.interpolateFrameBuffers(in0, in1, ...)
- *                                         -> setOutputSurfaceInfo() output Surface
+ *                                         -> previous / interpolated / next -> output Surface
  * ```
  *
  * This implements the Media3 1.3.1 `VideoFrameProcessor` interface: `INPUT_TYPE_SURFACE`,
  * `getInputSurface()`, `registerInputStream()`, `registerInputFrame()`, `setOutputSurfaceInfo()`,
- * `flush()` and `release()`. Only surface input is supported. The input surface is owned by this
- * processor and the display surface is handed over through `setOutputSurfaceInfo()`, so neither
- * surface lifetime depends on `Player.setVideoSurface(null)` or on re-setting the player on a
- * `PlayerView`.
+ * `flush()` and `release()`. Only surface input is supported.
+ *
+ * Surface ownership (one owner, no competing outputs):
+ *  * the processor owns the input [Surface]; the player renders decoded frames into it while either
+ *    processing stage is enabled. It is handed over through [onInputSurfaceCreated] and confirmed
+ *    through [onInputSurfaceAttached];
+ *  * the display surface of [displaySurfaceView] is published through `setOutputSurfaceInfo()`, and
+ *    released again when processing is switched off, which is what lets the owner restore normal
+ *    `PlayerView` playback;
+ *  * neither surface lifetime depends on `Player.setVideoSurface(null)` or on re-setting the player
+ *    on a `PlayerView`.
+ *
+ * All frame, buffer and GL state lives on a single worker thread, so a buffer or bitmap is never
+ * recycled while another stage could still be reading it.
  */
 @UnstableApi
 class VideoFrameProcessor(
     private val displaySurfaceView: SurfaceView,
     private val onStatisticsUpdated: (Statistics) -> Unit,
     private val onError: (String) -> Unit,
-    private val onInputSurfaceCreated: (Surface) -> Unit = {}
+    private val onInputSurfaceCreated: (Surface) -> Unit = {},
+    private val onInputSurfaceFailed: () -> Unit = {}
 ) : SurfaceHolder.Callback, Media3VideoFrameProcessor {
 
     companion object {
         private const val TAG = "VideoFrameProcessor"
 
+        /** Bounded queue: the pipeline must never grow faster than it can interpolate. */
         private const val FRAME_QUEUE_CAPACITY = 4
+
+        /** Pooled capture buffers. Bounded so a 4K stream cannot inflate the heap. */
         private const val MAX_POOLED_FRAME_BUFFERS = 6
+
         private const val WORKER_TASK_TIMEOUT_MS = 3000L
 
+        /**
+         * Only used to describe the input stream to Media3 before the real video size is known. It
+         * is never used to size a readback or an inference buffer.
+         */
         private const val FALLBACK_FRAME_WIDTH = 1920
         private const val FALLBACK_FRAME_HEIGHT = 1080
     }
 
     /**
-     * Whether RIFE frame interception is active. Frames arriving on the input surface are only
-     * read back while this is `true`.
+     * Whether RIFE interpolation is active. Input-surface frames are only read back while RIFE or
+     * the FastDVDnet stage is enabled.
      */
     @Volatile
     var isRifeEnabled = false
         private set
 
+    /**
+     * FastDVDnet pre-processing stage. This is a scaffold (history bookkeeping + pass-through),
+     * not a neural denoiser; see [FastDvdNetEngine].
+     */
+    val fastDvdNetEngine = FastDvdNetEngine()
+
     @Volatile
     var resolution = RifeResolution.ORIGINAL
+
+    /**
+     * True when the player must render into this processor's input surface, i.e. state 2, 3 or 4.
+     * When false the owner restores normal `PlayerView` playback (state 1).
+     */
+    val isProcessingEnabled: Boolean
+        get() = isRifeEnabled || fastDvdNetEngine.isEnabled
 
     /** Media3 reporting listener; output frames are rendered automatically by this processor. */
     private val media3Listener = object : Media3VideoFrameProcessor.Listener {
@@ -150,22 +190,31 @@ class VideoFrameProcessor(
     private var inputBundle: InputSurfaceBundle? = null
 
     /**
-     * The bundle that [inputBundle] replaced. It is kept alive until the player confirms it has
+     * The bundle that [inputBundle] replaced. It is kept alive until the owner confirms it has
      * attached the new surface, so the player is never left rendering into a destroyed Surface.
      */
     private var pendingSupersededBundle: InputSurfaceBundle? = null
-    private var frameReader: GlRgbaFrameReader? = null
+
+    private var frameGrabber: OesFrameGrabber? = null
     private var inputSurfaceEverAttached = false
 
     @Volatile
     private var createdInputSurface: Surface? = null
 
     /**
-     * The input surface the player must render decoded frames into, or `null` when none exists
-     * yet. The processor owns its lifecycle.
+     * `false` while the input surface is being (re)created, so the owner can never attach a surface
+     * that is about to be retired: [rifeInputSurface] reports `null` in that window and the owner
+     * waits for [onInputSurfaceCreated] instead.
+     */
+    @Volatile
+    private var inputSurfaceReady = false
+
+    /**
+     * The input surface the player must render decoded frames into, or `null` when none exists yet or
+     * one is being replaced. The processor owns its lifecycle.
      */
     val rifeInputSurface: Surface?
-        get() = createdInputSurface
+        get() = if (inputSurfaceReady) createdInputSurface else null
 
     // ---------------------------------------------------------------------------------------
     // RIFE pipeline state. Only ever mutated on the worker thread.
@@ -184,6 +233,8 @@ class VideoFrameProcessor(
 
     private var cachedIn0Buf: ByteBuffer? = null
     private var cachedIn1Buf: ByteBuffer? = null
+    private var cachedDenoised0Buf: ByteBuffer? = null
+    private var cachedDenoised1Buf: ByteBuffer? = null
     private var cachedOutBuf: ByteBuffer? = null
     private var cachedTargetSize = 0
 
@@ -246,43 +297,86 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Enables or disables RIFE frame interception.
+     * Enables or disables RIFE interpolation.
      *
-     * OFF -> ON flushes all RIFE state and re-creates the Media3 input surface together with its
+     * OFF -> ON flushes all pipeline state and re-creates the Media3 input surface together with its
      * EGL context and SurfaceTexture, so a stale or stalled input surface can never be reused. The
      * new surface is reported through the `onInputSurfaceCreated` callback so the owner can attach
      * it to the player.
      *
-     * ON -> OFF stops reading frames, drops all pending RIFE state and releases the output surface
-     * via `setOutputSurfaceInfo(null)`, which lets the owner restore the normal PlayerView
-     * rendering path.
+     * ON -> OFF stops reading frames, drops all pending pipeline state and releases the output
+     * surface via `setOutputSurfaceInfo(null)`, which lets the owner restore normal PlayerView
+     * rendering.
      */
     fun setRifeEnabled(enabled: Boolean) {
         if (isRifeEnabled == enabled) {
             return
         }
         isRifeEnabled = enabled
-
         if (enabled) {
-            runOnWorker("setRifeEnabled(true)") {
-                resetPipelineOnWorker("rife_enabled")
-                createInputSurfaceOnWorker("rife_enabled")
-            }
+            enableProcessing("rife_enabled")
         } else {
-            runOnWorker("setRifeEnabled(false)") {
-                pendingOutputSurfaceInfo = null
-                resetPipelineOnWorker("rife_disabled")
+            disableStage("rife_disabled")
+        }
+    }
+
+    /**
+     * Enables or disables the FastDVDnet pre-processing stage, i.e. the switch between
+     * "RIFE OFF + FastDVDnet ON" (state 2) and "RIFE OFF + FastDVDnet OFF" (state 1).
+     */
+    fun setFastDvdNetEnabled(enabled: Boolean) {
+        if (fastDvdNetEngine.isEnabled == enabled) {
+            return
+        }
+        fastDvdNetEngine.isEnabled = enabled
+        if (enabled) {
+            enableProcessing("fastdvdnet_enabled")
+        } else {
+            disableStage("fastdvdnet_disabled")
+        }
+    }
+
+    /**
+     * Turning a stage on: the player has to render into the input surface, and no frame captured
+     * before the toggle may be paired with a frame captured after it.
+     *
+     * The surface itself is only (re)created when the player does not hold it yet: a surface that is
+     * already attached stays in place, so toggling a second stage cannot invalidate the surface the
+     * decoder is currently writing into.
+     */
+    private fun enableProcessing(reason: String) {
+        // Block the owner from attaching a surface that is about to be replaced.
+        inputSurfaceReady = false
+        runOnWorker("enableProcessing($reason)") {
+            resetPipelineOnWorker(reason)
+            if (inputBundle == null || !inputSurfaceEverAttached) {
+                createInputSurfaceOnWorker(reason)
+            } else {
+                registerInputStreamOnWorker(currentFrameInfo())
+                notifyInputSurfaceCreated(createdInputSurface!!)
             }
         }
     }
 
     /**
-     * Clears every piece of per-stream RIFE state: the buffered previous frame, the frame queue,
-     * the cached RIFE input/output buffers, the pending-readback flag and the frame counters.
+     * Turning a stage off: the output surface is handed back so the owner can restore normal
+     * playback, and every frame that crossed the toggle boundary is dropped.
+     */
+    private fun disableStage(reason: String) {
+        runOnWorker("disableStage($reason)") {
+            pendingOutputSurfaceInfo = null
+            resetPipelineOnWorker(reason)
+        }
+    }
+
+    /**
+     * Clears every piece of per-stream pipeline state: the buffered previous frame, the frame queue,
+     * the cached capture/inference buffers, the FastDVDnet temporal history, the pending-readback
+     * flag and the frame counters.
      *
-     * Safe to call from any thread: the reset is serialized on the worker thread, which is the
-     * sole owner of every frame buffer. No buffer or bitmap is recycled while another worker could
-     * still be reading it, because there is only ever one worker.
+     * Safe to call from any thread: the reset is serialized on the worker thread, which is the sole
+     * owner of every frame buffer. No buffer or bitmap is recycled while another worker could still
+     * be reading it, because there is only ever one worker.
      */
     fun resetPipeline(reason: String) {
         val handler = workerHandler
@@ -310,8 +404,9 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Records the decoded frame size reported by `Player.Listener.onVideoSizeChanged`, i.e. the
-     * size of the frames the player renders into [getInputSurface].
+     * Records the decoded frame size reported by `Player.Listener.onVideoSizeChanged`, i.e. the size
+     * of the frames the player renders into `getInputSurface`. The value drives the readback size,
+     * so no fixed 1920x1080 processing size is assumed.
      */
     fun setInputFrameSize(width: Int, height: Int) {
         if (width <= 0 || height <= 0) {
@@ -323,8 +418,17 @@ class VideoFrameProcessor(
         inputWidth = width
         inputHeight = height
         Log.i(TAG, "Input frame size updated: ${width}x$height")
-        // A resolution change invalidates anything already buffered.
-        resetPipeline("input_size_changed")
+
+        // A resolution change invalidates anything already buffered, and the SurfaceTexture has to
+        // be told about the new producer buffer size.
+        runOnWorker("setInputFrameSize") {
+            inputBundle?.texture?.let { texture ->
+                if (!texture.isReleased) {
+                    texture.setDefaultBufferSize(width, height)
+                }
+            }
+            resetPipelineOnWorker("input_size_changed")
+        }
     }
 
     /**
@@ -341,9 +445,22 @@ class VideoFrameProcessor(
         }
     }
 
+    /**
+     * Called by the owner when it has taken the input surface away from the player, i.e. when normal
+     * PlayerView playback is restored. The surface itself is kept alive and can be handed back to the
+     * player by the next enable, but the processor must not assume the player is still writing into
+     * it.
+     */
+    fun onInputSurfaceDetached() {
+        runOnWorker("onInputSurfaceDetached()") {
+            inputSurfaceEverAttached = false
+        }
+    }
+
     /** Stops the worker and releases every resource owned by the processor. */
     fun stop() {
         isRifeEnabled = false
+        fastDvdNetEngine.isEnabled = false
         released = true
 
         val handler = workerHandler
@@ -366,6 +483,7 @@ class VideoFrameProcessor(
         workerThread = null
         workerHandler = null
         createdInputSurface = null
+        inputSurfaceReady = false
     }
 
     // ---------------------------------------------------------------------------------------
@@ -464,8 +582,8 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Media3 flush. All frames registered before the flush stop being considered registered, so
-     * the caller has to register the input stream again before feeding new frames.
+     * Media3 flush. All frames registered before the flush stop being considered registered, so the
+     * caller has to register the input stream again before feeding new frames.
      */
     override fun flush() {
         runOnWorker("flush()") {
@@ -541,7 +659,7 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Clears every piece of per-stream RIFE state. Runs on the worker thread so that no frame
+     * Clears every piece of per-stream pipeline state. Runs on the worker thread so that no frame
      * buffer is recycled while it could still be in use.
      */
     private fun resetPipelineOnWorker(reason: String) {
@@ -558,8 +676,13 @@ class VideoFrameProcessor(
             discarded++
         }
 
+        // Temporal history of the FastDVDnet scaffold must not survive a pipeline boundary either.
+        fastDvdNetEngine.reset()
+
         cachedIn0Buf = null
         cachedIn1Buf = null
+        cachedDenoised0Buf = null
+        cachedDenoised1Buf = null
         cachedOutBuf = null
         cachedTargetSize = 0
         readbackInProgress = false
@@ -578,8 +701,8 @@ class VideoFrameProcessor(
         releaseOutputBitmap()
 
         // The bundle's EGL context is still current here, so its GL objects can be deleted safely.
-        releaseGlObjectsForBundle(inputBundle, frameReader)
-        frameReader = null
+        releaseGlObjectsForBundle(inputBundle, frameGrabber)
+        frameGrabber = null
         releaseGlObjectsForBundle(pendingSupersededBundle, null)
 
         releaseInputSurfaceBundle(inputBundle)
@@ -587,6 +710,7 @@ class VideoFrameProcessor(
         releaseInputSurfaceBundle(pendingSupersededBundle)
         pendingSupersededBundle = null
         createdInputSurface = null
+        inputSurfaceReady = false
         inputSurfaceEverAttached = false
         inputStreamRegistered = false
         endOfInputSignalled = false
@@ -596,12 +720,12 @@ class VideoFrameProcessor(
      * Deletes the GL objects that belong to [bundle]'s EGL context. Must run while that context is
      * still current, otherwise the texture names would be meaningless in the new context.
      */
-    private fun releaseGlObjectsForBundle(bundle: InputSurfaceBundle?, reader: GlRgbaFrameReader?) {
+    private fun releaseGlObjectsForBundle(bundle: InputSurfaceBundle?, grabber: OesFrameGrabber?) {
         if (bundle == null || bundle.glObjectsReleased) {
             return
         }
         try {
-            reader?.release()
+            grabber?.release()
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to release the GL readback objects", t)
         }
@@ -686,6 +810,7 @@ class VideoFrameProcessor(
             val reusable = inputBundle
             if (reusable != null && !inputSurfaceEverAttached) {
                 registerInputStreamOnWorker(currentFrameInfo())
+                inputSurfaceReady = true
                 Log.i(TAG, "Reusing the existing Media3 input surface ($reason)")
                 notifyInputSurfaceCreated(reusable.surfaceHandle)
                 return
@@ -693,14 +818,19 @@ class VideoFrameProcessor(
 
             // The replaced bundle's EGL context is still current right now, so its GL objects have
             // to be deleted before the new context takes over.
-            releaseGlObjectsForBundle(inputBundle, frameReader)
-            frameReader = null
+            releaseGlObjectsForBundle(inputBundle, frameGrabber)
+            frameGrabber = null
 
             val display = GlUtil.getDefaultEglDisplay()
             val context = GlUtil.createEglContext(display)
             val eglSurface = GlUtil.createFocusedPlaceholderEglSurface(context, display)
             val textureId = GlUtil.createExternalTexture()
             val texture = SurfaceTexture(textureId)
+            if (inputWidth > 0 && inputHeight > 0) {
+                // Tells the SurfaceTexture how large the producer buffers are, so the sampling
+                // transform matrix is built for the real video size instead of an unknown one.
+                texture.setDefaultBufferSize(inputWidth, inputHeight)
+            }
             val inputSurface = Surface(texture)
             newBundle = InputSurfaceBundle(
                 display = display,
@@ -724,15 +854,16 @@ class VideoFrameProcessor(
                 workerHandler
             )
 
-            val reader = GlRgbaFrameReader()
-            frameReader = reader
-            reader.create(textureId, texture)
+            val grabber = OesFrameGrabber()
+            grabber.init(textureId)
+            frameGrabber = grabber
 
             // The replaced EGL/SurfaceTexture state has to outlive the handover, so it is retired
             // here and destroyed by onInputSurfaceAttached() once the player has the new surface.
             pendingSupersededBundle = inputBundle
             inputBundle = newBundle
             createdInputSurface = inputSurface
+            inputSurfaceReady = true
             inputSurfaceEverAttached = false
             registerInputStreamOnWorker(currentFrameInfo())
 
@@ -748,10 +879,19 @@ class VideoFrameProcessor(
                 inputBundle = null
                 createdInputSurface = null
             }
-            releaseGlObjectsForBundle(newBundle, frameReader)
-            frameReader = null
+            releaseGlObjectsForBundle(newBundle, frameGrabber)
+            frameGrabber = null
             releaseInputSurfaceBundle(newBundle)
+            inputSurfaceReady = false
             reportError("RIFE input surface initialization failed: ${e.message}")
+            // The owner has to fall back to normal PlayerView playback, otherwise the processing
+            // output surface would sit in front of the user with nothing rendered into it.
+            val handler = mainHandler
+            if (handler != null) {
+                handler.post { onInputSurfaceFailed() }
+            } else {
+                onInputSurfaceFailed()
+            }
         }
     }
 
@@ -768,7 +908,13 @@ class VideoFrameProcessor(
             droppedFrameCount++
             return
         }
-        if (!isRifeEnabled || !inputStreamRegistered || endOfInputSignalled) {
+        if (!isProcessingEnabled) {
+            // Nothing is intercepting: keep the decoder flowing instead of stalling it on a full
+            // BufferQueue, otherwise switching processing off would look like a freeze.
+            consumeAndDiscard(texture)
+            return
+        }
+        if (!inputStreamRegistered || endOfInputSignalled) {
             consumeAndDiscard(texture)
             return
         }
@@ -804,7 +950,7 @@ class VideoFrameProcessor(
 
     /**
      * Reads the decoded frame the [texture] is currently holding into a direct RGBA buffer and
-     * feeds it into the RIFE 2-frame pipeline.
+     * feeds it into the frame pipeline.
      */
     private fun captureFrameFromInputSurface(texture: SurfaceTexture) {
         val sourceWidth = inputWidth
@@ -815,17 +961,19 @@ class VideoFrameProcessor(
             return
         }
 
-        val reader = frameReader
-        if (reader == null || !reader.isInitialized) {
+        val grabber = frameGrabber
+        if (grabber == null || !grabber.isInitialized) {
             droppedFrameCount++
             return
         }
 
+        // The readback size is the source size scaled to the configured resolution; the aspect
+        // ratio of the source is preserved, so the frame is never stretched.
         val (captureWidth, captureHeight) =
             calculateTargetDimensions(sourceWidth, sourceHeight, resolution)
 
         val pixels = obtainFrameBuffer(captureWidth, captureHeight)
-        if (!reader.read(texture, captureWidth, captureHeight, pixels)) {
+        if (!grabber.read(texture, captureWidth, captureHeight, pixels)) {
             releaseFrameBuffer(pixels)
             droppedFrameCount++
             return
@@ -846,6 +994,7 @@ class VideoFrameProcessor(
             height = captureHeight
         )
 
+        // Bounded queue with explicit backpressure: drop the oldest frame rather than growing.
         if (!frameQueue.offer(frame)) {
             droppedFrameCount++
             frameQueue.poll()?.let { releaseFrameBuffer(it.pixels) }
@@ -904,13 +1053,15 @@ class VideoFrameProcessor(
 
         val in0Buf = cachedIn0Buf!!
         val in1Buf = cachedIn1Buf!!
+        val den0Buf = cachedDenoised0Buf!!
+        val den1Buf = cachedDenoised1Buf!!
         val outBuf = cachedOutBuf!!
 
         prev.pixels.clear()
         nextFrame.pixels.clear()
 
         // Inputs keep the clear -> put -> flip contract: flip() is what publishes the number of
-        // written bytes as the limit, so the readable range matches the frame handed to RIFE.
+        // written bytes as the limit, so the readable range matches the frame handed to the stage.
         in0Buf.clear()
         in1Buf.clear()
         in0Buf.put(prev.pixels)
@@ -918,24 +1069,77 @@ class VideoFrameProcessor(
         in0Buf.flip()
         in1Buf.flip()
 
-        // The output buffer is deliberately NOT flipped here. NativeEngine.interpolateFrameBuffers()
-        // reaches the memory through JNI GetDirectBufferAddress() and writes into it directly, so
-        // the Java position stays at 0 and a flip() would only publish limit = 0.
-        outBuf.clear()
+        val startTime = SystemClock.elapsedRealtime()
+
+        if (!isRifeEnabled) {
+            // State 2: FastDVDnet-only. The current frame is pre-processed and rendered as-is; no
+            // interpolation is attempted and no extra frame is invented.
+            if (fastDvdNetEngine.isEnabled) {
+                val denoised = fastDvdNetEngine.denoiseFrameBuffer(
+                    nextFrame.pixels,
+                    rifeInputW,
+                    rifeInputH,
+                    den1Buf
+                )
+                if (denoised) {
+                    renderBufferToOutput(den1Buf, rifeInputW, rifeInputH)
+                } else {
+                    renderFrameToOutput(nextFrame)
+                }
+            } else {
+                // Both stages were switched off between capture and processing: forward the frame
+                // instead of leaving a stale picture on the output surface.
+                renderFrameToOutput(nextFrame)
+            }
+            lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
+            frameCountOutput++
+            releaseFrameBuffer(prev.pixels)
+            previousFrame = nextFrame
+            updateStats()
+            return
+        }
+
+        // State 3 and 4: the FastDVDnet scaffold is optional pre-processing in front of RIFE. When
+        // it is off the captured buffers are handed to JNI directly, so no extra copy is made.
+        var src0Buf = in0Buf
+        var src1Buf = in1Buf
+        if (fastDvdNetEngine.isEnabled) {
+            val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(
+                in0Buf,
+                rifeInputW,
+                rifeInputH,
+                den0Buf
+            )
+            val denoisedNext = fastDvdNetEngine.denoiseFrameBuffer(
+                in1Buf,
+                rifeInputW,
+                rifeInputH,
+                den1Buf
+            )
+            if (denoisedPrev && denoisedNext) {
+                src0Buf = den0Buf
+                src1Buf = den1Buf
+            } else {
+                Log.w(TAG, "FastDVDnet stage failed, interpolating the raw frames")
+            }
+        }
 
         Log.i(
             TAG,
             "REAL RIFE EXECUTION LOG: preRifeDimensions=${rifeInputW}x$rifeInputH -> " +
                 "rifeInputDimensions=${rifeInputW}x$rifeInputH -> " +
                 "rifeOutputDimensions=${rifeOutputW}x$rifeOutputH -> " +
-                "renderingSurfaceDimensions=${displaySurfaceWidth}x$displaySurfaceHeight}"
+                "renderingSurfaceDimensions=${displaySurfaceWidth}x$displaySurfaceHeight"
         )
 
-        val startTime = SystemClock.elapsedRealtime()
+        // The output buffer is deliberately NOT flipped here. NativeEngine.interpolateFrameBuffers()
+        // reaches the memory through JNI GetDirectBufferAddress() and writes into it directly, so
+        // the Java position stays at 0 and a flip() would only publish limit = 0.
+        outBuf.clear()
 
         val success = NativeEngine.interpolateFrameBuffers(
-            in0Buf,
-            in1Buf,
+            src0Buf,
+            src1Buf,
             rifeInputW,
             rifeInputH,
             rifeOutputW,
@@ -954,6 +1158,8 @@ class VideoFrameProcessor(
             outBuf.position(0)
             outBuf.limit(requiredOutputBytes)
 
+            // Temporal order has to stay previous -> interpolated -> next, otherwise the output
+            // playback runs backwards or repeats.
             renderFrameToOutput(prev)
             frameCountOutput++
 
@@ -981,16 +1187,22 @@ class VideoFrameProcessor(
         updateStats()
     }
 
+    /**
+     * Allocates the reusable direct buffers used by the JNI stage, keeping one allocation per size
+     * change instead of one per frame.
+     */
     private fun ensureCachedBuffers(requiredInputBytes: Int, requiredOutputBytes: Int): Boolean {
         if (requiredInputBytes <= 0 || requiredOutputBytes <= 0) {
             return false
         }
         val requiredBytes = maxOf(requiredInputBytes, requiredOutputBytes)
-        if (cachedIn0Buf == null || cachedIn1Buf == null ||
-            cachedOutBuf == null || cachedTargetSize != requiredBytes
+        if (cachedIn0Buf == null || cachedIn1Buf == null || cachedDenoised0Buf == null ||
+            cachedDenoised1Buf == null || cachedOutBuf == null || cachedTargetSize != requiredBytes
         ) {
             cachedIn0Buf = ByteBuffer.allocateDirect(requiredBytes)
             cachedIn1Buf = ByteBuffer.allocateDirect(requiredBytes)
+            cachedDenoised0Buf = ByteBuffer.allocateDirect(requiredBytes)
+            cachedDenoised1Buf = ByteBuffer.allocateDirect(requiredBytes)
             cachedOutBuf = ByteBuffer.allocateDirect(requiredBytes)
             cachedTargetSize = requiredBytes
             Log.i(TAG, "Allocated RIFE buffers ($requiredBytes bytes each)")
@@ -1081,6 +1293,10 @@ class VideoFrameProcessor(
         return created
     }
 
+    /**
+     * Maps a source size onto the processing size for [res]. Only the longest edge is clamped, so
+     * the source aspect ratio is preserved and no fixed 1920x1080 processing size is imposed.
+     */
     fun calculateTargetDimensions(
         srcW: Int,
         srcH: Int,
@@ -1089,6 +1305,18 @@ class VideoFrameProcessor(
         return when (res) {
             RifeResolution.ORIGINAL ->
                 Pair(srcW, srcH)
+
+            RifeResolution.RES_1080P -> {
+                val maxDim = 1920
+
+                if (srcW > srcH && srcW > maxDim) {
+                    Pair(maxDim, (srcH * maxDim) / srcW)
+                } else if (srcH >= srcW && srcH > maxDim) {
+                    Pair((srcW * maxDim) / srcH, maxDim)
+                } else {
+                    Pair(srcW, srcH)
+                }
+            }
 
             RifeResolution.RES_720P -> {
                 val maxDim = 1280
@@ -1126,6 +1354,7 @@ class VideoFrameProcessor(
 
             val resStr = when (resolution) {
                 RifeResolution.ORIGINAL -> "Original"
+                RifeResolution.RES_1080P -> "1080p"
                 RifeResolution.RES_720P -> "720p"
                 RifeResolution.RES_480P -> "480p"
             }
@@ -1147,7 +1376,7 @@ class VideoFrameProcessor(
     }
 
     // ---------------------------------------------------------------------------------------
-    // Output SurfaceHolder.Callback: the SurfaceView the RIFE result is drawn to
+    // Output SurfaceHolder.Callback: the SurfaceView the processed result is drawn to
     // ---------------------------------------------------------------------------------------
 
     private var displaySurfaceWidth = 0

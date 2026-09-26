@@ -1281,6 +1281,10 @@ int RIFE::process(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float ti
 
         if (!(opt.use_fp16_storage && opt.use_int8_storage))
         {
+            if (outimage.empty())
+            {
+                outimage.create(w, h, (size_t)3u, 3);
+            }
 #if _WIN32
             out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
@@ -2582,6 +2586,10 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
 
     // download
     {
+        if (outimage.empty())
+        {
+            outimage.create(w, h, (size_t)3u, 3);
+        }
 #if _WIN32
         out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
@@ -3320,6 +3328,10 @@ int RIFE::process_v4(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float
 
         if (!(opt.use_fp16_storage && opt.use_int8_storage))
         {
+            if (outimage.empty())
+            {
+                outimage.create(w, h, (size_t)3u, 3);
+            }
 #if _WIN32
             out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
@@ -4523,6 +4535,10 @@ int RIFE::process_v4_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, f
 
     // download
     {
+        if (outimage.empty())
+        {
+            outimage.create(w, h, (size_t)3u, 3);
+        }
 #if _WIN32
         out.to_pixels((unsigned char*)outimage.data, ncnn::Mat::PIXEL_RGB2BGR);
 #else
