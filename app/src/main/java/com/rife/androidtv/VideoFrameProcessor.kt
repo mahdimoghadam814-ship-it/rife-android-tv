@@ -53,6 +53,12 @@ class VideoFrameProcessor(
     @Volatile
     var resolution = RifeResolution.ORIGINAL
 
+    @Volatile
+    private var sourceWidth = 1920
+
+    @Volatile
+    private var sourceHeight = 1080
+
     private var inputSurfaceTexture: SurfaceTexture? = null
 
     var inputSurface: Surface? = null
@@ -66,6 +72,9 @@ class VideoFrameProcessor(
 
     private var workerThread: HandlerThread? = null
     private var workerHandler: Handler? = null
+
+    private var inferenceThread: HandlerThread? = null
+    private var inferenceHandler: Handler? = null
 
     private var eglSurfaceTexture: EGLSurfaceTexture? = null
     private var frameGrabber: OesFrameGrabber? = null
@@ -90,11 +99,26 @@ class VideoFrameProcessor(
         displaySurfaceView.holder.addCallback(this)
     }
 
+    fun setSourceVideoDimensions(width: Int, height: Int) {
+        if (width > 0 && height > 0) {
+            sourceWidth = width
+            sourceHeight = height
+            Log.i(TAG, "Source video dimensions updated: ${width}x${height}")
+        }
+    }
+
     fun start() {
         if (workerThread == null) {
-            workerThread = HandlerThread("RifeWorkerThread").apply {
+            workerThread = HandlerThread("RifeCaptureThread").apply {
                 start()
                 workerHandler = Handler(looper)
+            }
+        }
+
+        if (inferenceThread == null) {
+            inferenceThread = HandlerThread("RifeInferenceThread").apply {
+                start()
+                inferenceHandler = Handler(looper)
             }
         }
 
@@ -156,6 +180,10 @@ class VideoFrameProcessor(
         workerThread?.quitSafely()
         workerThread = null
         workerHandler = null
+
+        inferenceThread?.quitSafely()
+        inferenceThread = null
+        inferenceHandler = null
     }
 
     private fun createInputSurface() {
@@ -178,7 +206,7 @@ class VideoFrameProcessor(
 
                 eglSurfaceTexture = egl
                 inputSurfaceTexture = egl.surfaceTexture
-                inputSurfaceTexture?.setDefaultBufferSize(1920, 1080)
+                inputSurfaceTexture?.setDefaultBufferSize(sourceWidth, sourceHeight)
                 inputSurface = Surface(inputSurfaceTexture)
 
                 Log.i(TAG, "Input SurfaceTexture initialized with Media3 EGLSurfaceTexture")
@@ -199,14 +227,14 @@ class VideoFrameProcessor(
 
         frameCountInput++
 
-        val sourceWidth = 1920
-        val sourceHeight = 1080
+        val srcW = sourceWidth
+        val srcH = sourceHeight
 
-        val (preRifeW, preRifeH) = calculateTargetDimensions(sourceWidth, sourceHeight, resolution)
+        val (preRifeW, preRifeH) = calculateTargetDimensions(srcW, srcH, resolution)
 
         Log.d(
             TAG,
-            "FRAME CAPTURE LOG: sourceDimensions=${sourceWidth}x${sourceHeight} -> preRifeDimensions=${preRifeW}x${preRifeH}"
+            "FRAME CAPTURE LOG: sourceDimensions=${srcW}x${srcH} -> preRifeDimensions=${preRifeW}x${preRifeH}"
         )
 
         var captureBitmap = cachedCaptureBitmap
@@ -243,8 +271,8 @@ class VideoFrameProcessor(
         val frameData = FrameData(
             bitmap = frameBitmapCopy,
             timestampUs = System.nanoTime() / 1000,
-            sourceWidth = sourceWidth,
-            sourceHeight = sourceHeight
+            sourceWidth = srcW,
+            sourceHeight = srcH
         )
 
         if (!frameQueue.offer(frameData)) {
@@ -256,7 +284,15 @@ class VideoFrameProcessor(
             frameQueue.offer(frameData)
         }
 
-        processNextFramePair()
+        scheduleInference()
+    }
+
+    private fun scheduleInference() {
+        inferenceHandler?.post {
+            if (isRifeEnabled) {
+                processNextFramePair()
+            }
+        }
     }
 
     private fun processNextFramePair() {

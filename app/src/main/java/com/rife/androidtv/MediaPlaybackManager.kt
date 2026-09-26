@@ -12,6 +12,7 @@ import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.common.Tracks
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.ClippingMediaSource
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
@@ -146,8 +147,14 @@ class MediaPlaybackManager(
                 .setId("EXTERNAL_SUBTITLE")
                 .build()
 
-            val subtitleMediaSource = SingleSampleMediaSource.Factory(dataSourceFactory)
+            var subtitleMediaSource: MediaSource = SingleSampleMediaSource.Factory(dataSourceFactory)
                 .createMediaSource(subtitleConfig, C.TIME_UNSET)
+
+            if (subtitleOffsetMs < 0) {
+                val startUs = (-subtitleOffsetMs) * 1000L
+                subtitleMediaSource = ClippingMediaSource(subtitleMediaSource, startUs, C.TIME_UNSET)
+            }
+
             mediaSources.add(subtitleMediaSource)
         }
 

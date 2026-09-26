@@ -25,6 +25,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.exoplayer.ExoPlayer
 import com.rife.androidtv.databinding.ActivityMainBinding
 
@@ -52,9 +53,7 @@ class MainActivity : AppCompatActivity() {
             val uri: Uri? = result.data?.data
             uri?.let {
                 videoName = it.lastPathSegment ?: "Local Video"
-                mediaPlaybackManager?.setVideoSource(it)
-                binding.layoutFilePicker.visibility = View.GONE
-                showPlayerControls()
+                playVideo(it)
             }
         }
     }
@@ -223,6 +222,12 @@ class MainActivity : AppCompatActivity() {
         )
 
         player?.addListener(object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    videoFrameProcessor?.setSourceVideoDimensions(videoSize.width, videoSize.height)
+                }
+            }
+
             override fun onTracksChanged(tracks: Tracks) {
                 mediaPlaybackManager?.updateTrackSelection()
             }
@@ -395,10 +400,11 @@ class MainActivity : AppCompatActivity() {
                 binding.displaySurfaceView.visibility = View.VISIBLE
                 Toast.makeText(this, "RIFE Frame Interpolation Active", Toast.LENGTH_SHORT).show()
             } else {
-                player?.setVideoSurface(null)
-                binding.playerView.setPlayer(player)
                 binding.displaySurfaceView.visibility = View.GONE
                 binding.playerView.visibility = View.VISIBLE
+                binding.playerView.post {
+                    binding.playerView.player = player
+                }
                 Toast.makeText(this, "Normal ExoPlayer Playback Active", Toast.LENGTH_SHORT).show()
             }
             showPlayerControls()
