@@ -4,7 +4,7 @@ plugins {
     alias(libs.plugins.androidApplication)
     alias(libs.plugins.composeCompiler)
     alias(libs.plugins.kotlinSerialization)
-    alias(libs.plugins.koinCompiler)
+    alias(libs.plugins.koin.compiler)
 }
 
 android {
@@ -18,6 +18,13 @@ android {
         versionCode = 2
         versionName = "2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // The RIFE engine (ncnn + Vulkan + SPIR-V shaders) is built from the third_party
+        // submodules through CMake. Only the target TV box ABI is packaged to keep the
+        // multi-gigabyte native build inside the storage budget of the build device.
+        ndk {
+            abiFilters.addAll(listOf("arm64-v8a"))
+        }
     }
 
     buildFeatures {
@@ -43,13 +50,6 @@ android {
         getByName("debug") {
             isDebuggable = true
         }
-    }
-
-    // The RIFE engine (ncnn + Vulkan + SPIR-V shaders) is built from the third_party
-    // submodules through CMake. Only the target TV box ABI is packaged to keep the
-    // multi-gigabyte native build inside the storage budget of the build device.
-    ndk {
-        abiFilters.addAll(listOf("arm64-v8a"))
     }
 
     ndkVersion = "26.3.11579264"
