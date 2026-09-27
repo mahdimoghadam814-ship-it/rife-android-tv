@@ -82,6 +82,7 @@ dependencies {
     // Koin
     implementation(libs.koin.android)
     implementation(libs.koin.annotations)
+    implementation(libs.koin.compose.viewmodel)
 
     testImplementation(libs.junit4)
     testImplementation(libs.kotlinx.coroutines.test)
