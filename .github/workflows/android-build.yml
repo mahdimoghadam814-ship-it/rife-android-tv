@@ -45,6 +45,55 @@ jobs:
           path: "app/build/outputs/apk/**/*.apk"
           if-no-files-found: error
 
+      - name: Verify APK ABI compatibility
+        run: |
+          set -euo pipefail
+          APK_PATH=$(find app/build/outputs/apk -name "*.apk" | head -n1)
+          echo "Found APK: $APK_PATH"
+
+          # List all native libraries in the APK
+          echo "=== APK native libraries ==="
+          unzip -l "$APK_PATH" "lib/*/*.so" | grep "\.so$"
+
+          # Extract ABI directories present
+          echo "=== Detected APK ABIs ==="
+          ABI_DIRS=$(unzip -l "$APK_PATH" "lib/*/*.so" | grep -oP 'lib/\K[^/]+' | sort -u)
+          echo "$ABI_DIRS"
+
+          # Verify required ABIs
+          REQUIRED_ABIS=("arm64-v8a" "armeabi-v7a")
+          MISSING_ABIS=()
+          for abi in "${REQUIRED_ABIS[@]}"; do
+            if echo "$ABI_DIRS" | grep -q "^${abi}$"; then
+              echo "- ${abi}: OK"
+            else
+              echo "- ${abi}: MISSING"
+              MISSING_ABIS+=("$abi")
+            fi
+          done
+
+          # Verify librife_native.so exists for each required ABI
+          echo "=== RIFE native library ==="
+          MISSING_RIFE=()
+          for abi in "${REQUIRED_ABIS[@]}"; do
+            if unzip -l "$APK_PATH" "lib/${abi}/librife_native.so" | grep -q "librife_native.so"; then
+              echo "- ${abi}/librife_native.so: OK"
+            else
+              echo "- ${abi}/librife_native.so: MISSING"
+              MISSING_RIFE+=("$abi")
+            fi
+          done
+
+          # Fail if any requirements not met
+          if [ ${#MISSING_ABIS[@]} -gt 0 ] || [ ${#MISSING_RIFE[@]} -gt 0 ]; then
+            echo "ERROR: APK verification failed!"
+            [ ${#MISSING_ABIS[@]} -gt 0 ] && echo "Missing ABIs: ${MISSING_ABIS[*]}"
+            [ ${#MISSING_RIFE[@]} -gt 0 ] && echo "Missing librife_native.so for: ${MISSING_RIFE[*]}"
+            exit 1
+          fi
+
+          echo "SUCCESS: All ABI verification checks passed!"
+
       - name: Upload build reports
         if: always()
         uses: actions/upload-artifact@v4

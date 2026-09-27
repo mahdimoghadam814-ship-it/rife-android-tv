@@ -20,10 +20,10 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         // The RIFE engine (ncnn + Vulkan + SPIR-V shaders) is built from the third_party
-        // submodules through CMake. Only the target TV box ABI is packaged to keep the
-        // multi-gigabyte native build inside the storage budget of the build device.
+        // submodules through CMake. Support both arm64-v8a (modern phones/TVs) and
+        // armeabi-v7a (Xiaomi TV Box S 3rd Gen and other 32-bit ARM Android TV runtimes).
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a"))
+            abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
         }
     }
 
