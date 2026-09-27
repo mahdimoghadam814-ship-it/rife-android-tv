@@ -22,18 +22,12 @@ import androidx.media3.common.VideoFrameProcessingException
 import androidx.media3.common.util.GlUtil
 import androidx.media3.common.util.TimestampIterator
 import androidx.media3.common.util.UnstableApi
+import com.rife.androidtv.NativeEngine
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import androidx.media3.common.VideoFrameProcessor as Media3VideoFrameProcessor
-
-enum class RifeResolution {
-    ORIGINAL,
-    RES_1080P,
-    RES_720P,
-    RES_480P
-}
 
 /**
  * A single *real* decoded video frame.
@@ -530,7 +524,16 @@ class VideoFrameProcessor(
         val latch = CountDownLatch(1)
         handler.post {
             try {
-                registerInputStreamOnWorker(FrameInfo.Builder(ColorInfo.SDR_BT709_LIMITED, inputWidth, inputHeight).build())
+                registerInputStreamOnWorker(
+                    FrameInfo(
+                        Format.Builder()
+                            .setColorInfo(ColorInfo.SDR_BT709_LIMITED)
+                            .setWidth(inputWidth)
+                            .setHeight(inputHeight)
+                            .build(),
+                        0L
+                    )
+                )
             } finally {
                 latch.countDown()
             }
@@ -558,16 +561,24 @@ class VideoFrameProcessor(
     override fun setOutputSurfaceInfo(outputSurfaceInfo: SurfaceInfo?) {
         runOnWorker("setOutputSurfaceInfo()") {
             pendingOutputSurfaceInfo = outputSurfaceInfo
+            val display = bundleDisplay()
+            if (display == null) {
+                // The output window surface can only be created on the input bundle's EGL
+                // display, and the renderer is (re)created together with that bundle, so there
+                // is nothing to update while no bundle exists.
+                Log.i(TAG, "Output surface update skipped: no input EGL display yet")
+                return@runOnWorker
+            }
             if (outputSurfaceInfo == null) {
                 Log.i(TAG, "Output surface released")
-                outputRenderer?.setOutputSurface(bundleDisplay(), null)
+                outputRenderer?.setOutputSurface(display, null)
             } else {
                 Log.i(
                     TAG,
                     "Output surface set: ${outputSurfaceInfo.width}x${outputSurfaceInfo.height} " +
                         "(orientationDegrees=${outputSurfaceInfo.orientationDegrees})"
                 )
-                outputRenderer?.setOutputSurface(bundleDisplay(), outputSurfaceInfo.surface)
+                outputRenderer?.setOutputSurface(display, outputSurfaceInfo.surface)
             }
         }
     }
@@ -678,7 +689,14 @@ class VideoFrameProcessor(
     private fun currentFrameInfo(): FrameInfo {
         val width = if (inputWidth > 0) inputWidth else FALLBACK_FRAME_WIDTH
         val height = if (inputHeight > 0) inputHeight else FALLBACK_FRAME_HEIGHT
-        return FrameInfo.Builder(ColorInfo.SDR_BT709_LIMITED, width, height).build()
+        return FrameInfo(
+            Format.Builder()
+                .setColorInfo(ColorInfo.SDR_BT709_LIMITED)
+                .setWidth(width)
+                .setHeight(height)
+                .build(),
+            0L
+        )
     }
 
     private fun registerInputStreamOnWorker(frameInfo: FrameInfo) {
@@ -688,8 +706,8 @@ class VideoFrameProcessor(
             media3Listener.onInputStreamRegistered(
                 Media3VideoFrameProcessor.INPUT_TYPE_SURFACE,
                 Format.Builder()
-                    .setWidth(frameInfo.width)
-                    .setHeight(frameInfo.height)
+                    .setWidth(frameInfo.format.width)
+                    .setHeight(frameInfo.format.height)
                     .build(),
                 ArrayList<Effect>()
             )
