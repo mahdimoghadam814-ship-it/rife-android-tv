@@ -40,7 +40,15 @@ class RifeEngineController(
      * surface; no frame is read back while both stages are off).
      */
     val processor = VideoFrameProcessor(
-        onStatisticsUpdated = { stats -> _stats.value = stats },
+        onStatisticsUpdated = { stats ->
+            _stats.value = RifeStats(
+                inputFps = stats.inputFps,
+                outputFps = stats.outputFps,
+                processingTimeMs = stats.processingTimeMs,
+                droppedFrames = stats.droppedFrames,
+                currentResolution = stats.currentResolution,
+            )
+        },
         onError = { message -> _error.value = message },
         onInputSurfaceCreated = { surface -> _inputSurface.value = surface },
         onInputSurfaceFailed = {
@@ -190,12 +198,24 @@ class RifeEngineController(
                         isV4 = false,
                     )
                     engineReady = loadSuccess
-                    Log.i(TAG, "RIFE engine initialised: modelLoaded=$loadSuccess")
+                    if (loadSuccess) {
+                        Log.i(TAG, "RIFE engine initialised: modelLoaded=$loadSuccess")
+                    } else {
+                        Log.e(TAG, "RIFE engine model load failed")
+                        _error.value = "RIFE model load failed. Check that model assets are packaged."
+                    }
                 } else {
                     Log.e(TAG, "RIFE engine init failed")
+                    _error.value = "RIFE engine initialization failed."
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "RIFE engine init crashed", t)
+                _error.value = "RIFE engine initialization crashed: ${t.message}"
+            } finally {
+                // Reset initStarted so a failed initialization can be retried.
+                engineInitStarted = false
+                initThread?.quitSafely()
+                initThread = null
             }
         }
     }

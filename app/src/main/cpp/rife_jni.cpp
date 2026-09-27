@@ -11,11 +11,17 @@ Java_com_rife_androidtv_NativeEngine_runDiagnostics(JNIEnv* env, jclass clazz) {
     DiagnosticResult res = run_vulkan_diagnostics();
 
     jclass resultClass = env->FindClass("com/rife/androidtv/NativeDiagnosticResult");
+    if (resultClass == nullptr) {
+        return nullptr;
+    }
     jmethodID constructor = env->GetMethodID(
         resultClass,
         "<init>",
         "(ZLjava/lang/String;Ljava/lang/String;IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;ZLjava/lang/String;Ljava/lang/String;)V"
     );
+    if (constructor == nullptr) {
+        return nullptr;
+    }
 
     jstring vulkanApiVersion = env->NewStringUTF(res.vulkan_api_version.c_str());
     jstring gpuName = env->NewStringUTF(res.gpu_name.c_str());
@@ -41,6 +47,7 @@ Java_com_rife_androidtv_NativeEngine_runDiagnostics(JNIEnv* env, jclass clazz) {
         errorMessage
     );
 
+    env->DeleteLocalRef(resultClass);
     return objectResult;
 }
 
@@ -101,18 +108,24 @@ Java_com_rife_androidtv_NativeEngine_getRifeStatus(JNIEnv* env, jclass clazz) {
     RifeEngineResult res = g_rife_engine.getStatus();
 
     jclass resultClass = env->FindClass("com/rife/androidtv/RifeDiagnosticResult");
+    if (resultClass == nullptr) {
+        return nullptr;
+    }
     jmethodID constructor = env->GetMethodID(
         resultClass,
         "<init>",
         "(ZZLjava/lang/String;Ljava/lang/String;ZJLjava/lang/String;Ljava/lang/String;)V"
     );
+    if (constructor == nullptr) {
+        return nullptr;
+    }
 
     jstring gpuName = env->NewStringUTF(res.gpu_name.c_str());
     jstring vulkanApiVersion = env->NewStringUTF(res.vulkan_api_version.c_str());
     jstring lastError = env->NewStringUTF(res.last_error.c_str());
     jstring opDetails = env->NewStringUTF(res.op_details.c_str());
 
-    return env->NewObject(
+    jobject objectResult = env->NewObject(
         resultClass,
         constructor,
         res.success,
@@ -124,4 +137,7 @@ Java_com_rife_androidtv_NativeEngine_getRifeStatus(JNIEnv* env, jclass clazz) {
         lastError,
         opDetails
     );
+
+    env->DeleteLocalRef(resultClass);
+    return objectResult;
 }

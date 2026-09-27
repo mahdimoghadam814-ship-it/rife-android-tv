@@ -300,6 +300,9 @@ class VideoFrameProcessor(
             }
         }
 
+        // Reset the released flag so a previous stop() does not permanently disable the processor.
+        released = false
+
         runOnWorker("start()") {
             createInputSurfaceOnWorker("start")
         }
@@ -578,6 +581,20 @@ class VideoFrameProcessor(
     override fun setOnInputFrameProcessedListener(listener: OnInputFrameProcessedListener) {
         // Frames are consumed and rendered internally as soon as they are read back, so there is
         // no external handshake to drive. Accepted for API compatibility.
+    }
+
+    private var inputSurfaceReadyListener: Runnable? = null
+
+    override fun setOnInputSurfaceReadyListener(listener: Runnable) {
+        inputSurfaceReadyListener = listener
+    }
+
+    /**
+     * Media3 redraw: re-renders the most recent output frame with updated effects. This processor
+     * renders every frame immediately upon production, so there is no buffered frame to redraw.
+     */
+    override fun redraw() {
+        // No-op: this processor renders frames immediately and has no buffered output to redraw.
     }
 
     /** This processor renders every output frame as soon as it becomes available. */
@@ -1069,13 +1086,13 @@ class VideoFrameProcessor(
         val rifeOutputW = rifeInputW
         val rifeOutputH = rifeInputH
 
-        val requiredInputBytes = rifeInputW * rifeInputH * 4
+        val requiredInputBytes = rifeInputW.toLong() * rifeInputH.toLong() * 4L
 
         // The JNI layer never checks the output capacity, and RifeEngine::processFrameBuffer() ends
         // with ncnn::Mat::to_pixels_resize(out_ptr, PIXEL_RGB2RGBA, w, h), which writes exactly
         // rifeOutputW * rifeOutputH * 4 bytes through that raw pointer. The Java side therefore has
         // to guarantee that capacity itself.
-        val requiredOutputBytes = rifeOutputW * rifeOutputH * 4
+        val requiredOutputBytes = rifeOutputW.toLong() * rifeOutputH.toLong() * 4L
 
         if (!ensureCachedBuffers(requiredInputBytes, requiredOutputBytes)) {
             releaseFrameBuffer(prev.pixels)
@@ -1189,13 +1206,11 @@ class VideoFrameProcessor(
             // than with flip(): position 0, limit = requiredOutputBytes. That is exactly what
             // renderBufferToOutput() -> GlOutputRenderer.render() needs.
             outBuf.position(0)
-            outBuf.limit(requiredOutputBytes)
+            outBuf.limit(requiredOutputBytes.toInt())
 
-            // Temporal order has to stay previous -> interpolated -> next, otherwise the output
-            // playback runs backwards or repeats.
-            renderFrameToOutput(prev)
-            frameCountOutput++
-
+            // Temporal order: previous frame was already rendered when it was captured (or as the
+            // first frame), so we only render the interpolated frame and the next frame.
+            // Sequence: A, M(A,B), B, M(B,C), C — correct 2x interpolation without duplication.
             renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
             frameCountOutput++
 
@@ -1224,21 +1239,26 @@ class VideoFrameProcessor(
      * Allocates the reusable direct buffers used by the JNI stage, keeping one allocation per size
      * change instead of one per frame.
      */
-    private fun ensureCachedBuffers(requiredInputBytes: Int, requiredOutputBytes: Int): Boolean {
+    private fun ensureCachedBuffers(requiredInputBytes: Long, requiredOutputBytes: Long): Boolean {
         if (requiredInputBytes <= 0 || requiredOutputBytes <= 0) {
             return false
         }
         val requiredBytes = maxOf(requiredInputBytes, requiredOutputBytes)
+        if (requiredBytes > Int.MAX_VALUE) {
+            Log.e(TAG, "ensureCachedBuffers: required size $requiredBytes overflows Int")
+            return false
+        }
+        val requiredBytesInt = requiredBytes.toInt()
         if (cachedIn0Buf == null || cachedIn1Buf == null || cachedDenoised0Buf == null ||
-            cachedDenoised1Buf == null || cachedOutBuf == null || cachedTargetSize != requiredBytes
+            cachedDenoised1Buf == null || cachedOutBuf == null || cachedTargetSize != requiredBytesInt
         ) {
-            cachedIn0Buf = ByteBuffer.allocateDirect(requiredBytes)
-            cachedIn1Buf = ByteBuffer.allocateDirect(requiredBytes)
-            cachedDenoised0Buf = ByteBuffer.allocateDirect(requiredBytes)
-            cachedDenoised1Buf = ByteBuffer.allocateDirect(requiredBytes)
-            cachedOutBuf = ByteBuffer.allocateDirect(requiredBytes)
-            cachedTargetSize = requiredBytes
-            Log.i(TAG, "Allocated RIFE buffers ($requiredBytes bytes each)")
+            cachedIn0Buf = ByteBuffer.allocateDirect(requiredBytesInt)
+            cachedIn1Buf = ByteBuffer.allocateDirect(requiredBytesInt)
+            cachedDenoised0Buf = ByteBuffer.allocateDirect(requiredBytesInt)
+            cachedDenoised1Buf = ByteBuffer.allocateDirect(requiredBytesInt)
+            cachedOutBuf = ByteBuffer.allocateDirect(requiredBytesInt)
+            cachedTargetSize = requiredBytesInt
+            Log.i(TAG, "Allocated RIFE buffers ($requiredBytesInt bytes each)")
         }
         return true
     }
@@ -1300,9 +1320,13 @@ class VideoFrameProcessor(
             return
         }
 
-        val requiredBytes = width * height * 4
+        val requiredBytes = width.toLong() * height.toLong() * 4L
+        if (requiredBytes > Int.MAX_VALUE) {
+            Log.e(TAG, "renderBufferToOutput: dimensions ${width}x$height overflow Int")
+            return
+        }
         pixels.position(0)
-        pixels.limit(requiredBytes)
+        pixels.limit(requiredBytes.toInt())
         try {
             renderer.render(pixels, width, height)
         } catch (t: Throwable) {

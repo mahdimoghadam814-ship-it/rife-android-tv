@@ -51,7 +51,7 @@ import androidx.core.content.FileProvider
 import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.lifecycleScope
-import dev.anilbeesetti.nextplayer.BuildConfig
+import com.rife.androidtv.BuildConfig
 import dev.anilbeesetti.nextplayer.MainActivity
 import dev.anilbeesetti.nextplayer.MainActivityUiState
 import dev.anilbeesetti.nextplayer.MainViewModel

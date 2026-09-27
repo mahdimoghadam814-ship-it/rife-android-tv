@@ -101,6 +101,7 @@ RifeEngine::~RifeEngine() {
 }
 
 bool RifeEngine::init(int requested_gpu_id) {
+    std::lock_guard<std::mutex> lock(mutex);
     gpu_id = requested_gpu_id;
 
     int gpu_count = ncnn::get_gpu_count();
@@ -168,6 +169,7 @@ bool RifeEngine::loadModelFromAssets(
     bool is_v2,
     bool is_v4
 ) {
+    std::lock_guard<std::mutex> lock(mutex);
     model_loaded = false;
     last_error.clear();
     op_details.clear();
@@ -361,6 +363,7 @@ bool RifeEngine::processFrameBuffer(
     float timestep,
     uint8_t* out_rgba
 ) {
+    std::lock_guard<std::mutex> lock(mutex);
     if (!model_loaded || !rife_impl) {
         last_error =
             "RIFE model not loaded.";
@@ -526,6 +529,7 @@ bool RifeEngine::interpolateTest(
 }
 
 RifeEngineResult RifeEngine::getStatus() const {
+    std::lock_guard<std::mutex> lock(mutex);
     RifeEngineResult res;
 
     /*

@@ -251,8 +251,13 @@ class GlOutputRenderer {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glUniform1i(uTextureHandle, 0)
 
+        val requiredBytes = width.toLong() * height.toLong() * 4L
+        if (requiredBytes > Int.MAX_VALUE) {
+            Log.e(TAG, "render: dimensions ${width}x$height overflow Int")
+            return
+        }
         buffer.position(0)
-        buffer.limit(width * height * 4)
+        buffer.limit(requiredBytes.toInt())
         GLES20.glTexImage2D(
             GLES20.GL_TEXTURE_2D,
             0,

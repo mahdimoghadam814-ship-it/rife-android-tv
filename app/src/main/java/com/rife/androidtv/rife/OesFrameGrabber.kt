@@ -208,14 +208,19 @@ class OesFrameGrabber {
         targetHeight: Int,
         out: ByteBuffer
     ): Boolean {
-        val requiredBytes = targetWidth * targetHeight * 4
+        val requiredBytes = targetWidth.toLong() * targetHeight.toLong() * 4L
         if (!isInitialized || targetWidth <= 0 || targetHeight <= 0) {
             return false
         }
-        if (!out.isDirect || out.capacity() < requiredBytes) {
+        if (requiredBytes > Int.MAX_VALUE) {
+            Log.w(TAG, "read(${targetWidth}x$targetHeight) overflows Int")
+            return false
+        }
+        val requiredBytesInt = requiredBytes.toInt()
+        if (!out.isDirect || out.capacity() < requiredBytesInt) {
             Log.w(
                 TAG,
-                "read(${targetWidth}x$targetHeight) needs a direct buffer of $requiredBytes bytes, " +
+                "read(${targetWidth}x$targetHeight) needs a direct buffer of $requiredBytesInt bytes, " +
                     "got direct=${out.isDirect} capacity=${out.capacity()}"
             )
             return false
@@ -267,7 +272,7 @@ class OesFrameGrabber {
             }
 
             out.position(0)
-            out.limit(requiredBytes)
+            out.limit(requiredBytesInt)
             GLES20.glReadPixels(
                 0,
                 0,
@@ -287,7 +292,7 @@ class OesFrameGrabber {
             // glReadPixels writes straight into the buffer memory and does not move the Java
             // position, so the readable range is established explicitly here.
             out.position(0)
-            out.limit(requiredBytes)
+            out.limit(requiredBytesInt)
             true
         } catch (t: Throwable) {
             Log.e(TAG, "External texture readback failed", t)
@@ -312,17 +317,18 @@ class OesFrameGrabber {
         targetHeight: Int,
         outBitmap: Bitmap
     ): Boolean {
-        val requiredBytes = targetWidth * targetHeight * 4
-        if (requiredBytes <= 0) {
+        val requiredBytes = targetWidth.toLong() * targetHeight.toLong() * 4L
+        if (requiredBytes <= 0 || requiredBytes > Int.MAX_VALUE) {
             return false
         }
+        val requiredBytesInt = requiredBytes.toInt()
         // Select the reuse buffer as a single non-null value: a `var` reassigned inside the null
         // check above is not smart-cast to non-null by the Kotlin compiler, so the nullable state
         // would leak into read()/copyPixelsFromBuffer(). The observable behaviour is identical:
         // reuse pixelBuffer while its capacity suffices, otherwise allocate and publish the new one.
         val currentBuffer = pixelBuffer
-        val staging = if (currentBuffer == null || currentBuffer.capacity() < requiredBytes) {
-            ByteBuffer.allocateDirect(requiredBytes).order(ByteOrder.nativeOrder())
+        val staging = if (currentBuffer == null || currentBuffer.capacity() < requiredBytesInt) {
+            ByteBuffer.allocateDirect(requiredBytesInt).order(ByteOrder.nativeOrder())
         } else {
             currentBuffer
         }
@@ -331,7 +337,7 @@ class OesFrameGrabber {
             return false
         }
         staging.position(0)
-        staging.limit(requiredBytes)
+        staging.limit(requiredBytesInt)
         outBitmap.copyPixelsFromBuffer(staging)
         return true
     }

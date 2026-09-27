@@ -125,6 +125,9 @@ dependencies {
 
     implementation(libs.github.anilbeesetti.nextlib.mediainfo)
 
+    // Media3 common: the RIFE VideoFrameProcessor implements androidx.media3.common.VideoFrameProcessor
+    implementation(libs.androidx.media3.common)
+
     testImplementation(libs.junit4)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.robolectric)

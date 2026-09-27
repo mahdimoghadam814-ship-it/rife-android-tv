@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <mutex>
 #include <android/asset_manager.h>
 #include "rife.h"
 
@@ -37,7 +38,10 @@ public:
     bool interpolateTest(int width = 256, int height = 256);
 
     RifeEngineResult getStatus() const;
-    long getLastInferenceTimeMs() const { return last_inference_time_ms; }
+    long getLastInferenceTimeMs() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return last_inference_time_ms;
+    }
 
 private:
     int gpu_id;
@@ -50,6 +54,10 @@ private:
     std::string op_details;
 
     std::unique_ptr<RIFE> rife_impl;
+
+    // Guards init/loadModelFromAssets/processFrameBuffer against concurrent calls from
+    // different threads (e.g. the RIFE init thread and the frame-processing worker thread).
+    mutable std::mutex mutex;
 };
 
 #endif // RIFE_ENGINE_H

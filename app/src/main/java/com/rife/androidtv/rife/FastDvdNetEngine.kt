@@ -94,16 +94,21 @@ class FastDvdNetEngine {
         height: Int,
         output: ByteBuffer
     ): Boolean {
-        val requiredBytes = width * height * 4
+        val requiredBytes = width.toLong() * height.toLong() * 4L
         if (requiredBytes <= 0) {
             return false
         }
+        if (requiredBytes > Int.MAX_VALUE) {
+            Log.w(TAG, "denoiseFrameBuffer($width x $height) overflows Int")
+            return false
+        }
+        val requiredBytesInt = requiredBytes.toInt()
         if (!input.isDirect || !output.isDirect ||
-            input.capacity() < requiredBytes || output.capacity() < requiredBytes
+            input.capacity() < requiredBytesInt || output.capacity() < requiredBytesInt
         ) {
             Log.w(
                 TAG,
-                "denoiseFrameBuffer($width x $height) needs direct buffers of $requiredBytes bytes, " +
+                "denoiseFrameBuffer($width x $height) needs direct buffers of $requiredBytesInt bytes, " +
                     "got in=${input.capacity()} out=${output.capacity()}"
             )
             return false
@@ -113,14 +118,14 @@ class FastDvdNetEngine {
         // stays under the processor's control.
         val source = input.duplicate()
         source.position(0)
-        source.limit(requiredBytes)
+        source.limit(requiredBytesInt)
 
         val target = output.duplicate()
         target.clear()
-        target.limit(requiredBytes)
+        target.limit(requiredBytesInt)
         target.put(source)
         target.position(0)
-        target.limit(requiredBytes)
+        target.limit(requiredBytesInt)
 
         synchronized(lock) {
             val slot = writeIndex
@@ -130,9 +135,9 @@ class FastDvdNetEngine {
             // returns the first pooled buffer or null when the pool is empty. Behaviour is unchanged:
             // reuse a pooled buffer that is big enough, otherwise allocate a new direct buffer.
             val currentBuffer = history[slot]
-            val buffer = if (currentBuffer == null || currentBuffer.capacity() < requiredBytes) {
-                pool.removeFirstOrNull()?.takeIf { it.capacity() >= requiredBytes }
-                    ?: ByteBuffer.allocateDirect(requiredBytes)
+            val buffer = if (currentBuffer == null || currentBuffer.capacity() < requiredBytesInt) {
+                pool.removeFirstOrNull()?.takeIf { it.capacity() >= requiredBytesInt }
+                    ?: ByteBuffer.allocateDirect(requiredBytesInt)
             } else {
                 currentBuffer
             }
