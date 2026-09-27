@@ -10,6 +10,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -24,6 +25,7 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.ui.R
 import dev.anilbeesetti.nextplayer.core.ui.theme.NextPlayerTheme
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
@@ -179,13 +181,13 @@ internal fun MediaPlayerContent(
     ) {
         rifeController.setRifeEnabled(playerPreferences.rifeEnabled)
         rifeController.setFastDvdNetEnabled(playerPreferences.fastDvdNetEnabled)
-        rifeController.setResolution(playerPreferences.rifeResolution)
+        rifeController.setResolution(playerPreferences.rifeResolution.toRifeResolution())
         // The settings entry wants the engine status to be visible immediately after a change,
         // even when the controls are already visible.
         rifeStatusTrigger++
     }
 
-    val controlsVisible = controlsVisibilityState.isVisible
+    val controlsVisible = controlsVisibilityState.controlsVisible
     LaunchedEffect(controlsVisible) {
         if (controlsVisible) rifeStatusTrigger++
     }
@@ -266,7 +268,7 @@ internal fun MediaPlayerContent(
             stats = rifeStats,
             rifeEnabled = playerPreferences.rifeEnabled,
             fastDvdNetEnabled = playerPreferences.fastDvdNetEnabled,
-            resolution = playerPreferences.rifeResolution,
+            resolution = playerPreferences.rifeResolution.toRifeResolution(),
             modifier = Modifier.align(Alignment.TopStart),
         )
     }
@@ -300,4 +302,11 @@ private fun MediaPlayerContentPreview() {
             onAction = {},
         )
     }
+}
+
+private fun RifeResolutionSetting.toRifeResolution(): RifeResolution = when (this) {
+    RifeResolutionSetting.ORIGINAL -> RifeResolution.ORIGINAL
+    RifeResolutionSetting.RES_1080P -> RifeResolution.RES_1080P
+    RifeResolutionSetting.RES_720P -> RifeResolution.RES_720P
+    RifeResolutionSetting.RES_480P -> RifeResolution.RES_480P
 }

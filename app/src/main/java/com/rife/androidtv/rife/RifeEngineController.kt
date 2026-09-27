@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import androidx.media3.common.SurfaceInfo
 import androidx.media3.common.util.UnstableApi
 import com.rife.androidtv.NativeEngine
 import com.rife.androidtv.RifeDiagnosticResult
