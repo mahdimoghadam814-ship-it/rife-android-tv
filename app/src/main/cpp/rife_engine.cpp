@@ -181,29 +181,14 @@ bool RifeEngine::loadModelFromAssets(
         return false;
     }
 
-    /*
-     * IMPORTANT:
-     *
-     * The Android TV device currently crashes inside
-     * glslang::GlslangToSpv() while RIFE::load() is building
+/*
+     * The Android TV device previously crashed inside
+     * glslang::GlslangToSpv() while RIFE::load() was building
      * Vulkan shader modules.
      *
-     * The RIFE implementation already supports a CPU-only mode:
-     * constructing RIFE with gpuid == -1 results in vkdev == 0,
-     * which makes RIFE::load() skip the Vulkan shader compilation
-     * path and makes process() use process_cpu().
-     *
-     * For this stability build we therefore intentionally load
-     * the model in CPU-only mode.
+     * Now we attempt Vulkan first (if available) and fall back to
+     * CPU only if Vulkan initialization genuinely fails.
      */
-    const int cpu_gpu_id = -1;
-
-    LOGI(
-        "Loading RIFE model in CPU fallback mode. "
-        "Vulkan detected=%s, requested GPU id=%d",
-        vulkan_available ? "YES" : "NO",
-        gpu_id
-    );
 
     std::string target_dir =
         base_cache_dir + "/" + model_dir;
@@ -266,91 +251,108 @@ bool RifeEngine::loadModelFromAssets(
         }
     }
 
-    try {
-        /*
-         * CPU-only RIFE.
-         *
-         * Using -1 here is intentional. In rife.cpp the
-         * constructor maps gpuid == -1 to vkdev == 0.
-         * That prevents RIFE::load() from entering the Vulkan
-         * pipeline/shader compilation path.
-         */
-        rife_impl = std::make_unique<RIFE>(
-            cpu_gpu_id,
-            false, // tta_mode
-            false, // tta_temporal_mode
-            false, // uhd_mode
-            1,     // num_threads
-            is_v2,
-            is_v4
-        );
+    auto try_load_with_gpu = [&](int gpu_id, const char* backend_name) -> bool {
+        try {
+            rife_impl = std::make_unique<RIFE>(
+                gpu_id,
+                false, // tta_mode
+                false, // tta_temporal_mode
+                false, // uhd_mode
+                1,     // num_threads
+                is_v2,
+                is_v4
+            );
 
-        LOGI(
-            "Calling RIFE::load() in CPU-only mode from: %s",
-            target_dir.c_str()
-        );
+            LOGI(
+                "Calling RIFE::load() with %s (gpu_id=%d) from: %s",
+                backend_name,
+                gpu_id,
+                target_dir.c_str()
+            );
 
-        int ret = rife_impl->load(target_dir);
+            int ret = rife_impl->load(target_dir);
 
-        if (ret != 0) {
+            if (ret != 0) {
+                last_error =
+                    std::string("RIFE ") + backend_name + " load failed with error code: " +
+                    std::to_string(ret);
+
+                LOGE(
+                    "%s",
+                    last_error.c_str()
+                );
+
+                rife_impl.reset();
+                return false;
+            }
+
+            model_loaded = true;
+
+            op_details =
+                std::string("RIFE model loaded with ") + backend_name + ".";
+
+            LOGI(
+                "RIFE model successfully loaded with %s from %s",
+                backend_name,
+                target_dir.c_str()
+            );
+
+            return true;
+
+        } catch (const std::exception& e) {
             last_error =
-                "RIFE CPU load failed with error code: " +
-                std::to_string(ret);
+                std::string("Exception during RIFE ") + backend_name + " load: " + e.what();
 
             LOGE(
                 "%s",
                 last_error.c_str()
             );
 
-            model_loaded = false;
             rife_impl.reset();
+            return false;
 
+        } catch (...) {
+            last_error =
+                std::string("Unknown exception during RIFE ") + backend_name + " load.";
+
+            LOGE(
+                "%s",
+                last_error.c_str()
+            );
+
+            rife_impl.reset();
             return false;
         }
+    };
 
-        model_loaded = true;
+    int gpu_id_to_use = vulkan_available ? gpu_id : -1;
+    const char* backend_name = vulkan_available ? "Vulkan" : "CPU fallback";
 
-        op_details =
-            "RIFE model loaded in CPU fallback mode.";
+    LOGI(
+        "Loading RIFE model with %s. Vulkan detected=%s, GPU id=%d",
+        backend_name,
+        vulkan_available ? "YES" : "NO",
+        gpu_id_to_use
+    );
 
-        LOGI(
-            "RIFE model successfully loaded in CPU mode "
-            "from %s",
-            target_dir.c_str()
-        );
-
-        return true;
-
-    } catch (const std::exception& e) {
-        last_error =
-            std::string(
-                "Exception during RIFE CPU load: "
-            ) + e.what();
-
-        LOGE(
-            "%s",
-            last_error.c_str()
-        );
-
-        model_loaded = false;
-        rife_impl.reset();
-
-        return false;
-
-    } catch (...) {
-        last_error =
-            "Unknown exception during RIFE CPU load.";
-
-        LOGE(
-            "%s",
-            last_error.c_str()
-        );
-
-        model_loaded = false;
-        rife_impl.reset();
-
+    if (!try_load_with_gpu(gpu_id_to_use, backend_name)) {
+        if (vulkan_available) {
+            LOGW(
+                "Vulkan load failed, falling back to CPU mode. Error: %s",
+                last_error.c_str()
+            );
+            last_error.clear();
+            if (try_load_with_gpu(-1, "CPU fallback")) {
+                vulkan_available = false;
+                gpu_name.clear();
+                vulkan_api_version.clear();
+                return true;
+            }
+        }
         return false;
     }
+
+    return true;
 }
 
 bool RifeEngine::processFrameBuffer(
@@ -369,6 +371,12 @@ bool RifeEngine::processFrameBuffer(
             "RIFE model not loaded.";
 
         return false;
+    }
+
+    static bool logged_backend = false;
+    if (!logged_backend) {
+        LOGI("RIFE backend=%s", vulkan_available ? "Vulkan" : "CPU");
+        logged_backend = true;
     }
 
     if (!in0_rgba || !in1_rgba || !out_rgba) {
@@ -431,7 +439,7 @@ bool RifeEngine::processFrameBuffer(
 
     if (ret != 0 || out_mat.empty()) {
         last_error =
-            "RIFE CPU process failed with error: " +
+            std::string("RIFE ") + (vulkan_available ? "Vulkan" : "CPU") + " process failed with error: " +
             std::to_string(ret);
 
         LOGE(
@@ -460,7 +468,7 @@ bool RifeEngine::processFrameBuffer(
     std::ostringstream ss;
 
     ss
-        << "CPU frame processed ("
+        << (vulkan_available ? "Vulkan" : "CPU") << " frame processed ("
         << src_w
         << "x"
         << src_h
@@ -532,12 +540,6 @@ RifeEngineResult RifeEngine::getStatus() const {
     std::lock_guard<std::mutex> lock(mutex);
     RifeEngineResult res;
 
-    /*
-     * Success means the model is loaded and at least one
-     * inference has completed. It does not require Vulkan
-     * because the current stability build intentionally
-     * supports CPU fallback.
-     */
     res.success =
         model_loaded &&
         (last_inference_time_ms >= 0);
