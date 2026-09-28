@@ -264,10 +264,12 @@ int RIFE::load(const std::string& modeldir)
                 ncnn::MutexLockGuard guard(lock);
                 if (spirv.empty())
                 {
+                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_preproc (tta_mode=%d) START", tta_mode);
                     if (tta_mode)
                         compile_spirv_module(rife_preproc_tta_comp_data, sizeof(rife_preproc_tta_comp_data), opt, spirv);
                     else
                         compile_spirv_module(rife_preproc_comp_data, sizeof(rife_preproc_comp_data), opt, spirv);
+                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_preproc END");
                 }
             }
 
@@ -283,10 +285,12 @@ int RIFE::load(const std::string& modeldir)
                 ncnn::MutexLockGuard guard(lock);
                 if (spirv.empty())
                 {
+                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_postproc (tta_mode=%d) START", tta_mode);
                     if (tta_mode)
                         compile_spirv_module(rife_postproc_tta_comp_data, sizeof(rife_postproc_tta_comp_data), opt, spirv);
                     else
                         compile_spirv_module(rife_postproc_comp_data, sizeof(rife_postproc_comp_data), opt, spirv);
+                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_postproc END");
                 }
             }
 
@@ -304,6 +308,7 @@ int RIFE::load(const std::string& modeldir)
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty())
             {
+                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_avg (rife_v4=%d, rife_v2=%d) START", rife_v4, rife_v2);
                 if (rife_v4)
                 {
                     compile_spirv_module(rife_v4_flow_tta_avg_comp_data, sizeof(rife_v4_flow_tta_avg_comp_data), opt, spirv);
@@ -316,6 +321,7 @@ int RIFE::load(const std::string& modeldir)
                 {
                     compile_spirv_module(rife_flow_tta_avg_comp_data, sizeof(rife_flow_tta_avg_comp_data), opt, spirv);
                 }
+                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_avg END");
             }
         }
 
@@ -334,6 +340,7 @@ int RIFE::load(const std::string& modeldir)
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty())
             {
+                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_temporal_avg (rife_v4=%d, rife_v2=%d) START", rife_v4, rife_v2);
                 if (rife_v4)
                 {
                     compile_spirv_module(rife_v4_flow_tta_temporal_avg_comp_data, sizeof(rife_v4_flow_tta_temporal_avg_comp_data), opt, spirv);
@@ -346,6 +353,7 @@ int RIFE::load(const std::string& modeldir)
                 {
                     compile_spirv_module(rife_flow_tta_temporal_avg_comp_data, sizeof(rife_flow_tta_temporal_avg_comp_data), opt, spirv);
                 }
+                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_temporal_avg END");
             }
         }
 
@@ -364,7 +372,9 @@ int RIFE::load(const std::string& modeldir)
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty())
             {
+                LOGE("RIFE-DEBUG: compile_spirv_module for rife_out_tta_temporal_avg START");
                 compile_spirv_module(rife_out_tta_temporal_avg_comp_data, sizeof(rife_out_tta_temporal_avg_comp_data), opt, spirv);
+                LOGE("RIFE-DEBUG: compile_spirv_module for rife_out_tta_temporal_avg END");
             }
         }
 
@@ -444,10 +454,12 @@ int RIFE::load(const std::string& modeldir)
                 ncnn::MutexLockGuard guard(lock);
                 if (spirv.empty())
                 {
+                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_v4_timestep (tta_mode=%d) START", tta_mode);
                     if (tta_mode)
                         compile_spirv_module(rife_v4_timestep_tta_comp_data, sizeof(rife_v4_timestep_tta_comp_data), opt, spirv);
                     else
                         compile_spirv_module(rife_v4_timestep_comp_data, sizeof(rife_v4_timestep_comp_data), opt, spirv);
+                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_v4_timestep END");
                 }
             }
 

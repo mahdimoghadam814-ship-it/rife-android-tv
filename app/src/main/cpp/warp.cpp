@@ -1,5 +1,8 @@
 // rife implemented with ncnn library
 
+#include <android/log.h>
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "RIFE-DEBUG", __VA_ARGS__)
+
 #include "rife_ops.h"
 
 #include "warp.comp.hex.h"
@@ -32,7 +35,9 @@ int Warp::create_pipeline(const Option& opt)
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty())
             {
+                LOGE("RIFE-DEBUG: compile_spirv_module for warp START");
                 compile_spirv_module(warp_comp_data, sizeof(warp_comp_data), opt, spirv);
+                LOGE("RIFE-DEBUG: compile_spirv_module for warp END");
             }
         }
 
@@ -49,7 +54,9 @@ int Warp::create_pipeline(const Option& opt)
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty())
             {
+                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack4 START");
                 compile_spirv_module(warp_pack4_comp_data, sizeof(warp_pack4_comp_data), opt, spirv);
+                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack4 END");
             }
         }
 
@@ -67,7 +74,9 @@ int Warp::create_pipeline(const Option& opt)
             ncnn::MutexLockGuard guard(lock);
             if (spirv.empty())
             {
+                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack8 START");
                 compile_spirv_module(warp_pack8_comp_data, sizeof(warp_pack8_comp_data), opt, spirv);
+                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack8 END");
             }
         }
 

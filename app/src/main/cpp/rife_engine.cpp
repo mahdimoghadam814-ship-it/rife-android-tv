@@ -119,8 +119,6 @@ bool RifeEngine::init(int requested_gpu_id) {
         return true;
     }
 
-    vulkan_available = true;
-
     if (gpu_id < 0 || gpu_id >= gpu_count) {
         gpu_id = ncnn::get_default_gpu_index();
     }
@@ -149,6 +147,24 @@ bool RifeEngine::init(int requested_gpu_id) {
             gpu_name.c_str(),
             vulkan_api_version.c_str()
         );
+
+        // Check for known problematic GPU: Mali-G310 crashes in glslang::GlslangToSpv()
+        // during RIFE Vulkan shader compilation. Disable Vulkan for this device to avoid SIGSEGV.
+        if (gpu_name.find("Mali-G310") != std::string::npos) {
+            LOGW(
+                "Mali-G310 detected - known to crash in glslang during RIFE Vulkan shader compilation. "
+                "Disabling Vulkan and falling back to CPU mode."
+            );
+            vulkan_available = false;
+            gpu_name.clear();
+            vulkan_api_version.clear();
+            last_error =
+                "Mali-G310 GPU detected. Vulkan disabled due to known glslang crash. "
+                "RIFE will use CPU fallback.";
+            return true;
+        }
+
+        vulkan_available = true;
     } else {
         LOGE(
             "Failed to obtain Vulkan device for GPU id %d",
@@ -187,7 +203,8 @@ bool RifeEngine::loadModelFromAssets(
      * glslang::GlslangToSpv() while RIFE::load() was building
      * Vulkan shader modules.
      *
-     * Now we attempt Vulkan first (if available) and fall back to
+     * Mali-G310 is detected in init() and Vulkan is disabled for it.
+     * For other devices, we attempt Vulkan first (if available) and fall back to
      * CPU only if Vulkan initialization genuinely fails.
      */
 
