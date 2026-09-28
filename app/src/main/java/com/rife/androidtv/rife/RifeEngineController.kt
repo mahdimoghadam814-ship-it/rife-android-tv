@@ -8,6 +8,8 @@ import androidx.media3.common.SurfaceInfo
 import androidx.media3.common.util.UnstableApi
 import com.rife.androidtv.NativeEngine
 import com.rife.androidtv.RifeDiagnosticResult
+import com.rife.androidtv.DeviceProfile
+import com.rife.androidtv.VulkanCapabilities
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeStats
@@ -36,6 +38,9 @@ class RifeEngineController(
 ) : RifeController {
     companion object {
         private const val TAG = "RifeEngineController"
+        private const val TAG_DEVICE = "RIFE-DEVICE"
+        private const val TAG_LIFECYCLE = "RIFE-LIFECYCLE"
+        private const val TAG_ERROR = "RIFE-ERROR"
     }
 
     /**
@@ -202,17 +207,21 @@ class RifeEngineController(
                     )
                     engineReady = loadSuccess
                     if (loadSuccess) {
-                        Log.i(TAG, "RIFE-LIFECYCLE: RIFE engine initialised: modelLoaded=$loadSuccess")
+                        Log.i(TAG_LIFECYCLE, "RIFE engine initialised: modelLoaded=$loadSuccess")
+                        // Log device profile and capabilities
+                        val status = NativeEngine.getRifeStatus()
+                        Log.i(TAG_DEVICE, "Device profile: ${status.deviceProfile}, GPU: ${status.gpuName}, " +
+                                "Vulkan: ${status.vulkanApiVersion}, Capabilities: ${status.vulkanCapabilities}")
                     } else {
-                        Log.e(TAG, "RIFE-LIFECYCLE: RIFE engine model load failed")
+                        Log.e(TAG_LIFECYCLE, "RIFE engine model load failed")
                         _error.value = "RIFE model load failed. Check that model assets are packaged."
                     }
                 } else {
-                    Log.e(TAG, "RIFE-LIFECYCLE: RIFE engine init failed")
+                    Log.e(TAG_LIFECYCLE, "RIFE engine init failed")
                     _error.value = "RIFE engine initialization failed."
                 }
             } catch (t: Throwable) {
-                Log.e(TAG, "RIFE-LIFECYCLE: RIFE engine init crashed", t)
+                Log.e(TAG_ERROR, "RIFE engine init crashed", t)
                 _error.value = "RIFE engine initialization crashed: ${t.message}"
             } finally {
                 // Reset initStarted so a failed initialization can be retried.

@@ -114,16 +114,69 @@ Java_com_rife_androidtv_NativeEngine_getRifeStatus(JNIEnv* env, jclass clazz) {
     jmethodID constructor = env->GetMethodID(
         resultClass,
         "<init>",
-        "(ZZLjava/lang/String;Ljava/lang/String;ZJLjava/lang/String;Ljava/lang/String;)V"
+        "(ZZLjava/lang/String;Ljava/lang/String;ZJLjava/lang/String;Ljava/lang/String;Lcom/rife/androidtv/VulkanCapabilities;Lcom/rife/androidtv/DeviceProfile;Ljava/lang/String;)V"
     );
     if (constructor == nullptr) {
         return nullptr;
+    }
+
+    // Create VulkanCapabilities object
+    jclass capsClass = env->FindClass("com/rife/androidtv/VulkanCapabilities");
+    if (capsClass == nullptr) {
+        return nullptr;
+    }
+    jmethodID capsConstructor = env->GetMethodID(
+        capsClass,
+        "<init>",
+        "(ZZZZZZZZZZZZZZ)V"
+    );
+    if (capsConstructor == nullptr) {
+        return nullptr;
+    }
+    jobject capsObj = env->NewObject(
+        capsClass,
+        capsConstructor,
+        res.vulkan_caps.fp16_storage,
+        res.vulkan_caps.fp16_packed,
+        res.vulkan_caps.fp16_arithmetic,
+        res.vulkan_caps.int8_storage,
+        res.vulkan_caps.int8_packed,
+        res.vulkan_caps.int8_arithmetic,
+        res.vulkan_caps.int16_storage,
+        res.vulkan_caps.int16_arithmetic,
+        res.vulkan_caps.shader_int16,
+        res.vulkan_caps.shader_int64,
+        res.vulkan_caps.cooperative_matrix,
+        res.vulkan_caps.subgroup_size_control,
+        res.vulkan_caps.storage_buffer_16bit,
+        res.vulkan_caps.uniform_storage_buffer_16bit
+    );
+
+    // Get DeviceProfile enum value
+    jclass profileClass = env->FindClass("com/rife/androidtv/DeviceProfile");
+    if (profileClass == nullptr) {
+        return nullptr;
+    }
+    jfieldID profileField = env->GetStaticFieldID(
+        profileClass,
+        "values",
+        "()[Lcom/rife/androidtv/DeviceProfile;"
+    );
+    jobjectArray profileValues = static_cast<jobjectArray>(env->GetStaticObjectField(profileClass, profileField));
+    jobject profileObj = nullptr;
+    if (profileValues) {
+        jsize len = env->GetArrayLength(profileValues);
+        int profileIndex = static_cast<int>(res.device_profile);
+        if (profileIndex >= 0 && profileIndex < len) {
+            profileObj = env->GetObjectArrayElement(profileValues, profileIndex);
+        }
     }
 
     jstring gpuName = env->NewStringUTF(res.gpu_name.c_str());
     jstring vulkanApiVersion = env->NewStringUTF(res.vulkan_api_version.c_str());
     jstring lastError = env->NewStringUTF(res.last_error.c_str());
     jstring opDetails = env->NewStringUTF(res.op_details.c_str());
+    jstring deviceModel = env->NewStringUTF(res.device_model.c_str());
 
     jobject objectResult = env->NewObject(
         resultClass,
@@ -133,11 +186,17 @@ Java_com_rife_androidtv_NativeEngine_getRifeStatus(JNIEnv* env, jclass clazz) {
         gpuName,
         vulkanApiVersion,
         res.model_loaded,
-        (jlong)res.last_inference_time_ms,
+        static_cast<jlong>(res.last_inference_time_ms),
         lastError,
-        opDetails
+        opDetails,
+        capsObj,
+        profileObj,
+        deviceModel
     );
 
     env->DeleteLocalRef(resultClass);
+    env->DeleteLocalRef(capsClass);
+    env->DeleteLocalRef(profileClass);
+    if (profileValues) env->DeleteLocalRef(profileValues);
     return objectResult;
 }

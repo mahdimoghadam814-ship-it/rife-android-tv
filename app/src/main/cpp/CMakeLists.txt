@@ -92,6 +92,20 @@ rife_add_shader(warp_pack8.comp)
 
 add_custom_target(generate-rife-spirv DEPENDS ${SHADER_SPV_HEX_FILES} ${SHADER_SPV_FILES})
 
+# Build-time SPIR-V header validation
+# Runs after SPIR-V headers are generated to validate magic number, size, alignment
+add_custom_target(validate-rife-spirv
+    COMMAND ${CMAKE_COMMAND}
+        -DSHADER_SPV_HEADERS="${SHADER_SPV_FILES}"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/validate_spirv_headers.cmake"
+    DEPENDS ${SHADER_SPV_FILES}
+    COMMENT "Validating generated SPIR-V headers"
+    VERBATIM
+)
+
+# Make validation run after generation but before native library build
+add_custom_target(rife-spirv-pipeline DEPENDS generate-rife-spirv validate-rife-spirv)
+
 # Native library target
 add_library(
     rife_native
@@ -103,7 +117,7 @@ add_library(
     warp.cpp
 )
 
-add_dependencies(rife_native generate-rife-spirv)
+add_dependencies(rife_native rife-spirv-pipeline)
 
 target_include_directories(
     rife_native
