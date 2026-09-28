@@ -1144,6 +1144,9 @@ class VideoFrameProcessor(
         val prev = previousFrame
 
         if (prev == null) {
+            // First frame: log checksum before rendering
+            val firstFrameChecksum = calculateChecksum(nextFrame.pixels, nextFrame.width, nextFrame.height)
+            Log.d(TAG, "PIPELINE CHECKSUM: firstFrame ${nextFrame.width}x${nextFrame.height} checksum=$firstFrameChecksum")
             renderFrameToOutput(nextFrame)
             frameCountOutput++
             previousFrame = nextFrame
@@ -1201,6 +1204,11 @@ class VideoFrameProcessor(
         in0Buf.flip()
         in1Buf.flip()
 
+        // DIAGNOSTICS: Log checksum of frames before FastDVDnet/RIFE
+        val prevChecksum = calculateChecksum(in0Buf, rifeInputW, rifeInputH)
+        val nextChecksum = calculateChecksum(in1Buf, rifeInputW, rifeInputH)
+        Log.d(TAG, "PIPELINE CHECKSUM: prevFrame ${rifeInputW}x${rifeInputH} checksum=$prevChecksum nextFrame checksum=$nextChecksum")
+
         val startTime = SystemClock.elapsedRealtime()
 
         if (!isRifeEnabled) {
@@ -1214,6 +1222,9 @@ class VideoFrameProcessor(
                     den1Buf
                 )
                 if (denoised) {
+                    // DIAGNOSTICS: Log checksum after FastDVDnet pass-through
+                    val fastDvdNetChecksum = calculateChecksum(den1Buf, rifeInputW, rifeInputH)
+                    Log.d(TAG, "PIPELINE CHECKSUM: after FastDVDnet ${rifeInputW}x${rifeInputH} checksum=$fastDvdNetChecksum (unchanged=${fastDvdNetChecksum == nextChecksum})")
                     renderBufferToOutput(den1Buf, rifeInputW, rifeInputH)
                 } else {
                     renderFrameToOutput(nextFrame)
@@ -1251,10 +1262,19 @@ class VideoFrameProcessor(
             if (denoisedPrev && denoisedNext) {
                 src0Buf = den0Buf
                 src1Buf = den1Buf
+                // DIAGNOSTICS: Log checksum after FastDVDnet
+                val den0Checksum = calculateChecksum(den0Buf, rifeInputW, rifeInputH)
+                val den1Checksum = calculateChecksum(den1Buf, rifeInputW, rifeInputH)
+                Log.d(TAG, "PIPELINE CHECKSUM: after FastDVDnet den0 checksum=$den0Checksum den1 checksum=$den1Checksum")
             } else {
                 Log.w(TAG, "FastDVDnet stage failed, interpolating the raw frames")
             }
         }
+
+        // DIAGNOSTICS: Log checksum before RIFE JNI
+        val src0Checksum = calculateChecksum(src0Buf, rifeInputW, rifeInputH)
+        val src1Checksum = calculateChecksum(src1Buf, rifeInputW, rifeInputH)
+        Log.d(TAG, "PIPELINE CHECKSUM: before RIFE src0 checksum=$src0Checksum src1 checksum=$src1Checksum")
 
         Log.i(
             TAG,
@@ -1289,6 +1309,10 @@ class VideoFrameProcessor(
             // renderBufferToOutput() -> GlOutputRenderer.render() needs.
             outBuf.position(0)
             outBuf.limit(requiredOutputBytes.toInt())
+
+            // DIAGNOSTICS: Log checksum after RIFE interpolation
+            val rifeOutputChecksum = calculateChecksum(outBuf, rifeOutputW, rifeOutputH)
+            Log.d(TAG, "PIPELINE CHECKSUM: after RIFE ${rifeOutputW}x${rifeOutputH} checksum=$rifeOutputChecksum")
 
             // Temporal order: previous frame was already rendered when it was captured (or as the
             // first frame), so we only render the interpolated frame and the next frame.
@@ -1380,6 +1404,32 @@ class VideoFrameProcessor(
         frameBufferPool.add(buffer)
     }
 
+    /**
+     * Calculates a cheap pixel checksum (sum of all RGBA values) to verify the buffer is not all-zero.
+     * Does not modify the buffer position/limit.
+     */
+    private fun calculateChecksum(buffer: ByteBuffer, width: Int, height: Int): Long {
+        val originalPosition = buffer.position()
+        val originalLimit = buffer.limit()
+        buffer.position(0)
+        val pixelCount = width * height
+        var sum: Long = 0
+        // Sample every 16th pixel to keep it fast
+        val step = 16
+        for (i in 0 until pixelCount step step) {
+            val offset = i * 4
+            if (offset + 3 < buffer.capacity()) {
+                sum += (buffer.get(offset).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 1).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 2).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 3).toInt() and 0xFF).toLong()
+            }
+        }
+        buffer.position(originalPosition)
+        buffer.limit(originalLimit)
+        return sum
+    }
+
     private fun renderFrameToOutput(frame: FrameData) {
         frame.pixels.clear()
         renderBufferToOutput(frame.pixels, frame.width, frame.height)
@@ -1409,6 +1459,11 @@ class VideoFrameProcessor(
         }
         pixels.position(0)
         pixels.limit(requiredBytes.toInt())
+
+        // DIAGNOSTICS: Log checksum before sending to GlOutputRenderer
+        val renderChecksum = calculateChecksum(pixels, width, height)
+        Log.d(TAG, "PIPELINE CHECKSUM: before GlOutputRenderer ${width}x$height checksum=$renderChecksum")
+
         try {
             renderer.render(pixels, width, height)
         } catch (t: Throwable) {

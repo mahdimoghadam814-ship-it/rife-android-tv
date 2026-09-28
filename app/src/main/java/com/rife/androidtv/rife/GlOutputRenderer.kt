@@ -238,11 +238,31 @@ class GlOutputRenderer {
             return
         }
 
+        // DIAGNOSTICS: Log EGL state before rendering
+        val currentDisplay = EGL14.eglGetCurrentDisplay()
+        val currentContext = EGL14.eglGetCurrentContext()
+        val currentSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        Log.d(TAG, "RENDER EGL STATE: display=$currentDisplay context=$currentContext surface=$currentSurface")
+
         if (surfaceWidth != width || surfaceHeight != height) {
             // The window surface keeps the size of the SurfaceView; the viewport is set from the
             // actual surface size so the frame is never stretched by a stale viewport.
             updateSurfaceSize()
         }
+
+        // DIAGNOSTICS: Calculate output buffer checksum
+        val checksum = calculateChecksum(buffer, width, height)
+        Log.d(TAG, "RENDER INPUT CHECKSUM: ${width}x$height checksum=$checksum")
+
+        // DIAGNOSTICS: Query framebuffer binding and viewport before drawing
+        val boundFbo = IntArray(1)
+        GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, boundFbo, 0)
+        val viewport = IntArray(4)
+        GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0)
+        val currentProgram = IntArray(1)
+        GLES20.glGetIntegerv(GLES20.GL_CURRENT_PROGRAM, currentProgram, 0)
+        Log.d(TAG, "RENDER PRE-DRAW: boundFbo=${boundFbo[0]} viewport=${viewport.contentToString()} currentProgram=${currentProgram[0]} surfaceSize=${surfaceWidth}x$surfaceHeight")
+
         GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
 
         GLES20.glUseProgram(program)
@@ -289,7 +309,36 @@ class GlOutputRenderer {
         GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
 
-        EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        // DIAGNOSTICS: Check eglSwapBuffers result and error
+        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        val swapError = EGL14.eglGetError()
+        Log.d(TAG, "eglSwapBuffers: result=$swapResult error=0x${swapError.toString(16)}")
+    }
+
+    /**
+     * Calculates a cheap pixel checksum (sum of all RGBA values) to verify the buffer is not all-zero.
+     * Does not modify the buffer position/limit.
+     */
+    private fun calculateChecksum(buffer: ByteBuffer, width: Int, height: Int): Long {
+        val originalPosition = buffer.position()
+        val originalLimit = buffer.limit()
+        buffer.position(0)
+        val pixelCount = width * height
+        var sum: Long = 0
+        // Sample every 16th pixel to keep it fast
+        val step = 16
+        for (i in 0 until pixelCount step step) {
+            val offset = i * 4
+            if (offset + 3 < buffer.capacity()) {
+                sum += (buffer.get(offset).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 1).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 2).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 3).toInt() and 0xFF).toLong()
+            }
+        }
+        buffer.position(originalPosition)
+        buffer.limit(originalLimit)
+        return sum
     }
 
     private fun updateSurfaceSize() {

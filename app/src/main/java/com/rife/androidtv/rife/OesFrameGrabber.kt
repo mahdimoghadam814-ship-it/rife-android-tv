@@ -293,6 +293,11 @@ class OesFrameGrabber {
             // position, so the readable range is established explicitly here.
             out.position(0)
             out.limit(requiredBytesInt)
+
+            // DIAGNOSTICS: Calculate cheap pixel checksum to verify capture is non-black
+            val checksum = calculateChecksum(out, targetWidth, targetHeight)
+            Log.d(TAG, "CAPTURE CHECKSUM: ${targetWidth}x$targetHeight checksum=$checksum")
+
             true
         } catch (t: Throwable) {
             Log.e(TAG, "External texture readback failed", t)
@@ -305,6 +310,32 @@ class OesFrameGrabber {
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             }
         }
+    }
+
+    /**
+     * Calculates a cheap pixel checksum (sum of all RGBA values) to verify the buffer is not all-zero.
+     * Does not modify the buffer position/limit.
+     */
+    private fun calculateChecksum(buffer: ByteBuffer, width: Int, height: Int): Long {
+        val originalPosition = buffer.position()
+        val originalLimit = buffer.limit()
+        buffer.position(0)
+        val pixelCount = width * height
+        var sum: Long = 0
+        // Sample every 16th pixel to keep it fast
+        val step = 16
+        for (i in 0 until pixelCount step step) {
+            val offset = i * 4
+            if (offset + 3 < buffer.capacity()) {
+                sum += (buffer.get(offset).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 1).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 2).toInt() and 0xFF).toLong()
+                sum += (buffer.get(offset + 3).toInt() and 0xFF).toLong()
+            }
+        }
+        buffer.position(originalPosition)
+        buffer.limit(originalLimit)
+        return sum
     }
 
     /**
