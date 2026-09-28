@@ -1,12 +1,43 @@
 #include <android/log.h>
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "RIFE-DEBUG", __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "RIFE-DEBUG", __VA_ARGS__)
 // rife implemented with ncnn library
 
 #include "rife.h"
 
 #include <algorithm>
 #include <vector>
+#include <fstream>
+#include <string>
 #include "benchmark.h"
+
+static size_t getCurrentRssBytes() {
+    std::ifstream status("/proc/self/status");
+    std::string line;
+    while (std::getline(status, line)) {
+        if (line.rfind("VmRSS:", 0) == 0) {
+            size_t kb = 0;
+            size_t pos = line.find_first_of("0123456789");
+            if (pos != std::string::npos) {
+                kb = std::stoull(line.substr(pos));
+            }
+            return kb * 1024;
+        }
+    }
+    return 0;
+}
+
+static void logRss(const char* stage, int frame = -1) {
+    size_t rss_bytes = getCurrentRssBytes();
+    double rss_mb = rss_bytes / (1024.0 * 1024.0);
+    if (frame >= 0) {
+        LOGI("RIFE-MEM frame=%d stage=%s rss=%.1f MB", frame, stage, rss_mb);
+    } else {
+        LOGI("RIFE-MEM stage=%s rss=%.1f MB", stage, rss_mb);
+    }
+}
+
+static int g_rife_frame_counter = 0;
 
 #include "rife_preproc.comp.hex.h"
 #include "rife_postproc.comp.hex.h"
@@ -170,6 +201,7 @@ int RIFE::load(const std::wstring& modeldir)
 int RIFE::load(const std::string& modeldir)
 #endif
 {
+    logRss("before_load");
     ncnn::Option opt;
     opt.num_threads = num_threads;
     opt.use_vulkan_compute = vkdev ? true : false;
@@ -228,6 +260,7 @@ int RIFE::load(const std::string& modeldir)
             return -10;
         }
     }
+    logRss("after_flownet_load");
 
     if (!rife_v4)
     {
@@ -237,6 +270,7 @@ int RIFE::load(const std::string& modeldir)
             fprintf(stderr, "RIFE: contextnet load failed, return=%d\n", context_ret);
             return -20;
         }
+        logRss("after_contextnet_load");
 
         const int fusion_ret = load_param_model(fusionnet, modeldir, "fusionnet");
         if (fusion_ret != 0)
@@ -244,6 +278,7 @@ int RIFE::load(const std::string& modeldir)
             fprintf(stderr, "RIFE: fusionnet load failed, return=%d\n", fusion_ret);
             return -30;
         }
+        logRss("after_fusionnet_load");
     }
 #endif
 
@@ -471,6 +506,7 @@ int RIFE::load(const std::string& modeldir)
         }
     }
 
+    logRss("after_load");
     return 0;
 }
 
@@ -1313,15 +1349,21 @@ int RIFE::process(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float ti
 
 int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float timestep, ncnn::Mat& outimage) const
 {
+    int frame = ++g_rife_frame_counter;
+    logRss("before_process", frame);
+    logRss("before_process_cpu", frame);
+
     if (timestep == 0.f)
     {
         outimage = in0image;
+        logRss("after_process_cpu", frame);
         return 0;
     }
 
     if (timestep == 1.f)
     {
         outimage = in1image;
+        logRss("after_process_cpu", frame);
         return 0;
     }
 
@@ -2333,6 +2375,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
                 ex.input("input1", in1_padded);
 
             LOGE("[RIFE-DEBUG] CPU normal: BEFORE flownet extract");
+            logRss("before_flownet_extract", frame);
 
             int ret_flow = ex.extract("flow", flow);
 
@@ -2342,6 +2385,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
                  flow.w,
                  flow.h,
                  flow.c);
+            logRss("after_flownet_extract", frame);
 
             if (ret_flow != 0 || flow.empty())
             {
@@ -2454,6 +2498,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
         // contextnet
         ncnn::Mat ctx0[4];
         ncnn::Mat ctx1[4];
+        logRss("before_contextnet_extract", frame);
         {
             ncnn::Extractor ex = contextnet.create_extractor();
 
@@ -2512,6 +2557,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
             LOGE("[RIFE-DEBUG] AFTER contextnet1 f4 ret=%d empty=%d w=%d h=%d c=%d",
                  ret_ctx1_f4, ctx1[3].empty() ? 1 : 0, ctx1[3].w, ctx1[3].h, ctx1[3].c);
         }
+        logRss("after_contextnet_extract", frame);
 
         // fusionnet
         ncnn::Mat out_padded;
@@ -2531,9 +2577,11 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
             ex.input("10", ctx1[3]);
 
             LOGE("[RIFE-DEBUG] BEFORE fusionnet output");
+            logRss("before_fusionnet_extract", frame);
             int ret_fusion = ex.extract("output", out_padded);
             LOGE("[RIFE-DEBUG] AFTER fusionnet output ret=%d empty=%d w=%d h=%d c=%d",
                  ret_fusion, out_padded.empty() ? 1 : 0, out_padded.w, out_padded.h, out_padded.c);
+            logRss("after_fusionnet_extract", frame);
         }
 
         ncnn::Mat out_padded_reversed;
@@ -2555,12 +2603,15 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
                 ex.input("9", ctx0[2]);
                 ex.input("10", ctx0[3]);
 
+                logRss("before_fusionnet_reversed_extract", frame);
                 ex.extract("output", out_padded_reversed);
+                logRss("after_fusionnet_reversed_extract", frame);
             }
         }
 
         // cut padding and postproc
         out.create(w, h, 3);
+        logRss("before_output_conversion", frame);
         if (tta_temporal_mode)
         {
             for (int q = 0; q < 3; q++)
@@ -2594,6 +2645,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
                 }
             }
         }
+        logRss("after_output_conversion", frame);
     }
 
     // download
@@ -2609,6 +2661,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
 #endif
     }
 
+    logRss("after_process_cpu", frame);
     return 0;
 }
 

@@ -49,7 +49,7 @@ data class PlayerPreferences(
 
     // Video Processing Preferences (RIFE interpolation + FastDVDnet pre-processing stage)
     val rifeEnabled: Boolean = false,
-    val rifeResolution: RifeResolutionSetting = RifeResolutionSetting.ORIGINAL,
+    val rifeResolution: RifeResolutionSetting = RifeResolutionSetting.RES_1080P,
     val fastDvdNetEnabled: Boolean = false,
 
     // Subtitle Preferences
