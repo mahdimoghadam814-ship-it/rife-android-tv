@@ -12,8 +12,39 @@ on:
       - "main"
 
 jobs:
-  build:
+  preflight:
+    name: Preflight Checks
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Verify Submodule Contents
+        run: |
+          echo "=== Verifying submodule contents ==="
+          ls -la third_party/
+          test -f third_party/ncnn/src/ncnn_glsl_ext.comp && echo "PASS: ncnn_glsl_ext.comp exists" || (echo "FAIL: ncnn_glsl_ext.comp missing" && exit 1)
+          test -f third_party/rife-ncnn-vulkan/src/generate_shader_comp_header.cmake && echo "PASS: generate_shader_comp_header.cmake exists" || (echo "FAIL: generate_shader_comp_header.cmake missing" && exit 1)
+
+      - name: Install glslangValidator
+        run: |
+          sudo apt-get update && sudo apt-get install -y glslang-tools
+          which glslangValidator
+          glslangValidator --version
+
+      - name: Run CMake Preflight
+        run: |
+          cmake -S app/src/main/cpp -B build/preflight -DCMAKE_BUILD_TYPE=Debug 2>&1 | tail -20
+          cmake --build build/preflight --target rife-preflight 2>&1 | tail -30
+
+  build:
+    name: Build Android TV RIFE APK
+    runs-on: ubuntu-latest
+    needs: preflight
+    timeout-minutes: 30
 
     steps:
       - name: Checkout Repository
@@ -35,9 +66,8 @@ jobs:
       - name: Install glslangValidator
         run: |
           sudo apt-get update && sudo apt-get install -y glslang-tools
-          # Also check NDK shader-tools path
-          ls -la $ANDROID_NDK_HOME/shader-tools/ 2>/dev/null || echo "NDK shader-tools not found"
           which glslangValidator
+          glslangValidator --version
 
       - name: Build Debug APK
         run: |

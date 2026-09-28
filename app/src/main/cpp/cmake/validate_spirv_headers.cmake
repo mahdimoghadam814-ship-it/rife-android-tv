@@ -1,5 +1,5 @@
 # CMake script to validate generated SPIR-V headers at build time
-# Usage: cmake -DSHADER_SPV_HEADERS="header1.h;header2.h;..." -P validate_spirv_headers.cmake
+# Usage: cmake -DVALIDATION_LIST_FILE=<path> -P validate_spirv_headers.cmake
 #
 # Validates:
 # 1. Header file exists
@@ -8,15 +8,40 @@
 # 4. Array size is consistent with declared size
 # 5. Word alignment (size is multiple of 4 bytes)
 
-if(NOT DEFINED SHADER_SPV_HEADERS)
-    message(FATAL_ERROR "SHADER_SPV_HEADERS not defined. Provide list of generated .spv.h files to validate.")
+if(NOT DEFINED VALIDATION_LIST_FILE)
+    message(FATAL_ERROR "VALIDATION_LIST_FILE not defined. Provide path to file containing list of generated .spv.h files.")
 endif()
 
-message(STATUS "Validating ${SHADER_SPV_HEADERS} SPIR-V headers...")
+# Also check in CMAKE_CURRENT_BINARY_DIR if defined
+if(NOT EXISTS "${VALIDATION_LIST_FILE}" AND DEFINED CMAKE_CURRENT_BINARY_DIR)
+    set(ALT_VALIDATION_LIST_FILE "${CMAKE_CURRENT_BINARY_DIR}/rife_spv_headers.txt")
+    if(EXISTS "${ALT_VALIDATION_LIST_FILE}")
+        set(VALIDATION_LIST_FILE "${ALT_VALIDATION_LIST_FILE}")
+    endif()
+endif()
+
+if(NOT EXISTS "${VALIDATION_LIST_FILE}")
+    message(FATAL_ERROR "VALIDATION_LIST_FILE not found: ${VALIDATION_LIST_FILE}")
+endif()
+
+file(READ "${VALIDATION_LIST_FILE}" shader_list_content)
+
+message(STATUS "Validating SPIR-V headers from ${VALIDATION_LIST_FILE}...")
 
 set(VALIDATION_FAILED FALSE)
 
-foreach(SPV_HEADER ${SHADER_SPV_HEADERS})
+# Parse the semicolon-separated list into a CMake list
+string(REPLACE ";" ";" shader_list "${shader_list_content}")
+
+# Verify each header
+foreach(shader_path ${shader_list})
+    # Strip whitespace from path
+    string(STRIP "${shader_path}" shader_path)
+    if(shader_path STREQUAL "")
+        continue()
+    endif()
+    set(SPV_HEADER "${shader_path}")
+
     if(NOT EXISTS "${SPV_HEADER}")
         message(WARNING "SPIR-V header not found: ${SPV_HEADER}")
         set(VALIDATION_FAILED TRUE)
@@ -37,20 +62,27 @@ foreach(SPV_HEADER ${SHADER_SPV_HEADERS})
         continue()
     endif()
 
-    # Extract the array content
+    # Extract the array content between { and }
     string(REGEX REPLACE "static const uint32_t ${SHADER_NAME}_spv_data\\[\\] = \\{([^}]*)\\}" "\\1" array_content "${array_match}")
 
-    # Count elements (comma-separated hex values)
+    # Clean up whitespace
     string(REPLACE " " "" array_content "${array_content}")
     string(REPLACE "\n" "" array_content "${array_content}")
     string(REPLACE "\t" "" array_content "${array_content}")
-    string(REPLACE "0x" ";" array_content "${array_content}")
-    string(LENGTH "${array_content}" content_len)
-    # Count semicolons (each element starts with 0x)
-    string(REGEX MATCHALL "0x[0-9a-fA-F]+" elements "${header_content}")
-    # Use CMake list to count
-    separate_arguments(elements_list UNIX_COMMAND "${elements}")
-    list(LENGTH elements_list word_count)
+
+    # Split by comma to get individual hex words
+    string(REPLACE "," ";" array_content "${array_content}")
+
+    # Remove empty elements and count words
+    set(word_count 0)
+    foreach(word ${array_content})
+        if(NOT word STREQUAL "")
+            math(EXPR word_count "${word_count} + 1")
+            if(word_count EQUAL 1)
+                set(first_word "${word}")
+            endif()
+        endif()
+    endforeach()
 
     if(word_count EQUAL 0)
         # Check if it's a zero-size fallback
@@ -63,10 +95,20 @@ foreach(SPV_HEADER ${SHADER_SPV_HEADERS})
             set(VALIDATION_FAILED TRUE)
             continue()
         endif()
+    elseif(word_count EQUAL 1 AND first_word STREQUAL "0")
+        # Check for single-word fallback (array = { 0 } with size = 0)
+        string(REGEX MATCH "spv_data_size = 0" is_fallback "${header_content}")
+        if(is_fallback)
+            message(STATUS "SPIR-V header ${SPV_HEADER}: zero-size fallback (optional shader)")
+            continue()
+        else()
+            message(WARNING "SPIR-V header ${SPV_HEADER}: single-word array with value 0 but not marked as fallback")
+            set(VALIDATION_FAILED TRUE)
+            continue()
+        endif()
     endif()
 
     # Validate SPIR-V magic number (first word should be 0x07230203)
-    list(GET elements_list 0 first_word)
     if(NOT first_word STREQUAL "0x07230203")
         message(WARNING "SPIR-V header ${SPV_HEADER}: invalid magic number ${first_word}, expected 0x07230203")
         set(VALIDATION_FAILED TRUE)

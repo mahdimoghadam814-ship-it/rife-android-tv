@@ -4,10 +4,41 @@ on:
   workflow_dispatch:
 
 jobs:
+  preflight:
+    name: Preflight Checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # third_party/ncnn and third_party/rife-ncnn-vulkan are declared
+          # submodules of this repository and are required by the CMake native build.
+          submodules: recursive
+
+      - name: Verify Submodule Contents
+        run: |
+          echo "=== Verifying submodule contents ==="
+          ls -la third_party/
+          test -f third_party/ncnn/src/ncnn_glsl_ext.comp && echo "PASS: ncnn_glsl_ext.comp exists" || (echo "FAIL: ncnn_glsl_ext.comp missing" && exit 1)
+          test -f third_party/rife-ncnn-vulkan/src/generate_shader_comp_header.cmake && echo "PASS: generate_shader_comp_header.cmake exists" || (echo "FAIL: generate_shader_comp_header.cmake missing" && exit 1)
+
+      - name: Install glslangValidator
+        run: |
+          sudo apt-get update && sudo apt-get install -y glslang-tools
+          which glslangValidator
+          glslangValidator --version
+
+      - name: Run CMake Preflight
+        run: |
+          cmake -S app/src/main/cpp -B build/preflight -DCMAKE_BUILD_TYPE=Debug 2>&1 | tail -20
+          cmake --build build/preflight --target rife-preflight 2>&1 | tail -30
+
   build-debug-apk:
     name: Build debug APK (ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: preflight
 
     steps:
       - name: Checkout repository
@@ -36,9 +67,8 @@ jobs:
       - name: Install glslangValidator
         run: |
           sudo apt-get update && sudo apt-get install -y glslang-tools
-          # Also check NDK shader-tools path
-          ls -la $ANDROID_NDK_HOME/shader-tools/ 2>/dev/null || echo "NDK shader-tools not found"
           which glslangValidator
+          glslangValidator --version
 
       - name: Build debug APK with Gradle wrapper
         run: |

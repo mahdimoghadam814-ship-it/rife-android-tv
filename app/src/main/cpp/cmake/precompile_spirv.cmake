@@ -49,9 +49,12 @@ else()
     # Read the GLSL source
     file(READ ${SHADER_SRC} shader_source)
 
-    # Get ncnn GLSL extensions path
-    get_filename_component(NCNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/ncnn" ABSOLUTE)
+    # Get ncnn GLSL extensions path - use passed parameter
+    if(NOT DEFINED NCNN_DIR OR NOT EXISTS "${NCNN_DIR}")
+        message(FATAL_ERROR "NCNN_DIR not defined or does not exist: ${NCNN_DIR}. Pass -DNCNN_DIR=<path> when invoking this script.")
+    endif()
     set(NCNN_GLSL_EXT ${NCNN_DIR}/src/ncnn_glsl_ext.comp)
+    message(STATUS "Using ncnn_glsl_ext.comp from: ${NCNN_GLSL_EXT}")
 
     # Build RIFE Vulkan macros as a single string (avoid CMake list semicolon joining)
     string(CONCAT RIFE_VULKAN_MACROS
@@ -86,12 +89,14 @@ else()
     if(EXISTS ${NCNN_GLSL_EXT})
         file(READ ${NCNN_GLSL_EXT} ncnn_glsl_ext_content)
         string(REGEX REPLACE "^#version [0-9]+.*\n" "" ncnn_glsl_ext_content "${ncnn_glsl_ext_content}")
+        message(STATUS "Loaded ncnn_glsl_ext.comp from: ${NCNN_GLSL_EXT}")
     else()
-        message(WARNING "ncnn_glsl_ext.comp not found at ${NCNN_GLSL_EXT}")
+        message(FATAL_ERROR "ncnn_glsl_ext.comp not found at ${NCNN_GLSL_EXT}. Required for shader precompilation. Ensure third_party/ncnn submodule is initialized.")
     endif()
 
-    # Combine: preamble + #version + ncnn_ext + macros + shader_body
-    set(shader_source_with_macros "${version_line}${ncnn_glsl_ext_content}${RIFE_VULKAN_MACROS}${shader_body}")
+    # CORRECT ORDER: preamble + #version + MACROS + ncnn_ext + shader_body
+    # Macros MUST come before ncnn extensions because ncnn extensions use #if NCNN_xxx
+    set(shader_source_with_macros "${version_line}${RIFE_VULKAN_MACROS}${ncnn_glsl_ext_content}${shader_body}")
 
     set(TEMP_GLSL ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}_with_macros.comp)
     set(TEMP_SPV ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.spv)
@@ -163,10 +168,13 @@ else()
         math(EXPR words_len "${words_len} - 1")
         string(SUBSTRING "${spv_words}" 0 ${words_len} spv_words)
 
+        # Calculate byte size
+        math(EXPR spv_data_size "${word_count} * 4")
+
         # Write the header file with uint32_t array
         file(WRITE ${SHADER_SPV_HEADER}
             "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = {${spv_words}};\n"
-            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = sizeof(${SHADER_SRC_NAME_WE}_spv_data);\n"
+            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = ${spv_data_size};\n"
         )
 
         message(STATUS "Generated ${SHADER_SPV_HEADER} with ${word_count} uint32_t words")
