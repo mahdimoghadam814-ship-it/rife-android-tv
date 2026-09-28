@@ -958,6 +958,10 @@ class VideoFrameProcessor(
     /**
      * Ensures the EGL context that owns the input SurfaceTexture is current on the worker thread.
      * Returns true if successful, false otherwise.
+     *
+     * Note: The input EGL surface may be EGL_NO_SURFACE when the device supports surfaceless
+     * EGL contexts (via GlUtil.createFocusedPlaceholderEglSurface). This is a valid state and
+     * eglMakeCurrent should be called with EGL_NO_SURFACE for both draw and read surfaces.
      */
     private fun ensureEglContextCurrent(): Boolean {
         val bundle = inputBundle
@@ -972,19 +976,24 @@ class VideoFrameProcessor(
             Log.e(TAG, "ensureEglContextCurrent: EGL display/context/surface is null")
             return false
         }
-        if (context == EGL14.EGL_NO_CONTEXT || surface == EGL14.EGL_NO_SURFACE) {
-            Log.e(TAG, "ensureEglContextCurrent: EGL context or surface is invalid")
+        if (context == EGL14.EGL_NO_CONTEXT) {
+            Log.e(TAG, "ensureEglContextCurrent: EGL context is invalid")
             return false
         }
         val currentContext = EGL14.eglGetCurrentContext()
         val currentDisplay = EGL14.eglGetCurrentDisplay()
         val currentSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        val isSurfaceNoSurface = surface == EGL14.EGL_NO_SURFACE
         if (currentContext == context && currentDisplay == display && currentSurface == surface) {
             return true
         }
-        if (!EGL14.eglMakeCurrent(display, surface, surface, context)) {
+        val drawSurface = if (isSurfaceNoSurface) EGL14.EGL_NO_SURFACE else surface
+        val readSurface = if (isSurfaceNoSurface) EGL14.EGL_NO_SURFACE else surface
+        if (!EGL14.eglMakeCurrent(display, drawSurface, readSurface, context)) {
             val error = EGL14.eglGetError()
-            Log.e(TAG, "ensureEglContextCurrent: eglMakeCurrent failed: 0x${error.toString(16)}")
+            Log.e(TAG, "ensureEglContextCurrent: eglMakeCurrent failed: 0x${error.toString(16)} " +
+                "display=$display context=$context surface=$surface isNoSurface=$isSurfaceNoSurface " +
+                "currentDisplay=$currentDisplay currentContext=$currentContext currentSurface=$currentSurface")
             return false
         }
         return true
@@ -1026,17 +1035,24 @@ class VideoFrameProcessor(
             if (bundle != null) {
                 val storedDisplay = bundle.display
                 val storedContext = bundle.context
+                val storedSurface = bundle.surface
                 val currentDisplay = EGL14.eglGetCurrentDisplay()
                 val currentContext = EGL14.eglGetCurrentContext()
+                val currentSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+                val currentReadSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
                 val textureId = bundle.textureId
                 val isTextureReleased = texture.isReleased
                 val isBundleReleased = bundle.glObjectsReleased
+                val isSurfaceNoSurface = storedSurface == EGL14.EGL_NO_SURFACE
                 Log.d(TAG, "EGL DIAGNOSTICS: workerThread=${Thread.currentThread().name} " +
-                    "storedDisplay=$storedDisplay storedContext=$storedContext " +
+                    "storedDisplay=$storedDisplay storedContext=$storedContext storedSurface=$storedSurface " +
+                    "surfaceIsNoSurface=$isSurfaceNoSurface " +
                     "currentDisplay=$currentDisplay currentContext=$currentContext " +
+                    "currentDrawSurface=$currentSurface currentReadSurface=$currentReadSurface " +
                     "textureId=$textureId textureReleased=$isTextureReleased bundleGLReleased=$isBundleReleased " +
                     "processingEnabled=$isProcessingEnabled " +
-                    "contextMatch=${storedContext == currentContext} displayMatch=${storedDisplay == currentDisplay}")
+                    "contextMatch=${storedContext == currentContext} displayMatch=${storedDisplay == currentDisplay} " +
+                    "surfaceMatch=${storedSurface == currentSurface}")
             }
 
             // Ensure the EGL context that owns the SurfaceTexture is current before updateTexImage
