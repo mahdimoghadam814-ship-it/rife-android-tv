@@ -1,62 +1,112 @@
 package com.rife.androidtv
 
-import android.os.Build
+import android.net.Uri
 import android.os.Bundle
+import android.view.KeyEvent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
 import com.rife.androidtv.databinding.ActivityMainBinding
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
+    private var player: ExoPlayer? = null
+
+    private val filePicker =
+        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
+            uri?.let { playVideo(it) }
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        runAndDisplayDiagnostics()
+        setupPlayer()
+        setupControls()
+
+        binding.btnOpen.requestFocus()
     }
 
-    private fun runAndDisplayDiagnostics() {
-        val abiList = Build.SUPPORTED_ABIS.joinToString(", ")
-        val primaryAbi = if (Build.SUPPORTED_ABIS.isNotEmpty()) Build.SUPPORTED_ABIS[0] else "Unknown"
+    private fun setupPlayer() {
+        player = ExoPlayer.Builder(this).build().also { exoPlayer ->
+            binding.playerView.player = exoPlayer
+            binding.playerView.keepScreenOn = true
+        }
+    }
 
-        val sb = StringBuilder()
-        sb.append("=== DIAGNOSTICS REPORT ===\n\n")
-        sb.append("--- SYSTEM INFO ---\n")
-        sb.append("Device Model: ${Build.MODEL} (${Build.DEVICE})\n")
-        sb.append("Product: ${Build.PRODUCT}\n")
-        sb.append("Hardware: ${Build.HARDWARE}\n")
-        sb.append("Android Version: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n")
-        sb.append("Primary Target ABI: $primaryAbi\n")
-        sb.append("Supported ABIs: $abiList\n\n")
-
-        try {
-            val result = NativeEngine.runDiagnostics()
-            sb.append("--- NATIVE ENGINE & VULKAN STATUS ---\n")
-            sb.append("Native Engine Status: LOADED & ACTIVE\n")
-            sb.append("ncnn Version: ${result.ncnnVersion}\n")
-            sb.append("Vulkan Supported: ${if (result.vulkanSupported) "YES" else "NO"}\n")
-            sb.append("Vulkan API Version: ${result.vulkanApiVersion}\n")
-            sb.append("GPU Name: ${if (result.gpuName.isEmpty()) "N/A" else result.gpuName}\n")
-            sb.append("Vendor ID: 0x${Integer.toHexString(result.vendorId)}\n")
-            sb.append("Device ID: 0x${Integer.toHexString(result.deviceId)}\n")
-            sb.append("Driver Info: ${if (result.driverInfo.isEmpty()) "N/A" else result.driverInfo}\n")
-            sb.append("Vulkan Features: ${result.relevantFeatures}\n\n")
-
-            sb.append("--- REAL NCNN VULKAN OPERATION ---\n")
-            sb.append("Vulkan Compute Test: ${if (result.ncnnVulkanOpSuccess) "PASSED" else "FAILED"}\n")
-            sb.append("Operation Details: ${result.ncnnOpDetails}\n")
-
-            if (result.errorMessage.isNotEmpty()) {
-                sb.append("Error Message: ${result.errorMessage}\n")
-            }
-        } catch (e: Throwable) {
-            sb.append("--- NATIVE ENGINE ERROR ---\n")
-            sb.append("Failed to execute native diagnostics: ${e.message}\n")
-            e.printStackTrace()
+    private fun setupControls() {
+        binding.btnOpen.setOnClickListener {
+            openVideoPicker()
         }
 
-        binding.tvDiagnosticsOutput.text = sb.toString()
+        binding.btnPlayPause.setOnClickListener {
+            player?.let {
+                if (it.isPlaying) it.pause() else it.play()
+            }
+        }
+
+        binding.btnRewind.setOnClickListener {
+            player?.seekBack()
+        }
+
+        binding.btnForward.setOnClickListener {
+            player?.seekForward()
+        }
+    }
+
+    private fun openVideoPicker() {
+        filePicker.launch(arrayOf("video/*"))
+    }
+
+    private fun playVideo(uri: Uri) {
+        val exoPlayer = player ?: return
+
+        exoPlayer.setMediaItem(MediaItem.fromUri(uri))
+        exoPlayer.prepare()
+        exoPlayer.play()
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        when (keyCode) {
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                player?.let {
+                    if (it.isPlaying) it.pause() else it.play()
+                }
+                return true
+            }
+
+            KeyEvent.KEYCODE_MEDIA_PLAY -> {
+                player?.play()
+                return true
+            }
+
+            KeyEvent.KEYCODE_MEDIA_PAUSE -> {
+                player?.pause()
+                return true
+            }
+
+            KeyEvent.KEYCODE_DPAD_LEFT -> {
+                player?.seekBack()
+                return true
+            }
+
+            KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                player?.seekForward()
+                return true
+            }
+        }
+
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onDestroy() {
+        binding.playerView.player = null
+        player?.release()
+        player = null
+        super.onDestroy()
     }
 }
