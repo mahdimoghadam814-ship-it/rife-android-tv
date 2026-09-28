@@ -1,6 +1,8 @@
 #include <android/log.h>
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "RIFE-DEBUG", __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "RIFE-DEBUG", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "RIFE-ERROR", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "RIFE-SPIRV", __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "RIFE-SPIRV", __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "RIFE-DEBUG", __VA_ARGS__)
 // rife implemented with ncnn library
 
 #include "rife.h"
@@ -328,24 +330,31 @@ int RIFE::load(const std::string& modeldir)
     }
 #endif
 
-    // Helper to get precompiled SPIR-V data, with fallback to runtime compilation
-    auto get_spirv = [&](const uint32_t* precompiled_data, size_t precompiled_size,
-                         const char* glsl_data, int glsl_size,
-                         std::vector<uint32_t>& spirv_out) -> bool {
-        // Try precompiled SPIR-V first
-        if (precompiled_data && precompiled_size > 0) {
-            spirv_out.assign(precompiled_data, precompiled_data + (precompiled_size / sizeof(uint32_t)));
-            LOGE("RIFE-DEBUG: Using precompiled SPIR-V (%zu words)", spirv_out.size());
-            return true;
-        }
-
-        // Fallback to runtime compilation (for devices where precompiled SPIR-V is not available)
-        LOGE("RIFE-DEBUG: Precompiled SPIR-V not available, falling back to runtime compilation");
-        int ret = compile_spirv_module(glsl_data, glsl_size, opt, spirv_out);
-        if (ret != 0) {
-            LOGE("RIFE-DEBUG: Runtime SPIR-V compilation failed");
+    // Helper to validate precompiled SPIR-V data
+    auto validate_spirv = [&](const char* shader_name, const uint32_t* data, size_t size) -> bool {
+        if (!data || size == 0) {
+            LOGE("RIFE-SPIRV: Missing precompiled SPIR-V for %s (size=%zu)", shader_name, size);
             return false;
         }
+        // Check SPIR-V magic number (first word should be 0x07230203)
+        if (size >= sizeof(uint32_t) && data[0] != 0x07230203u) {
+            LOGE("RIFE-SPIRV: Invalid SPIR-V magic for %s: 0x%08x", shader_name, data[0]);
+            return false;
+        }
+        return true;
+    };
+
+    // Helper to get precompiled SPIR-V data - NO runtime fallback in production
+    auto get_spirv = [&](const char* shader_name, const uint32_t* precompiled_data, size_t precompiled_size,
+                         std::vector<uint32_t>& spirv_out) -> bool {
+        // Production builds MUST have precompiled SPIR-V
+        if (!validate_spirv(shader_name, precompiled_data, precompiled_size)) {
+            LOGE("RIFE-SPIRV: Shader %s missing or invalid precompiled SPIR-V. Aborting Vulkan pipeline creation.", shader_name);
+            return false;
+        }
+
+        spirv_out.assign(precompiled_data, precompiled_data + (precompiled_size / sizeof(uint32_t)));
+        LOGI("RIFE-SPIRV: Using precompiled SPIR-V for %s (%zu words)", shader_name, spirv_out.size());
         return true;
     };
 
@@ -361,9 +370,9 @@ int RIFE::load(const std::string& modeldir)
 
         {
             std::vector<uint32_t> spirv;
-            if (!get_spirv(rife_preproc_spv_data, rife_preproc_spv_data_size,
-                           tta_mode ? rife_preproc_tta_comp_data : rife_preproc_comp_data,
-                           tta_mode ? sizeof(rife_preproc_tta_comp_data) : sizeof(rife_preproc_comp_data),
+            if (!get_spirv(tta_mode ? "rife_preproc_tta" : "rife_preproc",
+                           tta_mode ? rife_preproc_tta_spv_data : rife_preproc_spv_data,
+                           tta_mode ? rife_preproc_tta_spv_data_size : rife_preproc_spv_data_size,
                            spirv)) {
                 return -1;
             }
@@ -375,9 +384,9 @@ int RIFE::load(const std::string& modeldir)
 
         {
             std::vector<uint32_t> spirv;
-            if (!get_spirv(rife_postproc_spv_data, rife_postproc_spv_data_size,
-                           tta_mode ? rife_postproc_tta_comp_data : rife_postproc_comp_data,
-                           tta_mode ? sizeof(rife_postproc_tta_comp_data) : sizeof(rife_postproc_comp_data),
+            if (!get_spirv(tta_mode ? "rife_postproc_tta" : "rife_postproc",
+                           tta_mode ? rife_postproc_tta_spv_data : rife_postproc_spv_data,
+                           tta_mode ? rife_postproc_tta_spv_data_size : rife_postproc_spv_data_size,
                            spirv)) {
                 return -1;
             }
@@ -413,8 +422,8 @@ int RIFE::load(const std::string& modeldir)
             flow_tta_avg_comp_data_size = sizeof(rife_flow_tta_avg_comp_data);
         }
 
-        if (!get_spirv(flow_tta_avg_spv_data, flow_tta_avg_spv_data_size,
-                       flow_tta_avg_comp_data, flow_tta_avg_comp_data_size,
+        if (!get_spirv("flow_tta_avg",
+                       flow_tta_avg_spv_data, flow_tta_avg_spv_data_size,
                        spirv)) {
             return -1;
         }
@@ -451,8 +460,8 @@ int RIFE::load(const std::string& modeldir)
             flow_tta_temporal_avg_comp_data_size = sizeof(rife_flow_tta_temporal_avg_comp_data);
         }
 
-        if (!get_spirv(flow_tta_temporal_avg_spv_data, flow_tta_temporal_avg_spv_data_size,
-                       flow_tta_temporal_avg_comp_data, flow_tta_temporal_avg_comp_data_size,
+        if (!get_spirv("flow_tta_temporal_avg",
+                       flow_tta_temporal_avg_spv_data, flow_tta_temporal_avg_spv_data_size,
                        spirv)) {
             return -1;
         }
@@ -467,8 +476,8 @@ int RIFE::load(const std::string& modeldir)
     if (vkdev && tta_temporal_mode)
     {
         std::vector<uint32_t> spirv;
-        if (!get_spirv(rife_out_tta_temporal_avg_spv_data, rife_out_tta_temporal_avg_spv_data_size,
-                       rife_out_tta_temporal_avg_comp_data, sizeof(rife_out_tta_temporal_avg_comp_data),
+        if (!get_spirv("rife_out_tta_temporal_avg",
+                       rife_out_tta_temporal_avg_spv_data, rife_out_tta_temporal_avg_spv_data_size,
                        spirv)) {
             return -1;
         }
@@ -544,9 +553,9 @@ int RIFE::load(const std::string& modeldir)
         if (vkdev)
         {
             std::vector<uint32_t> spirv;
-            if (!get_spirv(rife_v4_timestep_spv_data, rife_v4_timestep_spv_data_size,
-                           tta_mode ? rife_v4_timestep_tta_comp_data : rife_v4_timestep_comp_data,
-                           tta_mode ? sizeof(rife_v4_timestep_tta_comp_data) : sizeof(rife_v4_timestep_comp_data),
+            if (!get_spirv(tta_mode ? "rife_v4_timestep_tta" : "rife_v4_timestep",
+                           tta_mode ? rife_v4_timestep_tta_spv_data : rife_v4_timestep_spv_data,
+                           tta_mode ? rife_v4_timestep_tta_spv_data_size : rife_v4_timestep_spv_data_size,
                            spirv)) {
                 return -1;
             }

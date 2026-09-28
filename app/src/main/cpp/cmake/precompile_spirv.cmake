@@ -1,5 +1,8 @@
 # CMake script to precompile GLSL shaders to SPIR-V using glslangValidator
-# Usage: cmake -DSHADER_SRC=<source.comp> -DSHADER_SPV_HEADER=<output.spv.h> -P precompile_spirv.cmake
+# Usage: cmake -DSHADER_SRC=<source.comp> -DSHADER_SPV_HEADER=<output.spv.h> -DSHADER_REQUIRED=ON -P precompile_spirv.cmake
+#
+# SHADER_REQUIRED: If ON (default), fail the build if precompilation fails.
+#                  If OFF, generate zero-size fallback header for optional shaders.
 
 # Find glslangValidator
 find_program(GLSLANG_VALIDATOR
@@ -14,14 +17,32 @@ find_program(GLSLANG_VALIDATOR
 
 get_filename_component(SHADER_SRC_NAME_WE ${SHADER_SRC} NAME_WE)
 
+# Default to required if not specified
+if(NOT DEFINED SHADER_REQUIRED)
+    set(SHADER_REQUIRED ON)
+endif()
+
+# Determine if this is a known optional shader that cannot be precompiled
+# warp_pack8 uses afpvec8 which is not defined in current ncnn_glsl_ext
+set(SHADER_OPTIONAL OFF)
+if(SHADER_SRC_NAME_WE STREQUAL "warp_pack8")
+    set(SHADER_OPTIONAL ON)
+    message(STATUS "Shader ${SHADER_SRC_NAME_WE} is marked as optional (afpvec8 not available)")
+endif()
+
 if(NOT GLSLANG_VALIDATOR)
-    message(WARNING "glslangValidator not found. SPIR-V precompilation skipped. Runtime compilation will be used.")
-    # Create a fallback header that defines symbols with size == 0
-    file(WRITE ${SHADER_SPV_HEADER}
-        "// SPIR-V precompilation not available - glslangValidator not found\n"
-        "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = { 0 };\n"
-        "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = 0;\n"
-    )
+    if(SHADER_REQUIRED AND NOT SHADER_OPTIONAL)
+        message(FATAL_ERROR "glslangValidator not found but required for ${SHADER_SRC}. Cannot build production RIFE without precompiled SPIR-V.")
+    else()
+        message(WARNING "glslangValidator not found. SPIR-V precompilation skipped for ${SHADER_SRC}. Runtime compilation will be used (DEBUG ONLY).")
+        # Create a fallback header that defines symbols with size == 0
+        file(WRITE ${SHADER_SPV_HEADER}
+            "// SPIR-V precompilation not available - glslangValidator not found\n"
+            "// DEBUG ONLY: zero-size fallback will trigger runtime compilation\n"
+            "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = { 0 };\n"
+            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = 0;\n"
+        )
+    endif()
 else()
     message(STATUS "Found glslangValidator: ${GLSLANG_VALIDATOR}")
 
@@ -96,10 +117,30 @@ else()
         # Read the SPIR-V binary as hex bytes
         file(READ ${TEMP_SPV} spv_data_hex HEX)
 
+        # Validate SPIR-V magic number (first 4 bytes = 0x07230203 in little-endian = "SpV\0")
+        string(SUBSTRING "${spv_data_hex}" 0 8 magic_hex)
+        # magic_hex is 8 hex chars = 4 bytes in little-endian
+        # SPIR-V magic is 0x07230203 -> bytes 03 02 23 07 in file (little-endian)
+        if(NOT magic_hex STREQUAL "03022307")
+            message(WARNING "SPIR-V magic number mismatch for ${SHADER_SRC}: got ${magic_hex}, expected 03022307")
+            if(SHADER_REQUIRED AND NOT SHADER_OPTIONAL)
+                message(FATAL_ERROR "Invalid SPIR-V magic number for required shader ${SHADER_SRC}")
+            endif()
+        endif()
+
+        # Validate word alignment (hex length must be multiple of 8 = 4 bytes per word)
+        string(LENGTH "${spv_data_hex}" hex_len)
+        math(EXPR mod "${hex_len} % 8")
+        if(NOT mod EQUAL 0)
+            message(WARNING "SPIR-V data not word-aligned for ${SHADER_SRC}: ${hex_len} hex chars")
+            if(SHADER_REQUIRED AND NOT SHADER_OPTIONAL)
+                message(FATAL_ERROR "SPIR-V data not word-aligned for required shader ${SHADER_SRC}")
+            endif()
+        endif()
+
         # Convert hex bytes to uint32_t words (little-endian: 4 bytes per word)
         # spv_data_hex is a string of hex byte pairs: "0102030405060708..."
         # We need to group them into 32-bit words: 0x04030201, 0x08070605, ...
-        string(LENGTH "${spv_data_hex}" hex_len)
         math(EXPR word_count "${hex_len} / 8")
 
         set(spv_words "")
@@ -132,12 +173,17 @@ else()
     else()
         message(WARNING "Failed to compile ${SHADER_SRC} to SPIR-V: ${error}")
         message(WARNING "Output: ${output}")
-        # Create a fallback header with size == 0 for runtime compilation fallback
-        file(WRITE ${SHADER_SPV_HEADER}
-            "// SPIR-V precompilation failed\n"
-            "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = { 0 };\n"
-            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = 0;\n"
-        )
+        if(SHADER_REQUIRED AND NOT SHADER_OPTIONAL)
+            message(FATAL_ERROR "Required shader ${SHADER_SRC} failed SPIR-V precompilation. Build aborted.")
+        else()
+            # Create a fallback header with size == 0 for optional shaders
+            file(WRITE ${SHADER_SPV_HEADER}
+                "// SPIR-V precompilation failed for optional shader\n"
+                "// DEBUG ONLY: zero-size fallback will trigger runtime compilation\n"
+                "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = { 0 };\n"
+                "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = 0;\n"
+            )
+        endif()
     endif()
 
     # Clean up temp files

@@ -1,7 +1,9 @@
 // rife implemented with ncnn library
 
 #include <android/log.h>
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "RIFE-DEBUG", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "RIFE-ERROR", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "RIFE-SPIRV", __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "RIFE-SPIRV", __VA_ARGS__)
 
 #include "rife_ops.h"
 
@@ -25,6 +27,20 @@ Warp::Warp()
     pipeline_warp_pack8 = 0;
 }
 
+// Helper to validate precompiled SPIR-V data
+static inline bool validate_spirv(const char* shader_name, const uint32_t* data, size_t size) {
+    if (!data || size == 0) {
+        LOGE("RIFE-SPIRV: Missing precompiled SPIR-V for %s (size=%zu)", shader_name, size);
+        return false;
+    }
+    // Check SPIR-V magic number (first word should be 0x07230203)
+    if (size >= sizeof(uint32_t) && data[0] != 0x07230203u) {
+        LOGE("RIFE-SPIRV: Invalid SPIR-V magic for %s: 0x%08x", shader_name, data[0]);
+        return false;
+    }
+    return true;
+}
+
 int Warp::create_pipeline(const Option& opt)
 {
     if (!vkdev)
@@ -32,33 +48,24 @@ int Warp::create_pipeline(const Option& opt)
 
     std::vector<vk_specialization_type> specializations(0 + 0);
 
-    // Helper to get precompiled SPIR-V data, with fallback to runtime compilation
-    auto get_spirv = [&](const uint32_t* precompiled_data, size_t precompiled_size,
-                         const char* glsl_data, int glsl_size,
+    // Helper to get precompiled SPIR-V data - NO runtime fallback in production
+    auto get_spirv = [&](const char* shader_name, const uint32_t* precompiled_data, size_t precompiled_size,
                          std::vector<uint32_t>& spirv_out) -> bool {
-        // Try precompiled SPIR-V first
-        if (precompiled_data && precompiled_size > 0) {
-            spirv_out.assign(precompiled_data, precompiled_data + (precompiled_size / sizeof(uint32_t)));
-            LOGE("RIFE-DEBUG: Using precompiled SPIR-V (%zu words)", spirv_out.size());
-            return true;
-        }
-
-        // Fallback to runtime compilation
-        LOGE("RIFE-DEBUG: Precompiled SPIR-V not available, falling back to runtime compilation");
-        int ret = compile_spirv_module(glsl_data, glsl_size, opt, spirv_out);
-        if (ret != 0) {
-            LOGE("RIFE-DEBUG: Runtime SPIR-V compilation failed");
+        // Production builds MUST have precompiled SPIR-V
+        if (!validate_spirv(shader_name, precompiled_data, precompiled_size)) {
+            LOGE("RIFE-SPIRV: Shader %s missing or invalid precompiled SPIR-V. Aborting Vulkan pipeline creation.", shader_name);
             return false;
         }
+
+        spirv_out.assign(precompiled_data, precompiled_data + (precompiled_size / sizeof(uint32_t)));
+        LOGI("RIFE-SPIRV: Using precompiled SPIR-V for %s (%zu words)", shader_name, spirv_out.size());
         return true;
     };
 
-    // pack1
+    // pack1 (warp)
     {
         std::vector<uint32_t> spirv;
-        if (!get_spirv(warp_spv_data, warp_spv_data_size,
-                       warp_comp_data, sizeof(warp_comp_data),
-                       spirv)) {
+        if (!get_spirv("warp", warp_spv_data, warp_spv_data_size, spirv)) {
             return -1;
         }
 
@@ -67,12 +74,10 @@ int Warp::create_pipeline(const Option& opt)
         pipeline_warp->create(spirv.data(), spirv.size() * 4, specializations);
     }
 
-    // pack4
+    // pack4 (warp_pack4)
     {
         std::vector<uint32_t> spirv;
-        if (!get_spirv(warp_pack4_spv_data, warp_pack4_spv_data_size,
-                       warp_pack4_comp_data, sizeof(warp_pack4_comp_data),
-                       spirv)) {
+        if (!get_spirv("warp_pack4", warp_pack4_spv_data, warp_pack4_spv_data_size, spirv)) {
             return -1;
         }
 
@@ -81,19 +86,22 @@ int Warp::create_pipeline(const Option& opt)
         pipeline_warp_pack4->create(spirv.data(), spirv.size() * 4, specializations);
     }
 
-    // pack8
+    // pack8 (warp_pack8) - OPTIONAL: only if fp16 packed/storage supported AND precompiled SPIR-V available
     if (vkdev->info.support_fp16_packed() || vkdev->info.support_fp16_storage())
     {
         std::vector<uint32_t> spirv;
-        if (!get_spirv(warp_pack8_spv_data, warp_pack8_spv_data_size,
-                       warp_pack8_comp_data, sizeof(warp_pack8_comp_data),
-                       spirv)) {
-            return -1;
+        if (validate_spirv("warp_pack8", warp_pack8_spv_data, warp_pack8_spv_data_size)) {
+            if (get_spirv("warp_pack8", warp_pack8_spv_data, warp_pack8_spv_data_size, spirv)) {
+                pipeline_warp_pack8 = new Pipeline(vkdev);
+                pipeline_warp_pack8->set_optimal_local_size_xyz();
+                pipeline_warp_pack8->create(spirv.data(), spirv.size() * 4, specializations);
+                LOGI("RIFE-SPIRV: warp_pack8 pipeline created successfully");
+            } else {
+                LOGW("RIFE-SPIRV: warp_pack8 precompiled SPIR-V validation failed, skipping pack8 pipeline");
+            }
+        } else {
+            LOGW("RIFE-SPIRV: warp_pack8 precompiled SPIR-V not available (optional), skipping pack8 pipeline");
         }
-
-        pipeline_warp_pack8 = new Pipeline(vkdev);
-        pipeline_warp_pack8->set_optimal_local_size_xyz();
-        pipeline_warp_pack8->create(spirv.data(), spirv.size() * 4, specializations);
     }
 
     return 0;
@@ -216,7 +224,12 @@ int Warp::forward(const std::vector<VkMat>& bottom_blobs, std::vector<VkMat>& to
 
     if (elempack == 8)
     {
-        cmd.record_pipeline(pipeline_warp_pack8, bindings, constants, top_blob);
+        if (pipeline_warp_pack8) {
+            cmd.record_pipeline(pipeline_warp_pack8, bindings, constants, top_blob);
+        } else {
+            // Fallback to pack4 if pack8 pipeline not available
+            cmd.record_pipeline(pipeline_warp_pack4, bindings, constants, top_blob);
+        }
     }
     else if (elempack == 4)
     {

@@ -27,12 +27,23 @@ find_library(LOG_LIB log)
 find_library(ANDROID_LIB android)
 
 # Shader compilation macro for RIFE - generates both GLSL hex (for fallback) and SPIR-V (for precompiled)
+# Usage: rife_add_shader(SHADER_SRC [REQUIRED])
+#   SHADER_SRC: shader source file (e.g., rife_preproc.comp)
+#   REQUIRED:   if TRUE (default), fail build if SPIR-V precompilation fails
+#               if FALSE, generate zero-size fallback for optional shaders
 macro(rife_add_shader SHADER_SRC)
     get_filename_component(SHADER_SRC_NAME_WE ${SHADER_SRC} NAME_WE)
     set(SHADER_COMP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.comp.hex.h)
     set(SHADER_SPV_HEADER ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.comp.spv.h)
 
-    # Generate GLSL hex header (fallback for runtime compilation)
+    # Determine if this shader is required for production
+    # warp_pack8 uses afpvec8 which is not available in current ncnn_glsl_ext
+    set(SHADER_REQUIRED TRUE)
+    if(SHADER_SRC_NAME_WE STREQUAL "warp_pack8")
+        set(SHADER_REQUIRED FALSE)
+    endif()
+
+    # Generate GLSL hex header (fallback for runtime compilation - DEBUG only)
     add_custom_command(
         OUTPUT ${SHADER_COMP_HEADER}
         COMMAND ${CMAKE_COMMAND} -DSHADER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SRC} -DSHADER_COMP_HEADER=${SHADER_COMP_HEADER} -P "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/rife-ncnn-vulkan/src/generate_shader_comp_header.cmake"
@@ -48,6 +59,7 @@ macro(rife_add_shader SHADER_SRC)
         COMMAND ${CMAKE_COMMAND}
             -DSHADER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SRC}
             -DSHADER_SPV_HEADER=${SHADER_SPV_HEADER}
+            -DSHADER_REQUIRED=${SHADER_REQUIRED}
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/precompile_spirv.cmake"
         DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SRC}
         COMMENT "Precompiling shader ${SHADER_SRC_NAME_WE}.comp to SPIR-V"
@@ -59,6 +71,7 @@ macro(rife_add_shader SHADER_SRC)
     list(APPEND SHADER_SPV_FILES ${SHADER_SPV_HEADER})
 endmacro()
 
+# All RIFE custom shaders - REQUIRED for production Vulkan path
 rife_add_shader(rife_preproc.comp)
 rife_add_shader(rife_postproc.comp)
 rife_add_shader(rife_preproc_tta.comp)
@@ -74,6 +87,7 @@ rife_add_shader(rife_v4_timestep.comp)
 rife_add_shader(rife_v4_timestep_tta.comp)
 rife_add_shader(warp.comp)
 rife_add_shader(warp_pack4.comp)
+# warp_pack8 is OPTIONAL - uses afpvec8 not available in ncnn_glsl_ext
 rife_add_shader(warp_pack8.comp)
 
 add_custom_target(generate-rife-spirv DEPENDS ${SHADER_SPV_HEX_FILES} ${SHADER_SPV_FILES})

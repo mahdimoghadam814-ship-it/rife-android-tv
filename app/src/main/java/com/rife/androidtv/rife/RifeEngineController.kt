@@ -23,9 +23,12 @@ import kotlinx.coroutines.flow.asStateFlow
  * both the player screen (surface routing, engine status overlay) and the Video Processing
  * settings entry drive it through this single instance.
  *
- * The native RIFE engine is initialised lazily on the first enable, off the main thread, exactly
- * like the previous standalone player did: model initialisation loads the RIFE network from assets
- * and can take seconds.
+ * The native RIFE engine is initialised lazily on the first RIFE enable, off the main thread,
+ * exactly like the previous standalone player did: model initialisation loads the RIFE network
+ * from assets and can take seconds.
+ *
+ * FastDVDnet (scaffold) does NOT initialize the RIFE engine. The two stages have independent
+ * lifecycles.
  */
 @UnstableApi
 class RifeEngineController(
@@ -117,11 +120,11 @@ class RifeEngineController(
 
     /**
      * Enables or disables the FastDVDnet pre-processing stage (scaffold: frames pass through).
+     * FastDVDnet does NOT initialize the RIFE engine - it runs independently.
      */
     override fun setFastDvdNetEnabled(enabled: Boolean) {
-        if (enabled) {
-            ensureEngineInitialized()
-        }
+        // FastDVDnet scaffold does NOT require RIFE engine initialization.
+        // It only maintains a temporal history buffer and passes frames through unchanged.
         processor.setFastDvdNetEnabled(enabled)
         _processingEnabled.value = processor.isProcessingEnabled
     }
@@ -199,17 +202,17 @@ class RifeEngineController(
                     )
                     engineReady = loadSuccess
                     if (loadSuccess) {
-                        Log.i(TAG, "RIFE engine initialised: modelLoaded=$loadSuccess")
+                        Log.i(TAG, "RIFE-LIFECYCLE: RIFE engine initialised: modelLoaded=$loadSuccess")
                     } else {
-                        Log.e(TAG, "RIFE engine model load failed")
+                        Log.e(TAG, "RIFE-LIFECYCLE: RIFE engine model load failed")
                         _error.value = "RIFE model load failed. Check that model assets are packaged."
                     }
                 } else {
-                    Log.e(TAG, "RIFE engine init failed")
+                    Log.e(TAG, "RIFE-LIFECYCLE: RIFE engine init failed")
                     _error.value = "RIFE engine initialization failed."
                 }
             } catch (t: Throwable) {
-                Log.e(TAG, "RIFE engine init crashed", t)
+                Log.e(TAG, "RIFE-LIFECYCLE: RIFE engine init crashed", t)
                 _error.value = "RIFE engine initialization crashed: ${t.message}"
             } finally {
                 // Reset initStarted so a failed initialization can be retried.
