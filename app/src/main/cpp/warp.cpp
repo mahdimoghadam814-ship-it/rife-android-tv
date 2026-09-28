@@ -9,6 +9,11 @@
 #include "warp_pack4.comp.hex.h"
 #include "warp_pack8.comp.hex.h"
 
+// Precompiled SPIR-V headers (avoid runtime glslang compilation)
+#include "warp.comp.spv.h"
+#include "warp_pack4.comp.spv.h"
+#include "warp_pack8.comp.spv.h"
+
 using namespace ncnn;
 
 Warp::Warp()
@@ -27,18 +32,34 @@ int Warp::create_pipeline(const Option& opt)
 
     std::vector<vk_specialization_type> specializations(0 + 0);
 
+    // Helper to get precompiled SPIR-V data, with fallback to runtime compilation
+    auto get_spirv = [&](const uint32_t* precompiled_data, size_t precompiled_size,
+                         const char* glsl_data, int glsl_size,
+                         std::vector<uint32_t>& spirv_out) -> bool {
+        // Try precompiled SPIR-V first
+        if (precompiled_data && precompiled_size > 0) {
+            spirv_out.assign(precompiled_data, precompiled_data + (precompiled_size / sizeof(uint32_t)));
+            LOGE("RIFE-DEBUG: Using precompiled SPIR-V (%zu words)", spirv_out.size());
+            return true;
+        }
+
+        // Fallback to runtime compilation
+        LOGE("RIFE-DEBUG: Precompiled SPIR-V not available, falling back to runtime compilation");
+        int ret = compile_spirv_module(glsl_data, glsl_size, opt, spirv_out);
+        if (ret != 0) {
+            LOGE("RIFE-DEBUG: Runtime SPIR-V compilation failed");
+            return false;
+        }
+        return true;
+    };
+
     // pack1
     {
-        static std::vector<uint32_t> spirv;
-        static ncnn::Mutex lock;
-        {
-            ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty())
-            {
-                LOGE("RIFE-DEBUG: compile_spirv_module for warp START");
-                compile_spirv_module(warp_comp_data, sizeof(warp_comp_data), opt, spirv);
-                LOGE("RIFE-DEBUG: compile_spirv_module for warp END");
-            }
+        std::vector<uint32_t> spirv;
+        if (!get_spirv(warp_spv_data, warp_spv_data_size,
+                       warp_comp_data, sizeof(warp_comp_data),
+                       spirv)) {
+            return -1;
         }
 
         pipeline_warp = new Pipeline(vkdev);
@@ -48,16 +69,11 @@ int Warp::create_pipeline(const Option& opt)
 
     // pack4
     {
-        static std::vector<uint32_t> spirv;
-        static ncnn::Mutex lock;
-        {
-            ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty())
-            {
-                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack4 START");
-                compile_spirv_module(warp_pack4_comp_data, sizeof(warp_pack4_comp_data), opt, spirv);
-                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack4 END");
-            }
+        std::vector<uint32_t> spirv;
+        if (!get_spirv(warp_pack4_spv_data, warp_pack4_spv_data_size,
+                       warp_pack4_comp_data, sizeof(warp_pack4_comp_data),
+                       spirv)) {
+            return -1;
         }
 
         pipeline_warp_pack4 = new Pipeline(vkdev);
@@ -68,16 +84,11 @@ int Warp::create_pipeline(const Option& opt)
     // pack8
     if (vkdev->info.support_fp16_packed() || vkdev->info.support_fp16_storage())
     {
-        static std::vector<uint32_t> spirv;
-        static ncnn::Mutex lock;
-        {
-            ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty())
-            {
-                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack8 START");
-                compile_spirv_module(warp_pack8_comp_data, sizeof(warp_pack8_comp_data), opt, spirv);
-                LOGE("RIFE-DEBUG: compile_spirv_module for warp_pack8 END");
-            }
+        std::vector<uint32_t> spirv;
+        if (!get_spirv(warp_pack8_spv_data, warp_pack8_spv_data_size,
+                       warp_pack8_comp_data, sizeof(warp_pack8_comp_data),
+                       spirv)) {
+            return -1;
         }
 
         pipeline_warp_pack8 = new Pipeline(vkdev);

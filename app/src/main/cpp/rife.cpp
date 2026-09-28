@@ -9,6 +9,8 @@
 #include <vector>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <atomic>
 #include "benchmark.h"
 
 static size_t getCurrentRssBytes() {
@@ -37,6 +39,35 @@ static void logRss(const char* stage, int frame = -1) {
     }
 }
 
+class RssSampler {
+public:
+    RssSampler(int frame, const char* stage)
+        : frame_(frame), stage_(stage), running_(false) {
+        running_ = true;
+        thread_ = std::thread([this]() {
+            while (running_) {
+                size_t rss_bytes = getCurrentRssBytes();
+                double rss_mb = rss_bytes / (1024.0 * 1024.0);
+                LOGI("RIFE-MEM-SAMPLE frame=%d stage=%s rss=%.1f MB", frame_, stage_, rss_mb);
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            }
+        });
+    }
+
+    ~RssSampler() {
+        running_ = false;
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+private:
+    int frame_;
+    const char* stage_;
+    std::atomic<bool> running_;
+    std::thread thread_;
+};
+
 static int g_rife_frame_counter = 0;
 
 #include "rife_preproc.comp.hex.h"
@@ -52,6 +83,21 @@ static int g_rife_frame_counter = 0;
 #include "rife_out_tta_temporal_avg.comp.hex.h"
 #include "rife_v4_timestep.comp.hex.h"
 #include "rife_v4_timestep_tta.comp.hex.h"
+
+// Precompiled SPIR-V headers (avoid runtime glslang compilation)
+#include "rife_preproc.comp.spv.h"
+#include "rife_postproc.comp.spv.h"
+#include "rife_preproc_tta.comp.spv.h"
+#include "rife_postproc_tta.comp.spv.h"
+#include "rife_flow_tta_avg.comp.spv.h"
+#include "rife_v2_flow_tta_avg.comp.spv.h"
+#include "rife_v4_flow_tta_avg.comp.spv.h"
+#include "rife_flow_tta_temporal_avg.comp.spv.h"
+#include "rife_v2_flow_tta_temporal_avg.comp.spv.h"
+#include "rife_v4_flow_tta_temporal_avg.comp.spv.h"
+#include "rife_out_tta_temporal_avg.comp.spv.h"
+#include "rife_v4_timestep.comp.spv.h"
+#include "rife_v4_timestep_tta.comp.spv.h"
 
 #include "rife_ops.h"
 
@@ -282,6 +328,27 @@ int RIFE::load(const std::string& modeldir)
     }
 #endif
 
+    // Helper to get precompiled SPIR-V data, with fallback to runtime compilation
+    auto get_spirv = [&](const uint32_t* precompiled_data, size_t precompiled_size,
+                         const char* glsl_data, int glsl_size,
+                         std::vector<uint32_t>& spirv_out) -> bool {
+        // Try precompiled SPIR-V first
+        if (precompiled_data && precompiled_size > 0) {
+            spirv_out.assign(precompiled_data, precompiled_data + (precompiled_size / sizeof(uint32_t)));
+            LOGE("RIFE-DEBUG: Using precompiled SPIR-V (%zu words)", spirv_out.size());
+            return true;
+        }
+
+        // Fallback to runtime compilation (for devices where precompiled SPIR-V is not available)
+        LOGE("RIFE-DEBUG: Precompiled SPIR-V not available, falling back to runtime compilation");
+        int ret = compile_spirv_module(glsl_data, glsl_size, opt, spirv_out);
+        if (ret != 0) {
+            LOGE("RIFE-DEBUG: Runtime SPIR-V compilation failed");
+            return false;
+        }
+        return true;
+    };
+
     // initialize preprocess and postprocess pipeline
     if (vkdev)
     {
@@ -293,19 +360,12 @@ int RIFE::load(const std::string& modeldir)
 #endif
 
         {
-            static std::vector<uint32_t> spirv;
-            static ncnn::Mutex lock;
-            {
-                ncnn::MutexLockGuard guard(lock);
-                if (spirv.empty())
-                {
-                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_preproc (tta_mode=%d) START", tta_mode);
-                    if (tta_mode)
-                        compile_spirv_module(rife_preproc_tta_comp_data, sizeof(rife_preproc_tta_comp_data), opt, spirv);
-                    else
-                        compile_spirv_module(rife_preproc_comp_data, sizeof(rife_preproc_comp_data), opt, spirv);
-                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_preproc END");
-                }
+            std::vector<uint32_t> spirv;
+            if (!get_spirv(rife_preproc_spv_data, rife_preproc_spv_data_size,
+                           tta_mode ? rife_preproc_tta_comp_data : rife_preproc_comp_data,
+                           tta_mode ? sizeof(rife_preproc_tta_comp_data) : sizeof(rife_preproc_comp_data),
+                           spirv)) {
+                return -1;
             }
 
             rife_preproc = new ncnn::Pipeline(vkdev);
@@ -314,19 +374,12 @@ int RIFE::load(const std::string& modeldir)
         }
 
         {
-            static std::vector<uint32_t> spirv;
-            static ncnn::Mutex lock;
-            {
-                ncnn::MutexLockGuard guard(lock);
-                if (spirv.empty())
-                {
-                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_postproc (tta_mode=%d) START", tta_mode);
-                    if (tta_mode)
-                        compile_spirv_module(rife_postproc_tta_comp_data, sizeof(rife_postproc_tta_comp_data), opt, spirv);
-                    else
-                        compile_spirv_module(rife_postproc_comp_data, sizeof(rife_postproc_comp_data), opt, spirv);
-                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_postproc END");
-                }
+            std::vector<uint32_t> spirv;
+            if (!get_spirv(rife_postproc_spv_data, rife_postproc_spv_data_size,
+                           tta_mode ? rife_postproc_tta_comp_data : rife_postproc_comp_data,
+                           tta_mode ? sizeof(rife_postproc_tta_comp_data) : sizeof(rife_postproc_comp_data),
+                           spirv)) {
+                return -1;
             }
 
             rife_postproc = new ncnn::Pipeline(vkdev);
@@ -337,27 +390,33 @@ int RIFE::load(const std::string& modeldir)
 
     if (vkdev && tta_mode)
     {
-        static std::vector<uint32_t> spirv;
-        static ncnn::Mutex lock;
-        {
-            ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty())
-            {
-                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_avg (rife_v4=%d, rife_v2=%d) START", rife_v4, rife_v2);
-                if (rife_v4)
-                {
-                    compile_spirv_module(rife_v4_flow_tta_avg_comp_data, sizeof(rife_v4_flow_tta_avg_comp_data), opt, spirv);
-                }
-                else if (rife_v2)
-                {
-                    compile_spirv_module(rife_v2_flow_tta_avg_comp_data, sizeof(rife_v2_flow_tta_avg_comp_data), opt, spirv);
-                }
-                else
-                {
-                    compile_spirv_module(rife_flow_tta_avg_comp_data, sizeof(rife_flow_tta_avg_comp_data), opt, spirv);
-                }
-                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_avg END");
-            }
+        std::vector<uint32_t> spirv;
+        const uint32_t* flow_tta_avg_spv_data = nullptr;
+        size_t flow_tta_avg_spv_data_size = 0;
+        const char* flow_tta_avg_comp_data = nullptr;
+        int flow_tta_avg_comp_data_size = 0;
+
+        if (rife_v4) {
+            flow_tta_avg_spv_data = rife_v4_flow_tta_avg_spv_data;
+            flow_tta_avg_spv_data_size = rife_v4_flow_tta_avg_spv_data_size;
+            flow_tta_avg_comp_data = rife_v4_flow_tta_avg_comp_data;
+            flow_tta_avg_comp_data_size = sizeof(rife_v4_flow_tta_avg_comp_data);
+        } else if (rife_v2) {
+            flow_tta_avg_spv_data = rife_v2_flow_tta_avg_spv_data;
+            flow_tta_avg_spv_data_size = rife_v2_flow_tta_avg_spv_data_size;
+            flow_tta_avg_comp_data = rife_v2_flow_tta_avg_comp_data;
+            flow_tta_avg_comp_data_size = sizeof(rife_v2_flow_tta_avg_comp_data);
+        } else {
+            flow_tta_avg_spv_data = rife_flow_tta_avg_spv_data;
+            flow_tta_avg_spv_data_size = rife_flow_tta_avg_spv_data_size;
+            flow_tta_avg_comp_data = rife_flow_tta_avg_comp_data;
+            flow_tta_avg_comp_data_size = sizeof(rife_flow_tta_avg_comp_data);
+        }
+
+        if (!get_spirv(flow_tta_avg_spv_data, flow_tta_avg_spv_data_size,
+                       flow_tta_avg_comp_data, flow_tta_avg_comp_data_size,
+                       spirv)) {
+            return -1;
         }
 
         std::vector<ncnn::vk_specialization_type> specializations(0);
@@ -369,27 +428,33 @@ int RIFE::load(const std::string& modeldir)
 
     if (vkdev && tta_temporal_mode)
     {
-        static std::vector<uint32_t> spirv;
-        static ncnn::Mutex lock;
-        {
-            ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty())
-            {
-                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_temporal_avg (rife_v4=%d, rife_v2=%d) START", rife_v4, rife_v2);
-                if (rife_v4)
-                {
-                    compile_spirv_module(rife_v4_flow_tta_temporal_avg_comp_data, sizeof(rife_v4_flow_tta_temporal_avg_comp_data), opt, spirv);
-                }
-                else if (rife_v2)
-                {
-                    compile_spirv_module(rife_v2_flow_tta_temporal_avg_comp_data, sizeof(rife_v2_flow_tta_temporal_avg_comp_data), opt, spirv);
-                }
-                else
-                {
-                    compile_spirv_module(rife_flow_tta_temporal_avg_comp_data, sizeof(rife_flow_tta_temporal_avg_comp_data), opt, spirv);
-                }
-                LOGE("RIFE-DEBUG: compile_spirv_module for rife_flow_tta_temporal_avg END");
-            }
+        std::vector<uint32_t> spirv;
+        const uint32_t* flow_tta_temporal_avg_spv_data = nullptr;
+        size_t flow_tta_temporal_avg_spv_data_size = 0;
+        const char* flow_tta_temporal_avg_comp_data = nullptr;
+        int flow_tta_temporal_avg_comp_data_size = 0;
+
+        if (rife_v4) {
+            flow_tta_temporal_avg_spv_data = rife_v4_flow_tta_temporal_avg_spv_data;
+            flow_tta_temporal_avg_spv_data_size = rife_v4_flow_tta_temporal_avg_spv_data_size;
+            flow_tta_temporal_avg_comp_data = rife_v4_flow_tta_temporal_avg_comp_data;
+            flow_tta_temporal_avg_comp_data_size = sizeof(rife_v4_flow_tta_temporal_avg_comp_data);
+        } else if (rife_v2) {
+            flow_tta_temporal_avg_spv_data = rife_v2_flow_tta_temporal_avg_spv_data;
+            flow_tta_temporal_avg_spv_data_size = rife_v2_flow_tta_temporal_avg_spv_data_size;
+            flow_tta_temporal_avg_comp_data = rife_v2_flow_tta_temporal_avg_comp_data;
+            flow_tta_temporal_avg_comp_data_size = sizeof(rife_v2_flow_tta_temporal_avg_comp_data);
+        } else {
+            flow_tta_temporal_avg_spv_data = rife_flow_tta_temporal_avg_spv_data;
+            flow_tta_temporal_avg_spv_data_size = rife_flow_tta_temporal_avg_spv_data_size;
+            flow_tta_temporal_avg_comp_data = rife_flow_tta_temporal_avg_comp_data;
+            flow_tta_temporal_avg_comp_data_size = sizeof(rife_flow_tta_temporal_avg_comp_data);
+        }
+
+        if (!get_spirv(flow_tta_temporal_avg_spv_data, flow_tta_temporal_avg_spv_data_size,
+                       flow_tta_temporal_avg_comp_data, flow_tta_temporal_avg_comp_data_size,
+                       spirv)) {
+            return -1;
         }
 
         std::vector<ncnn::vk_specialization_type> specializations(0);
@@ -401,16 +466,11 @@ int RIFE::load(const std::string& modeldir)
 
     if (vkdev && tta_temporal_mode)
     {
-        static std::vector<uint32_t> spirv;
-        static ncnn::Mutex lock;
-        {
-            ncnn::MutexLockGuard guard(lock);
-            if (spirv.empty())
-            {
-                LOGE("RIFE-DEBUG: compile_spirv_module for rife_out_tta_temporal_avg START");
-                compile_spirv_module(rife_out_tta_temporal_avg_comp_data, sizeof(rife_out_tta_temporal_avg_comp_data), opt, spirv);
-                LOGE("RIFE-DEBUG: compile_spirv_module for rife_out_tta_temporal_avg END");
-            }
+        std::vector<uint32_t> spirv;
+        if (!get_spirv(rife_out_tta_temporal_avg_spv_data, rife_out_tta_temporal_avg_spv_data_size,
+                       rife_out_tta_temporal_avg_comp_data, sizeof(rife_out_tta_temporal_avg_comp_data),
+                       spirv)) {
+            return -1;
         }
 
         std::vector<ncnn::vk_specialization_type> specializations(0);
@@ -483,19 +543,12 @@ int RIFE::load(const std::string& modeldir)
     {
         if (vkdev)
         {
-            static std::vector<uint32_t> spirv;
-            static ncnn::Mutex lock;
-            {
-                ncnn::MutexLockGuard guard(lock);
-                if (spirv.empty())
-                {
-                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_v4_timestep (tta_mode=%d) START", tta_mode);
-                    if (tta_mode)
-                        compile_spirv_module(rife_v4_timestep_tta_comp_data, sizeof(rife_v4_timestep_tta_comp_data), opt, spirv);
-                    else
-                        compile_spirv_module(rife_v4_timestep_comp_data, sizeof(rife_v4_timestep_comp_data), opt, spirv);
-                    LOGE("RIFE-DEBUG: compile_spirv_module for rife_v4_timestep END");
-                }
+            std::vector<uint32_t> spirv;
+            if (!get_spirv(rife_v4_timestep_spv_data, rife_v4_timestep_spv_data_size,
+                           tta_mode ? rife_v4_timestep_tta_comp_data : rife_v4_timestep_comp_data,
+                           tta_mode ? sizeof(rife_v4_timestep_tta_comp_data) : sizeof(rife_v4_timestep_comp_data),
+                           spirv)) {
+                return -1;
             }
 
             std::vector<ncnn::vk_specialization_type> specializations;
@@ -2376,6 +2429,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
 
             LOGE("[RIFE-DEBUG] CPU normal: BEFORE flownet extract");
             logRss("before_flownet_extract", frame);
+            RssSampler flownet_sampler(frame, "flownet_extract");
 
             int ret_flow = ex.extract("flow", flow);
 
@@ -2499,6 +2553,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
         ncnn::Mat ctx0[4];
         ncnn::Mat ctx1[4];
         logRss("before_contextnet_extract", frame);
+        RssSampler contextnet_sampler(frame, "contextnet_extract");
         {
             ncnn::Extractor ex = contextnet.create_extractor();
 
@@ -2578,6 +2633,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
 
             LOGE("[RIFE-DEBUG] BEFORE fusionnet output");
             logRss("before_fusionnet_extract", frame);
+            RssSampler fusionnet_sampler(frame, "fusionnet_extract");
             int ret_fusion = ex.extract("output", out_padded);
             LOGE("[RIFE-DEBUG] AFTER fusionnet output ret=%d empty=%d w=%d h=%d c=%d",
                  ret_fusion, out_padded.empty() ? 1 : 0, out_padded.w, out_padded.h, out_padded.c);
@@ -2604,6 +2660,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
                 ex.input("10", ctx0[3]);
 
                 logRss("before_fusionnet_reversed_extract", frame);
+                RssSampler fusionnet_rev_sampler(frame, "fusionnet_reversed_extract");
                 ex.extract("output", out_padded_reversed);
                 logRss("after_fusionnet_reversed_extract", frame);
             }
@@ -2612,6 +2669,7 @@ int RIFE::process_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, floa
         // cut padding and postproc
         out.create(w, h, 3);
         logRss("before_output_conversion", frame);
+        RssSampler output_conv_sampler(frame, "output_conversion");
         if (tta_temporal_mode)
         {
             for (int q = 0; q < 3; q++)

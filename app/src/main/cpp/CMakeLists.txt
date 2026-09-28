@@ -26,11 +26,13 @@ find_library(VULKAN_LIB vulkan)
 find_library(LOG_LIB log)
 find_library(ANDROID_LIB android)
 
-# Shader compilation macro for RIFE
+# Shader compilation macro for RIFE - generates both GLSL hex (for fallback) and SPIR-V (for precompiled)
 macro(rife_add_shader SHADER_SRC)
     get_filename_component(SHADER_SRC_NAME_WE ${SHADER_SRC} NAME_WE)
     set(SHADER_COMP_HEADER ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.comp.hex.h)
+    set(SHADER_SPV_HEADER ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.comp.spv.h)
 
+    # Generate GLSL hex header (fallback for runtime compilation)
     add_custom_command(
         OUTPUT ${SHADER_COMP_HEADER}
         COMMAND ${CMAKE_COMMAND} -DSHADER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SRC} -DSHADER_COMP_HEADER=${SHADER_COMP_HEADER} -P "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/rife-ncnn-vulkan/src/generate_shader_comp_header.cmake"
@@ -40,7 +42,21 @@ macro(rife_add_shader SHADER_SRC)
     )
     set_source_files_properties(${SHADER_COMP_HEADER} PROPERTIES GENERATED TRUE)
 
+    # Generate SPIR-V header (precompiled, avoids runtime glslang crash)
+    add_custom_command(
+        OUTPUT ${SHADER_SPV_HEADER}
+        COMMAND ${CMAKE_COMMAND}
+            -DSHADER_SRC=${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SRC}
+            -DSHADER_SPV_HEADER=${SHADER_SPV_HEADER}
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/precompile_spirv.cmake"
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/${SHADER_SRC}
+        COMMENT "Precompiling shader ${SHADER_SRC_NAME_WE}.comp to SPIR-V"
+        VERBATIM
+    )
+    set_source_files_properties(${SHADER_SPV_HEADER} PROPERTIES GENERATED TRUE)
+
     list(APPEND SHADER_SPV_HEX_FILES ${SHADER_COMP_HEADER})
+    list(APPEND SHADER_SPV_FILES ${SHADER_SPV_HEADER})
 endmacro()
 
 rife_add_shader(rife_preproc.comp)
@@ -60,7 +76,7 @@ rife_add_shader(warp.comp)
 rife_add_shader(warp_pack4.comp)
 rife_add_shader(warp_pack8.comp)
 
-add_custom_target(generate-rife-spirv DEPENDS ${SHADER_SPV_HEX_FILES})
+add_custom_target(generate-rife-spirv DEPENDS ${SHADER_SPV_HEX_FILES} ${SHADER_SPV_FILES})
 
 # Native library target
 add_library(
