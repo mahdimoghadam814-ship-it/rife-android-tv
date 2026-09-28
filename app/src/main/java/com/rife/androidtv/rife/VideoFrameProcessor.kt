@@ -978,7 +978,8 @@ class VideoFrameProcessor(
         }
         val currentContext = EGL14.eglGetCurrentContext()
         val currentDisplay = EGL14.eglGetCurrentDisplay()
-        if (currentContext == context && currentDisplay == display) {
+        val currentSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        if (currentContext == context && currentDisplay == display && currentSurface == surface) {
             return true
         }
         if (!EGL14.eglMakeCurrent(display, surface, surface, context)) {
