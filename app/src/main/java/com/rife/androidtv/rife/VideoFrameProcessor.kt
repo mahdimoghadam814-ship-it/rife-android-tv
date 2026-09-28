@@ -956,6 +956,40 @@ class VideoFrameProcessor(
     }
 
     /**
+     * Ensures the EGL context that owns the input SurfaceTexture is current on the worker thread.
+     * Returns true if successful, false otherwise.
+     */
+    private fun ensureEglContextCurrent(): Boolean {
+        val bundle = inputBundle
+        if (bundle == null) {
+            Log.e(TAG, "ensureEglContextCurrent: inputBundle is null")
+            return false
+        }
+        val display = bundle.display
+        val context = bundle.context
+        val surface = bundle.surface
+        if (display == null || context == null || surface == null) {
+            Log.e(TAG, "ensureEglContextCurrent: EGL display/context/surface is null")
+            return false
+        }
+        if (context == EGL14.EGL_NO_CONTEXT || surface == EGL14.EGL_NO_SURFACE) {
+            Log.e(TAG, "ensureEglContextCurrent: EGL context or surface is invalid")
+            return false
+        }
+        val currentContext = EGL14.eglGetCurrentContext()
+        val currentDisplay = EGL14.eglGetCurrentDisplay()
+        if (currentContext == context && currentDisplay == display) {
+            return true
+        }
+        if (!EGL14.eglMakeCurrent(display, surface, surface, context)) {
+            val error = EGL14.eglGetError()
+            Log.e(TAG, "ensureEglContextCurrent: eglMakeCurrent failed: 0x${error.toString(16)}")
+            return false
+        }
+        return true
+    }
+
+    /**
      * Invoked on the worker thread whenever a decoded frame has been queued onto the input
      * SurfaceTexture. This is where real decoded pixels become available.
      */
@@ -986,6 +1020,31 @@ class VideoFrameProcessor(
 
         readbackInProgress = true
         try {
+            // Diagnostic logging before updateTexImage
+            val bundle = inputBundle
+            if (bundle != null) {
+                val storedDisplay = bundle.display
+                val storedContext = bundle.context
+                val currentDisplay = EGL14.eglGetCurrentDisplay()
+                val currentContext = EGL14.eglGetCurrentContext()
+                val textureId = bundle.textureId
+                val isTextureReleased = texture.isReleased
+                val isBundleReleased = bundle.glObjectsReleased
+                Log.d(TAG, "EGL DIAGNOSTICS: workerThread=${Thread.currentThread().name} " +
+                    "storedDisplay=$storedDisplay storedContext=$storedContext " +
+                    "currentDisplay=$currentDisplay currentContext=$currentContext " +
+                    "textureId=$textureId textureReleased=$isTextureReleased bundleGLReleased=$isBundleReleased " +
+                    "processingEnabled=$isProcessingEnabled " +
+                    "contextMatch=${storedContext == currentContext} displayMatch=${storedDisplay == currentDisplay}")
+            }
+
+            // Ensure the EGL context that owns the SurfaceTexture is current before updateTexImage
+            if (!ensureEglContextCurrent()) {
+                Log.e(TAG, "Failed to make EGL context current for updateTexImage")
+                droppedFrameCount++
+                return
+            }
+
             // Acquires the frame the decoder has just queued. It must be called exactly once per
             // available frame, before the texture is sampled.
             texture.updateTexImage()
@@ -1001,6 +1060,11 @@ class VideoFrameProcessor(
 
     /** Keeps the decoder from stalling on a full BufferQueue while a frame is intentionally lost. */
     private fun consumeAndDiscard(texture: SurfaceTexture) {
+        // Ensure the EGL context is current before updateTexImage
+        if (!ensureEglContextCurrent()) {
+            Log.w(TAG, "consumeAndDiscard: failed to make EGL context current")
+            return
+        }
         try {
             texture.updateTexImage()
         } catch (t: Throwable) {
