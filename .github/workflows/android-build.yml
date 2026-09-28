@@ -33,6 +33,13 @@ jobs:
           # (compileSdk 37, ndkVersion 26.3.11579264, cmake 3.22.1).
           packages: "platform-tools platforms;android-37 build-tools;37.0.0 ndk;26.3.11579264 cmake;3.22.1"
 
+      - name: Install glslangValidator
+        run: |
+          sudo apt-get update && sudo apt-get install -y glslang-tools
+          # Also check NDK shader-tools path
+          ls -la $ANDROID_NDK_HOME/shader-tools/ 2>/dev/null || echo "NDK shader-tools not found"
+          which glslangValidator
+
       - name: Build debug APK with Gradle wrapper
         run: |
           chmod +x ./gradlew
