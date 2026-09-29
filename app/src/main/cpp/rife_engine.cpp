@@ -51,7 +51,7 @@ static bool extractAssetFile(
     const std::string& outFilePath
 ) {
     if (!mgr) {
-        LOGE("AssetManager is null");
+        LOGE_ERROR("AssetManager is null");
         return false;
     }
 
@@ -62,7 +62,7 @@ static bool extractAssetFile(
     );
 
     if (!asset) {
-        LOGE("Failed to open asset file: %s", assetPath.c_str());
+        LOGE_ERROR("Failed to open asset file: %s", assetPath.c_str());
         return false;
     }
 
@@ -79,7 +79,7 @@ static bool extractAssetFile(
     AAsset_close(asset);
 
     if (readBytes != static_cast<int>(size)) {
-        LOGE(
+        LOGE_ERROR(
             "Failed to read complete asset file: %s "
             "(expected=%zu read=%d)",
             assetPath.c_str(),
@@ -95,7 +95,7 @@ static bool extractAssetFile(
     );
 
     if (!outFile.is_open()) {
-        LOGE(
+        LOGE_ERROR(
             "Failed to write output file: %s",
             outFilePath.c_str()
         );
@@ -110,7 +110,7 @@ static bool extractAssetFile(
     outFile.close();
 
     if (!outFile) {
-        LOGE(
+        LOGE_ERROR(
             "Failed while writing output file: %s",
             outFilePath.c_str()
         );
@@ -138,7 +138,7 @@ bool RifeEngine::init(int requested_gpu_id) {
 
     int gpu_count = ncnn::get_gpu_count();
 
-    LOGI("ncnn reported GPU count: %d", gpu_count);
+    LOGI_DEVICE("ncnn reported GPU count: %d", gpu_count);
 
     if (gpu_count <= 0) {
         vulkan_available = false;
@@ -241,7 +241,7 @@ bool RifeEngine::loadModelFromAssets(
 
     if (!mgr) {
         last_error = "AssetManager is null.";
-        LOGE("%s", last_error.c_str());
+        LOGE_ERROR("%s", last_error.c_str());
         return false;
     }
 
@@ -264,7 +264,7 @@ bool RifeEngine::loadModelFromAssets(
     int mkdir_result = std::system(cmd.c_str());
 
     if (mkdir_result != 0) {
-        LOGE(
+        LOGE_ERROR(
             "mkdir failed for model directory: %s "
             "(result=%d)",
             target_dir.c_str(),
@@ -297,7 +297,7 @@ bool RifeEngine::loadModelFromAssets(
         std::string output_path =
             target_dir + "/" + file_name;
 
-        LOGI(
+        LOGI_LIFECYCLE(
             "Extracting model asset: %s",
             asset_path.c_str()
         );
@@ -328,7 +328,7 @@ bool RifeEngine::loadModelFromAssets(
                 is_v4
             );
 
-            LOGI(
+            LOGI_LIFECYCLE(
                 "Calling RIFE::load() with %s (gpu_id=%d) from: %s",
                 backend_name,
                 gpu_id,
@@ -342,10 +342,10 @@ bool RifeEngine::loadModelFromAssets(
                     std::string("RIFE ") + backend_name + " load failed with error code: " +
                     std::to_string(ret);
 
-                LOGE(
-                    "%s",
-                    last_error.c_str()
-                );
+LOGE_ERROR(
+                "%s",
+                last_error.c_str()
+            );
 
                 rife_impl.reset();
                 return false;
@@ -356,11 +356,11 @@ bool RifeEngine::loadModelFromAssets(
             op_details =
                 std::string("RIFE model loaded with ") + backend_name + ".";
 
-            LOGI(
-                "RIFE model successfully loaded with %s from %s",
-                backend_name,
-                target_dir.c_str()
-            );
+LOGI_LIFECYCLE(
+            "RIFE model successfully loaded with %s from %s",
+            backend_name,
+            target_dir.c_str()
+        );
 
             return true;
 
@@ -368,7 +368,7 @@ bool RifeEngine::loadModelFromAssets(
             last_error =
                 std::string("Exception during RIFE ") + backend_name + " load: " + e.what();
 
-            LOGE(
+            LOGE_ERROR(
                 "%s",
                 last_error.c_str()
             );
@@ -380,7 +380,7 @@ bool RifeEngine::loadModelFromAssets(
             last_error =
                 std::string("Unknown exception during RIFE ") + backend_name + " load.";
 
-            LOGE(
+            LOGE_ERROR(
                 "%s",
                 last_error.c_str()
             );
@@ -393,16 +393,16 @@ bool RifeEngine::loadModelFromAssets(
     int gpu_id_to_use = vulkan_available ? gpu_id : -1;
     const char* backend_name = vulkan_available ? "Vulkan" : "CPU fallback";
 
-    LOGI(
-        "Loading RIFE model with %s. Vulkan detected=%s, GPU id=%d",
-        backend_name,
-        vulkan_available ? "YES" : "NO",
-        gpu_id_to_use
-    );
+LOGI_LIFECYCLE(
+            "Loading RIFE model with %s. Vulkan detected=%s, GPU id=%d",
+            backend_name,
+            vulkan_available ? "YES" : "NO",
+            gpu_id_to_use
+        );
 
     if (!try_load_with_gpu(gpu_id_to_use, backend_name)) {
         if (vulkan_available) {
-            LOGW(
+            LOGW_LIFECYCLE(
                 "Vulkan load failed, falling back to CPU mode. Error: %s",
                 last_error.c_str()
             );
@@ -440,7 +440,7 @@ bool RifeEngine::processFrameBuffer(
 
     static bool logged_backend = false;
     if (!logged_backend) {
-        LOGI("RIFE backend=%s", vulkan_available ? "Vulkan" : "CPU");
+        LOGI_LIFECYCLE("RIFE backend=%s", vulkan_available ? "Vulkan" : "CPU");
         logged_backend = true;
     }
 
@@ -507,7 +507,7 @@ bool RifeEngine::processFrameBuffer(
             std::string("RIFE ") + (vulkan_available ? "Vulkan" : "CPU") + " process failed with error: " +
             std::to_string(ret);
 
-        LOGE(
+        LOGE_ERROR(
             "%s",
             last_error.c_str()
         );
@@ -665,7 +665,7 @@ void RifeEngine::detectVulkanCapabilities(const ncnn::VulkanDevice* vkdev) {
     vulkan_caps.cooperative_matrix = info.support_cooperative_matrix();
     vulkan_caps.subgroup_size_control = info.support_subgroup_size_control();
     vulkan_caps.storage_buffer_16bit = info.support_VK_KHR_16bit_storage();
-    vulkan_caps.uniform_storage_buffer_16bit = info.support_VK_KHR_uniform_buffer_standard_layout();
+    vulkan_caps.uniform_storage_buffer_16bit = false; // info.support_VK_KHR_uniform_buffer_standard_layout() not available in this ncnn version
 
     LOGI_DEVICE("Vulkan capabilities detected:");
     LOGI_DEVICE("  fp16_storage=%s, fp16_packed=%s, fp16_arithmetic=%s",
