@@ -11,7 +11,7 @@
 class RIFE
 {
 public:
-    RIFE(int gpuid, bool tta_mode = false, bool tta_temporal_mode = false, bool uhd_mode = false, int num_threads = 1, bool rife_v2 = false, bool rife_v4 = false);
+    RIFE(int gpuid, bool tta_mode = false, bool tta_temporal_mode = false, bool uhd_mode = false, int num_threads = 1, bool rife_v2 = false, bool rife_v4 = false, const std::string& gpu_name = "");
     ~RIFE();
 
 #if _WIN32
@@ -49,6 +49,7 @@ private:
     int num_threads;
     bool rife_v2;
     bool rife_v4;
+    bool is_tv_box;
 };
 
 #endif // RIFE_H

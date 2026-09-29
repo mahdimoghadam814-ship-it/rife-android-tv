@@ -318,6 +318,14 @@ bool RifeEngine::loadModelFromAssets(
 
     auto try_load_with_gpu = [&](int gpu_id, const char* backend_name) -> bool {
         try {
+            // Get GPU name for device-specific optimizations
+            std::string gpu_name;
+            const ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device(gpu_id);
+            if (vkdev) {
+                const VkPhysicalDeviceProperties& props = vkdev->info.physicalDeviceProperties();
+                gpu_name = props.deviceName;
+            }
+
             rife_impl = std::make_unique<RIFE>(
                 gpu_id,
                 false, // tta_mode
@@ -325,7 +333,8 @@ bool RifeEngine::loadModelFromAssets(
                 false, // uhd_mode
                 1,     // num_threads
                 is_v2,
-                is_v4
+                is_v4,
+                gpu_name
             );
 
             LOGI_LIFECYCLE(

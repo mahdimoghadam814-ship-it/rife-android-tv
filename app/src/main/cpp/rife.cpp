@@ -105,7 +105,7 @@ static int g_rife_frame_counter = 0;
 
 DEFINE_LAYER_CREATOR(Warp)
 
-RIFE::RIFE(int gpuid, bool _tta_mode, bool _tta_temporal_mode, bool _uhd_mode, int _num_threads, bool _rife_v2, bool _rife_v4)
+RIFE::RIFE(int gpuid, bool _tta_mode, bool _tta_temporal_mode, bool _uhd_mode, int _num_threads, bool _rife_v2, bool _rife_v4, const std::string& gpu_name)
 {
     vkdev = gpuid == -1 ? 0 : ncnn::get_gpu_device(gpuid);
 
@@ -125,6 +125,14 @@ RIFE::RIFE(int gpuid, bool _tta_mode, bool _tta_temporal_mode, bool _uhd_mode, i
     num_threads = _num_threads;
     rife_v2 = _rife_v2;
     rife_v4 = _rife_v4;
+    is_tv_box = false;
+
+    // Detect Mali-G310 (Xiaomi TV Box S 3rd Gen) for memory optimization
+    if (!gpu_name.empty() && gpu_name.find("Mali-G310") != std::string::npos)
+    {
+        is_tv_box = true;
+    }
+}
 }
 
 RIFE::~RIFE()
@@ -260,6 +268,26 @@ int RIFE::load(const std::string& modeldir)
     // Disable cooperative matrix to prevent glslang crash on Adreno 825
     // when compiling cooperative matrix shaders for convolution layers.
     opt.use_cooperative_matrix = false;
+
+    // Memory optimization for TV Box (Mali-G310 / Xiaomi TV Box S 3rd Gen)
+    if (is_tv_box)
+    {
+        // Disable memory-heavy optimizations for low-memory CPU fallback
+        opt.use_winograd_convolution = false;
+        opt.use_sgemm_convolution = false;
+        opt.use_packing_layout = false;
+        opt.use_int8_storage = false;
+        opt.use_int8_packed = false;
+        opt.use_int8_arithmetic = false;
+        opt.use_winograd23_convolution = false;
+        opt.use_winograd43_convolution = false;
+        opt.use_winograd63_convolution = false;
+        opt.use_bf16_storage = false;
+        opt.use_bf16_packed = false;
+        opt.use_shader_local_memory = false;
+        opt.lightmode = true;  // Enable intermediate blob recycling
+        LOGI("TV Box detected (Mali-G310): Applied memory optimization options");
+    }
 
     flownet.opt = opt;
     contextnet.opt = opt;
