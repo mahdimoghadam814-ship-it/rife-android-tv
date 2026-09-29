@@ -199,6 +199,27 @@ bool RifeEngine::init(int requested_gpu_id) {
             return true;
         }
 
+        // Check for known problematic GPU: Adreno 825 crashes in glslang::GlslangToSpv()
+        // during runtime shader compilation due to a glslang compiler bug triggered by if/else
+        // statements in shader code (TIntermSelection traversal). Disable Vulkan for this device
+        // to avoid SIGSEGV.
+        // Match Qualcomm vendor (0x5143) and Adreno 825 device ID range (0x4403xxxx)
+        if (props.vendorID == 0x5143 && (props.deviceID & 0xFFFF0000) == 0x44030000) {
+            LOGW_DEVICE(
+                "Adreno 825 detected - known to crash in glslang during RIFE Vulkan shader "
+                "compilation (glslang::TIntermSelection traversal). Disabling Vulkan and "
+                "falling back to CPU mode."
+            );
+            vulkan_available = false;
+            gpu_name.clear();
+            vulkan_api_version.clear();
+            device_profile = DeviceProfile::CPU_FALLBACK;
+            last_error =
+                "Adreno 825 GPU detected. Vulkan disabled due to known glslang crash in "
+                "TIntermSelection traversal. RIFE will use CPU fallback.";
+            return true;
+        }
+
         // Detect Vulkan capabilities
         detectVulkanCapabilities(vkdev);
 
@@ -711,9 +732,10 @@ void RifeEngine::selectDeviceProfile() {
         return;
     }
 
-    // Poco F7 - would typically have Adreno 740/750 or high-end Mali
+    // Poco F7 - would typically have Adreno 740/750/825 or high-end Mali
     // Check for high-end GPU indicators
     if (gpu_lower.find("adreno 7") != std::string::npos ||
+        gpu_lower.find("adreno 8") != std::string::npos ||
         gpu_lower.find("mali-g7") != std::string::npos ||
         gpu_lower.find("immortalis") != std::string::npos) {
         // Additional check for high performance score
