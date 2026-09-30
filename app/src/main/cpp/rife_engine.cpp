@@ -507,7 +507,7 @@ bool RifeEngine::processFrameBuffer(
         return false;
     }
 
-    ncnn::Mat out_mat(effective_target_w, effective_target_h, ncnn::Mat::PIXEL_RGB);
+    ncnn::Mat out_mat(effective_target_w, effective_target_h, 3, ncnn::Mat::PIXEL_RGB);
 
     int ret =
         rife_impl->process(
@@ -552,7 +552,7 @@ if (ret != 0 || out_mat.empty()) {
                     in0_rgba, ncnn::Mat::PIXEL_RGBA2RGB, src_w, src_h, effective_target_w, effective_target_h);
                 in1_mat = ncnn::Mat::from_pixels_resize(
                     in1_rgba, ncnn::Mat::PIXEL_RGBA2RGB, src_w, src_h, effective_target_w, effective_target_h);
-                out_mat = ncnn::Mat(effective_target_w, effective_target_h, ncnn::Mat::PIXEL_RGB);
+                out_mat = ncnn::Mat(effective_target_w, effective_target_h, 3, ncnn::Mat::PIXEL_RGB);
             }
             // Retry the process
             ret = rife_impl->process(in0_mat, in1_mat, timestep, out_mat);
@@ -696,7 +696,7 @@ DeviceProfile RifeEngine::getDeviceProfile() const {
     return device_profile;
 }
 
-const VulkanCapabilities RifeEngine::getVulkanCapabilities() const {
+VulkanCapabilities RifeEngine::getVulkanCapabilities() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return vulkan_caps;
 }

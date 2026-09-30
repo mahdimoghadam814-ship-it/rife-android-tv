@@ -8,32 +8,7 @@
 // ncnn
 #include "net.h"
 #include "option.h"
-
-namespace rife {
-
-struct NcnnOptionPolicy {
-    bool use_vulkan_compute = false;
-    bool use_fp16_packed = false;
-    bool use_fp16_storage = false;
-    bool use_fp16_arithmetic = false;
-    bool use_int8_storage = false;
-    bool use_int8_packed = false;
-    bool use_int8_arithmetic = false;
-    bool use_cooperative_matrix = false;
-    bool use_winograd_convolution = true;
-    bool use_sgemm_convolution = true;
-    bool use_packing_layout = true;
-    bool use_winograd23_convolution = true;
-    bool use_winograd43_convolution = true;
-    bool use_winograd63_convolution = true;
-    bool use_bf16_storage = false;
-    bool use_bf16_packed = false;
-    bool use_shader_local_memory = false;
-    bool lightmode = false;
-    int num_threads = 1;
-};
-
-} // namespace rife
+#include "device_policy.h"
 
 class RIFE
 {

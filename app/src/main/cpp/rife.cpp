@@ -398,7 +398,8 @@ int RIFE::load(const std::string& modeldir)
 
     // Helper lambda for safe pipeline creation with cleanup on failure
     auto create_pipeline = [&](const char* shader_name, const uint32_t* spv_data, size_t spv_size,
-                               ncnn::Pipeline** out_pipeline, int local_size_x, int local_size_y, int local_size_z) -> bool {
+                               ncnn::Pipeline** out_pipeline, int local_size_x, int local_size_y, int local_size_z,
+                               const std::vector<ncnn::vk_specialization_type>& specializations) -> bool {
         std::vector<uint32_t> spirv;
         if (!get_spirv(shader_name, spv_data, spv_size, spirv)) {
             return false;
@@ -426,14 +427,14 @@ int RIFE::load(const std::string& modeldir)
         if (!create_pipeline(tta_mode ? "rife_preproc_tta" : "rife_preproc",
                              tta_mode ? rife_preproc_tta_spv_data : rife_preproc_spv_data,
                              tta_mode ? rife_preproc_tta_spv_data_size : rife_preproc_spv_data_size,
-                             &rife_preproc, 8, 8, 3)) {
+                             &rife_preproc, 8, 8, 3, specializations)) {
             return -1;
         }
 
         if (!create_pipeline(tta_mode ? "rife_postproc_tta" : "rife_postproc",
                              tta_mode ? rife_postproc_tta_spv_data : rife_postproc_spv_data,
                              tta_mode ? rife_postproc_tta_spv_data_size : rife_postproc_spv_data_size,
-                             &rife_postproc, 8, 8, 3)) {
+                             &rife_postproc, 8, 8, 3, specializations)) {
             return -1;
         }
     }
@@ -457,7 +458,7 @@ int RIFE::load(const std::string& modeldir)
         std::vector<ncnn::vk_specialization_type> specializations(0);
         if (!create_pipeline("flow_tta_avg",
                              flow_tta_avg_spv_data, flow_tta_avg_spv_data_size,
-                             &rife_flow_tta_avg, 8, 8, 1)) {
+                             &rife_flow_tta_avg, 8, 8, 1, specializations)) {
             return -1;
         }
     }
@@ -481,7 +482,7 @@ int RIFE::load(const std::string& modeldir)
         std::vector<ncnn::vk_specialization_type> specializations(0);
         if (!create_pipeline("flow_tta_temporal_avg",
                              flow_tta_temporal_avg_spv_data, flow_tta_temporal_avg_spv_data_size,
-                             &rife_flow_tta_temporal_avg, 8, 8, 1)) {
+                             &rife_flow_tta_temporal_avg, 8, 8, 1, specializations)) {
             return -1;
         }
     }
@@ -490,7 +491,7 @@ int RIFE::load(const std::string& modeldir)
     {
         if (!create_pipeline("rife_out_tta_temporal_avg",
                              rife_out_tta_temporal_avg_spv_data, rife_out_tta_temporal_avg_spv_data_size,
-                             &rife_out_tta_temporal_avg, 8, 8, 1)) {
+                             &rife_out_tta_temporal_avg, 8, 8, 1, specializations)) {
             return -1;
         }
     }
@@ -561,9 +562,10 @@ int RIFE::load(const std::string& modeldir)
             const uint32_t* timestep_spv_data = tta_mode ? rife_v4_timestep_tta_spv_data : rife_v4_timestep_spv_data;
             size_t timestep_spv_data_size = tta_mode ? rife_v4_timestep_tta_spv_data_size : rife_v4_timestep_spv_data_size;
 
+            std::vector<ncnn::vk_specialization_type> specializations;
             if (!create_pipeline(tta_mode ? "rife_v4_timestep_tta" : "rife_v4_timestep",
                                  timestep_spv_data, timestep_spv_data_size,
-                                 &rife_v4_timestep, 8, 8, 1)) {
+                                 &rife_v4_timestep, 8, 8, 1, specializations)) {
                 return -1;
             }
         }
