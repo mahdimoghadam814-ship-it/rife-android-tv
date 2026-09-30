@@ -18,7 +18,7 @@ get_filename_component(NCNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_p
 if (EXISTS "${NCNN_DIR}/CMakeLists.txt")
     # Apply ncnn interp shader SPIR-V precompilation patch before building ncnn
     # Patch file is at repository root (4 levels up from app/src/main/cpp)
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../" ABSOLUTE)
+    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../" ABSOLUTE)
     execute_process(
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${REPO_ROOT}/ncnn_interp_spirv.patch"
