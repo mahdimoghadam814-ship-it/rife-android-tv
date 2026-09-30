@@ -63,11 +63,12 @@ bool DevicePolicy::initialize(int requested_gpu_id) {
         backend_policy_.disable_reason.clear();
     }
 
+    active_backend_ = backend_policy_.vulkan_allowed ? Backend::VULKAN : Backend::CPU;
+
     selectDeviceProfile();
     buildNcnnOptions();
     buildResolutionLadder();
 
-    active_backend_ = backend_policy_.vulkan_allowed ? Backend::VULKAN : Backend::CPU;
     initialized_ = true;
 
     LOGI_DEVICE("RIFE init completed: vulkan=%s, profile=%d, gpu=%s, backend=%s",
