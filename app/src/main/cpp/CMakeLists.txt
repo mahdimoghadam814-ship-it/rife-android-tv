@@ -16,6 +16,22 @@ set(NCNN_DISABLE_EXCEPTION OFF CACHE BOOL "" FORCE)
 get_filename_component(NCNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/ncnn" ABSOLUTE)
 
 if (EXISTS "${NCNN_DIR}/CMakeLists.txt")
+    # Apply ncnn interp shader SPIR-V precompilation patch before building ncnn
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../ncnn_interp_spirv.patch"
+            "${CMAKE_CURRENT_BINARY_DIR}/ncnn_interp_spirv.patch"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    execute_process(
+        COMMAND git apply "${CMAKE_CURRENT_BINARY_DIR}/ncnn_interp_spirv.patch"
+        WORKING_DIRECTORY "${NCNN_DIR}"
+        RESULT_VARIABLE PATCH_RESULT
+    )
+    if(NOT PATCH_RESULT EQUAL 0)
+        message(WARNING "Failed to apply ncnn interp SPIR-V patch, continuing anyway...")
+    endif()
+    
     add_subdirectory("${NCNN_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/ncnn")
 else()
     message(FATAL_ERROR "ncnn source directory not found at ${NCNN_DIR}")
