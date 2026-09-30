@@ -7,6 +7,7 @@
 #include <mutex>
 #include <android/asset_manager.h>
 #include "rife.h"
+#include "device_policy.h"
 
 struct VulkanCapabilities {
     bool fp16_storage = false;
@@ -27,15 +28,7 @@ struct VulkanCapabilities {
     std::string toString() const;
 };
 
-enum class DeviceProfile {
-    UNKNOWN,
-    POCO_F7,
-    XIAOMI_TV_BOX_S_3RD_GEN,
-    GENERIC_HIGH_END,
-    GENERIC_MID_RANGE,
-    GENERIC_LOW_END,
-    CPU_FALLBACK
-};
+using DeviceProfile = rife::DeviceProfile;
 
 struct RifeEngineResult {
     bool success;
@@ -58,7 +51,6 @@ public:
 
     bool init(int gpu_id = 0);
     bool loadModelFromAssets(AAssetManager* mgr, const std::string& base_cache_dir, const std::string& model_dir, bool is_v2 = true, bool is_v4 = false);
-
     bool processFrameBuffer(
         const uint8_t* in0_rgba, const uint8_t* in1_rgba,
         int src_w, int src_h,
@@ -66,18 +58,25 @@ public:
         float timestep,
         uint8_t* out_rgba
     );
-
     bool interpolateTest(int width = 256, int height = 256);
 
+    // Fallback lifecycle
+    bool tryFallback();
+
+    // Model lifecycle
+    bool unloadModel();
+    bool reloadModel(AAssetManager* mgr, const std::string& base_cache_dir, const std::string& model_dir, bool is_v2, bool is_v4);
+
     RifeEngineResult getStatus() const;
-    long getLastInferenceTimeMs() const {
-        std::lock_guard<std::mutex> lock(mutex);
-        return last_inference_time_ms;
-    }
+    long getLastInferenceTimeMs() const;
 
     // Device profile and capability accessors
     DeviceProfile getDeviceProfile() const;
-    const VulkanCapabilities& getVulkanCapabilities() const;
+    VulkanCapabilities getVulkanCapabilities() const;
+    bool getActiveBackend() const;
+    rife::NcnnOptionPolicy getNcnnOptionPolicy() const;
+    rife::ResolutionPolicy getResolutionPolicy() const;
+    rife::MemoryPolicy getMemoryPolicy() const;
 
 private:
     int gpu_id;
@@ -93,15 +92,23 @@ private:
     std::string device_model;
 
     std::unique_ptr<RIFE> rife_impl;
+    rife::DevicePolicy device_policy_;
 
-    // Guards init/loadModelFromAssets/processFrameBuffer against concurrent calls from
-    // different threads (e.g. the RIFE init thread and the frame-processing worker thread).
-    mutable std::mutex mutex;
+    // Cached model parameters for fallback/reload
+    std::string cached_base_cache_dir;
+    std::string cached_model_dir;
+    bool cached_is_v2 = true;
+    bool cached_is_v4 = false;
 
-    // Private helpers
-    void detectVulkanCapabilities(const ncnn::VulkanDevice* vkdev);
-    void selectDeviceProfile();
+    // Guards init/loadModelFromAssets/processFrameBuffer against concurrent calls
+    mutable std::mutex mutex_;
+
+    // Private helpers - public methods acquire mutex, these assume it's held
     void logStructured(const char* tag, const char* fmt, ...) __attribute__((format(printf, 3, 4)));
+    void unloadModel_locked();
+    bool loadModelFromAssets_locked(AAssetManager* mgr, const std::string& base_cache_dir, const std::string& model_dir, bool is_v2, bool is_v4);
+    bool createRifeInstance_locked(int gpu_id, const std::string& model_dir, bool is_v2, bool is_v4);
+    bool tryFallback_locked();
 };
 
 #endif // RIFE_ENGINE_H

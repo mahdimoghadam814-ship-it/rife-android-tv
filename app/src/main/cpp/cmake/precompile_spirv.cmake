@@ -64,38 +64,46 @@ else()
         "#define NCNN_fp16_arithmetic 0\n"
         "#define ncnn_vendorID 0\n"
         "#define ncnn_storageBuffer16BitAccess 1\n"
-        "#define ncnn_uniformAndStorageBuffer16BitAccess 1\n"
+        "#define ncnn_uniformAndStorageBuffer16BitAccess 0\n"
         "#define ncnn_shaderInt16 1\n"
         "#define ncnn_shaderInt64 1\n"
         "#define ncnn_enable_validation_layer 0\n"
     )
 
-    # Find the #version line anywhere in the shader (not just at start)
-    # Split shader into: preamble (comments before #version), #version line, and body
-    string(REGEX MATCH "([^\n]*\n)*#version[^\n]*\n" version_prefix "${shader_source}")
-    if(version_prefix)
-        # Extract everything before and including #version line
-        string(LENGTH "${version_prefix}" prefix_len)
-        string(SUBSTRING "${shader_source}" ${prefix_len} -1 shader_body)
-        set(version_line "${version_prefix}")
-    else()
-        # Fallback: assume #version 450 at start
-        string(REGEX MATCH "^(#version[^\n]*\n)" version_line "${shader_source}")
-        string(REGEX REPLACE "^#version[^\n]*\n" "" shader_body "${shader_source}")
+    # ============================================================
+    # CORRECT SHADER ASSEMBLY ORDER (per GLSL spec):
+    # 1. #version directive (MUST be first non-comment line)
+    # 2. RIFE-required macros (NCNN_* macros that ncnn_glsl_ext and shader depend on)
+    # 3. ncnn_glsl_ext.comp content (defines sfp, afp, buffer_* macros using NCNN_*)
+    # 4. Shader body (contains #if NCNN_* #extension blocks and uses sfp, afp, etc.)
+    # ============================================================
+
+    # Step 1: Extract #version line from shader source (must be first non-comment line)
+    # Handle optional leading comments and whitespace
+    string(REGEX MATCH "^[ \t]*\n*[ \t]*#[ \t]*version[^\n]*\n" version_line "${shader_source}")
+    if(NOT version_line)
+        message(FATAL_ERROR "Shader ${SHADER_SRC} missing required #version directive at start of file")
     endif()
 
-    # Read ncnn GLSL extensions and remove any #version line
+    # Remove the version line from shader source to get the body
+    string(LENGTH "${version_line}" version_line_len)
+    string(SUBSTRING "${shader_source}" ${version_line_len} -1 shader_body)
+
+    # Step 2: Read ncnn GLSL extensions and remove any #version line
     set(ncnn_glsl_ext_content "")
     if(EXISTS ${NCNN_GLSL_EXT})
         file(READ ${NCNN_GLSL_EXT} ncnn_glsl_ext_content)
-        string(REGEX REPLACE "^#version [0-9]+.*\n" "" ncnn_glsl_ext_content "${ncnn_glsl_ext_content}")
+        # Remove any #version line from ncnn_glsl_ext
+        string(REGEX REPLACE "^[ \t]*#[ \t]*version[^\n]*\n" "" ncnn_glsl_ext_content "${ncnn_glsl_ext_content}")
         message(STATUS "Loaded ncnn_glsl_ext.comp from: ${NCNN_GLSL_EXT}")
     else()
         message(FATAL_ERROR "ncnn_glsl_ext.comp not found at ${NCNN_GLSL_EXT}. Required for shader precompilation. Ensure third_party/ncnn submodule is initialized.")
     endif()
 
-    # CORRECT ORDER: preamble + #version + MACROS + ncnn_ext + shader_body
-    # Macros MUST come before ncnn extensions because ncnn extensions use #if NCNN_xxx
+    # Step 3: Remove any leading whitespace-only lines from shader_body
+    string(REGEX REPLACE "^[ \t]*\n" "" shader_body "${shader_body}")
+
+    # Step 4: Assemble in correct order: #version + MACROS + ncnn_ext + shader_body
     set(shader_source_with_macros "${version_line}${RIFE_VULKAN_MACROS}${ncnn_glsl_ext_content}${shader_body}")
 
     set(TEMP_GLSL ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}_with_macros.comp)
@@ -168,13 +176,13 @@ else()
         math(EXPR words_len "${words_len} - 1")
         string(SUBSTRING "${spv_words}" 0 ${words_len} spv_words)
 
-        # Calculate byte size
-        math(EXPR spv_data_size "${word_count} * 4")
+        # spv_data_size is in WORDS (uint32_t count) for the C++ registry
+        math(EXPR spv_data_size_words "${word_count}")
 
         # Write the header file with uint32_t array
         file(WRITE ${SHADER_SPV_HEADER}
             "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = {${spv_words}};\n"
-            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = ${spv_data_size};\n"
+            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = ${spv_data_size_words};\n"
         )
 
         message(STATUS "Generated ${SHADER_SPV_HEADER} with ${word_count} uint32_t words")

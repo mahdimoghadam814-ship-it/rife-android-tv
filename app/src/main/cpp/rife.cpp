@@ -132,7 +132,14 @@ RIFE::RIFE(int gpuid, bool _tta_mode, bool _tta_temporal_mode, bool _uhd_mode, i
     {
         is_tv_box = true;
     }
+
+    // Initialize default option policy
+    option_policy_ = rife::NcnnOptionPolicy();
 }
+
+void RIFE::setOptions(const rife::NcnnOptionPolicy& policy)
+{
+    option_policy_ = policy;
 }
 
 RIFE::~RIFE()
@@ -259,35 +266,35 @@ int RIFE::load(const std::string& modeldir)
 {
     logRss("before_load");
     ncnn::Option opt;
-    opt.num_threads = num_threads;
-    opt.use_vulkan_compute = vkdev ? true : false;
-    opt.use_fp16_packed = vkdev ? true : false;
-    opt.use_fp16_storage = vkdev ? true : false;
-    opt.use_fp16_arithmetic = false;
-    opt.use_int8_storage = true;
-    // Disable cooperative matrix to prevent glslang crash on Adreno 825
-    // when compiling cooperative matrix shaders for convolution layers.
-    opt.use_cooperative_matrix = false;
 
-    // Memory optimization for TV Box (Mali-G310 / Xiaomi TV Box S 3rd Gen)
-    if (is_tv_box)
-    {
-        // Disable memory-heavy optimizations for low-memory CPU fallback
-        opt.use_winograd_convolution = false;
-        opt.use_sgemm_convolution = false;
-        opt.use_packing_layout = false;
-        opt.use_int8_storage = false;
-        opt.use_int8_packed = false;
-        opt.use_int8_arithmetic = false;
-        opt.use_winograd23_convolution = false;
-        opt.use_winograd43_convolution = false;
-        opt.use_winograd63_convolution = false;
-        opt.use_bf16_storage = false;
-        opt.use_bf16_packed = false;
-        opt.use_shader_local_memory = false;
-        opt.lightmode = true;  // Enable intermediate blob recycling
-        LOGI("TV Box detected (Mali-G310): Applied memory optimization options");
-    }
+    // Apply options from centralized policy
+    opt.num_threads = option_policy_.num_threads;
+    opt.use_vulkan_compute = option_policy_.use_vulkan_compute && (vkdev != nullptr);
+    opt.use_fp16_packed = option_policy_.use_fp16_packed;
+    opt.use_fp16_storage = option_policy_.use_fp16_storage;
+    opt.use_fp16_arithmetic = option_policy_.use_fp16_arithmetic;
+    opt.use_int8_storage = option_policy_.use_int8_storage;
+    opt.use_int8_packed = option_policy_.use_int8_packed;
+    opt.use_int8_arithmetic = option_policy_.use_int8_arithmetic;
+    opt.use_cooperative_matrix = option_policy_.use_cooperative_matrix;
+    opt.use_winograd_convolution = option_policy_.use_winograd_convolution;
+    opt.use_sgemm_convolution = option_policy_.use_sgemm_convolution;
+    opt.use_packing_layout = option_policy_.use_packing_layout;
+    opt.use_winograd23_convolution = option_policy_.use_winograd23_convolution;
+    opt.use_winograd43_convolution = option_policy_.use_winograd43_convolution;
+    opt.use_winograd63_convolution = option_policy_.use_winograd63_convolution;
+    opt.use_bf16_storage = option_policy_.use_bf16_storage;
+    opt.use_bf16_packed = option_policy_.use_bf16_packed;
+    opt.use_shader_local_memory = option_policy_.use_shader_local_memory;
+    opt.lightmode = option_policy_.lightmode;
+
+    LOGI("RIFE Options: vulkan=%s fp16_packed=%s fp16_storage=%s int8_storage=%s lightmode=%s threads=%d",
+         opt.use_vulkan_compute ? "YES" : "NO",
+         opt.use_fp16_packed ? "YES" : "NO",
+         opt.use_fp16_storage ? "YES" : "NO",
+         opt.use_int8_storage ? "YES" : "NO",
+         opt.lightmode ? "YES" : "NO",
+         opt.num_threads);
 
     flownet.opt = opt;
     contextnet.opt = opt;
@@ -389,6 +396,23 @@ int RIFE::load(const std::string& modeldir)
         return true;
     };
 
+    // Helper lambda for safe pipeline creation with cleanup on failure
+    auto create_pipeline = [&](const char* shader_name, const uint32_t* spv_data, size_t spv_size,
+                               ncnn::Pipeline** out_pipeline, int local_size_x, int local_size_y, int local_size_z) -> bool {
+        std::vector<uint32_t> spirv;
+        if (!get_spirv(shader_name, spv_data, spv_size, spirv)) {
+            return false;
+        }
+        *out_pipeline = new ncnn::Pipeline(vkdev);
+        (*out_pipeline)->set_optimal_local_size_xyz(local_size_x, local_size_y, local_size_z);
+        if ((*out_pipeline)->create(spirv.data(), spirv.size() * 4, specializations) != 0) {
+            delete *out_pipeline;
+            *out_pipeline = nullptr;
+            return false;
+        }
+        return true;
+    };
+
     // initialize preprocess and postprocess pipeline
     if (vkdev)
     {
@@ -399,125 +423,76 @@ int RIFE::load(const std::string& modeldir)
         specializations[0].i = 0;
 #endif
 
-        {
-            std::vector<uint32_t> spirv;
-            if (!get_spirv(tta_mode ? "rife_preproc_tta" : "rife_preproc",
-                           tta_mode ? rife_preproc_tta_spv_data : rife_preproc_spv_data,
-                           tta_mode ? rife_preproc_tta_spv_data_size : rife_preproc_spv_data_size,
-                           spirv)) {
-                return -1;
-            }
-
-            rife_preproc = new ncnn::Pipeline(vkdev);
-            rife_preproc->set_optimal_local_size_xyz(8, 8, 3);
-            rife_preproc->create(spirv.data(), spirv.size() * 4, specializations);
+        if (!create_pipeline(tta_mode ? "rife_preproc_tta" : "rife_preproc",
+                             tta_mode ? rife_preproc_tta_spv_data : rife_preproc_spv_data,
+                             tta_mode ? rife_preproc_tta_spv_data_size : rife_preproc_spv_data_size,
+                             &rife_preproc, 8, 8, 3)) {
+            return -1;
         }
 
-        {
-            std::vector<uint32_t> spirv;
-            if (!get_spirv(tta_mode ? "rife_postproc_tta" : "rife_postproc",
-                           tta_mode ? rife_postproc_tta_spv_data : rife_postproc_spv_data,
-                           tta_mode ? rife_postproc_tta_spv_data_size : rife_postproc_spv_data_size,
-                           spirv)) {
-                return -1;
-            }
-
-            rife_postproc = new ncnn::Pipeline(vkdev);
-            rife_postproc->set_optimal_local_size_xyz(8, 8, 3);
-            rife_postproc->create(spirv.data(), spirv.size() * 4, specializations);
+        if (!create_pipeline(tta_mode ? "rife_postproc_tta" : "rife_postproc",
+                             tta_mode ? rife_postproc_tta_spv_data : rife_postproc_spv_data,
+                             tta_mode ? rife_postproc_tta_spv_data_size : rife_postproc_spv_data_size,
+                             &rife_postproc, 8, 8, 3)) {
+            return -1;
         }
     }
 
     if (vkdev && tta_mode)
     {
-        std::vector<uint32_t> spirv;
         const uint32_t* flow_tta_avg_spv_data = nullptr;
         size_t flow_tta_avg_spv_data_size = 0;
-        const char* flow_tta_avg_comp_data = nullptr;
-        int flow_tta_avg_comp_data_size = 0;
 
         if (rife_v4) {
             flow_tta_avg_spv_data = rife_v4_flow_tta_avg_spv_data;
             flow_tta_avg_spv_data_size = rife_v4_flow_tta_avg_spv_data_size;
-            flow_tta_avg_comp_data = rife_v4_flow_tta_avg_comp_data;
-            flow_tta_avg_comp_data_size = sizeof(rife_v4_flow_tta_avg_comp_data);
         } else if (rife_v2) {
             flow_tta_avg_spv_data = rife_v2_flow_tta_avg_spv_data;
             flow_tta_avg_spv_data_size = rife_v2_flow_tta_avg_spv_data_size;
-            flow_tta_avg_comp_data = rife_v2_flow_tta_avg_comp_data;
-            flow_tta_avg_comp_data_size = sizeof(rife_v2_flow_tta_avg_comp_data);
         } else {
             flow_tta_avg_spv_data = rife_flow_tta_avg_spv_data;
             flow_tta_avg_spv_data_size = rife_flow_tta_avg_spv_data_size;
-            flow_tta_avg_comp_data = rife_flow_tta_avg_comp_data;
-            flow_tta_avg_comp_data_size = sizeof(rife_flow_tta_avg_comp_data);
-        }
-
-        if (!get_spirv("flow_tta_avg",
-                       flow_tta_avg_spv_data, flow_tta_avg_spv_data_size,
-                       spirv)) {
-            return -1;
         }
 
         std::vector<ncnn::vk_specialization_type> specializations(0);
-
-        rife_flow_tta_avg = new ncnn::Pipeline(vkdev);
-        rife_flow_tta_avg->set_optimal_local_size_xyz(8, 8, 1);
-        rife_flow_tta_avg->create(spirv.data(), spirv.size() * 4, specializations);
+        if (!create_pipeline("flow_tta_avg",
+                             flow_tta_avg_spv_data, flow_tta_avg_spv_data_size,
+                             &rife_flow_tta_avg, 8, 8, 1)) {
+            return -1;
+        }
     }
 
     if (vkdev && tta_temporal_mode)
     {
-        std::vector<uint32_t> spirv;
         const uint32_t* flow_tta_temporal_avg_spv_data = nullptr;
         size_t flow_tta_temporal_avg_spv_data_size = 0;
-        const char* flow_tta_temporal_avg_comp_data = nullptr;
-        int flow_tta_temporal_avg_comp_data_size = 0;
 
         if (rife_v4) {
             flow_tta_temporal_avg_spv_data = rife_v4_flow_tta_temporal_avg_spv_data;
             flow_tta_temporal_avg_spv_data_size = rife_v4_flow_tta_temporal_avg_spv_data_size;
-            flow_tta_temporal_avg_comp_data = rife_v4_flow_tta_temporal_avg_comp_data;
-            flow_tta_temporal_avg_comp_data_size = sizeof(rife_v4_flow_tta_temporal_avg_comp_data);
         } else if (rife_v2) {
             flow_tta_temporal_avg_spv_data = rife_v2_flow_tta_temporal_avg_spv_data;
             flow_tta_temporal_avg_spv_data_size = rife_v2_flow_tta_temporal_avg_spv_data_size;
-            flow_tta_temporal_avg_comp_data = rife_v2_flow_tta_temporal_avg_comp_data;
-            flow_tta_temporal_avg_comp_data_size = sizeof(rife_v2_flow_tta_temporal_avg_comp_data);
         } else {
             flow_tta_temporal_avg_spv_data = rife_flow_tta_temporal_avg_spv_data;
             flow_tta_temporal_avg_spv_data_size = rife_flow_tta_temporal_avg_spv_data_size;
-            flow_tta_temporal_avg_comp_data = rife_flow_tta_temporal_avg_comp_data;
-            flow_tta_temporal_avg_comp_data_size = sizeof(rife_flow_tta_temporal_avg_comp_data);
-        }
-
-        if (!get_spirv("flow_tta_temporal_avg",
-                       flow_tta_temporal_avg_spv_data, flow_tta_temporal_avg_spv_data_size,
-                       spirv)) {
-            return -1;
         }
 
         std::vector<ncnn::vk_specialization_type> specializations(0);
-
-        rife_flow_tta_temporal_avg = new ncnn::Pipeline(vkdev);
-        rife_flow_tta_temporal_avg->set_optimal_local_size_xyz(8, 8, 1);
-        rife_flow_tta_temporal_avg->create(spirv.data(), spirv.size() * 4, specializations);
+        if (!create_pipeline("flow_tta_temporal_avg",
+                             flow_tta_temporal_avg_spv_data, flow_tta_temporal_avg_spv_data_size,
+                             &rife_flow_tta_temporal_avg, 8, 8, 1)) {
+            return -1;
+        }
     }
 
     if (vkdev && tta_temporal_mode)
     {
-        std::vector<uint32_t> spirv;
-        if (!get_spirv("rife_out_tta_temporal_avg",
-                       rife_out_tta_temporal_avg_spv_data, rife_out_tta_temporal_avg_spv_data_size,
-                       spirv)) {
+        if (!create_pipeline("rife_out_tta_temporal_avg",
+                             rife_out_tta_temporal_avg_spv_data, rife_out_tta_temporal_avg_spv_data_size,
+                             &rife_out_tta_temporal_avg, 8, 8, 1)) {
             return -1;
         }
-
-        std::vector<ncnn::vk_specialization_type> specializations(0);
-
-        rife_out_tta_temporal_avg = new ncnn::Pipeline(vkdev);
-        rife_out_tta_temporal_avg->set_optimal_local_size_xyz(8, 8, 1);
-        rife_out_tta_temporal_avg->create(spirv.data(), spirv.size() * 4, specializations);
     }
 
     if (uhd_mode)
@@ -583,19 +558,14 @@ int RIFE::load(const std::string& modeldir)
     {
         if (vkdev)
         {
-            std::vector<uint32_t> spirv;
-            if (!get_spirv(tta_mode ? "rife_v4_timestep_tta" : "rife_v4_timestep",
-                           tta_mode ? rife_v4_timestep_tta_spv_data : rife_v4_timestep_spv_data,
-                           tta_mode ? rife_v4_timestep_tta_spv_data_size : rife_v4_timestep_spv_data_size,
-                           spirv)) {
+            const uint32_t* timestep_spv_data = tta_mode ? rife_v4_timestep_tta_spv_data : rife_v4_timestep_spv_data;
+            size_t timestep_spv_data_size = tta_mode ? rife_v4_timestep_tta_spv_data_size : rife_v4_timestep_spv_data_size;
+
+            if (!create_pipeline(tta_mode ? "rife_v4_timestep_tta" : "rife_v4_timestep",
+                                 timestep_spv_data, timestep_spv_data_size,
+                                 &rife_v4_timestep, 8, 8, 1)) {
                 return -1;
             }
-
-            std::vector<ncnn::vk_specialization_type> specializations;
-
-            rife_v4_timestep = new ncnn::Pipeline(vkdev);
-            rife_v4_timestep->set_optimal_local_size_xyz(8, 8, 1);
-            rife_v4_timestep->create(spirv.data(), spirv.size() * 4, specializations);
         }
     }
 

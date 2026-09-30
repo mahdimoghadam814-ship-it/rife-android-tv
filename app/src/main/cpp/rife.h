@@ -7,6 +7,33 @@
 
 // ncnn
 #include "net.h"
+#include "option.h"
+
+namespace rife {
+
+struct NcnnOptionPolicy {
+    bool use_vulkan_compute = false;
+    bool use_fp16_packed = false;
+    bool use_fp16_storage = false;
+    bool use_fp16_arithmetic = false;
+    bool use_int8_storage = false;
+    bool use_int8_packed = false;
+    bool use_int8_arithmetic = false;
+    bool use_cooperative_matrix = false;
+    bool use_winograd_convolution = true;
+    bool use_sgemm_convolution = true;
+    bool use_packing_layout = true;
+    bool use_winograd23_convolution = true;
+    bool use_winograd43_convolution = true;
+    bool use_winograd63_convolution = true;
+    bool use_bf16_storage = false;
+    bool use_bf16_packed = false;
+    bool use_shader_local_memory = false;
+    bool lightmode = false;
+    int num_threads = 1;
+};
+
+} // namespace rife
 
 class RIFE
 {
@@ -27,6 +54,8 @@ public:
     int process_v4(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float timestep, ncnn::Mat& outimage) const;
 
     int process_v4_cpu(const ncnn::Mat& in0image, const ncnn::Mat& in1image, float timestep, ncnn::Mat& outimage) const;
+
+    void setOptions(const rife::NcnnOptionPolicy& policy);
 
 private:
     ncnn::VulkanDevice* vkdev;
@@ -50,6 +79,7 @@ private:
     bool rife_v2;
     bool rife_v4;
     bool is_tv_box;
+    rife::NcnnOptionPolicy option_policy_;
 };
 
 #endif // RIFE_H

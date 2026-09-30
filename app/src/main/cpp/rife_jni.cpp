@@ -87,6 +87,23 @@ Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
         return false;
     }
 
+    // Check output buffer capacity - native code writes RGBA (4 bytes per pixel)
+    // The maximum output size is targetWidth * targetHeight * 4 bytes (RGBA)
+    // since resolution fallback never upscales beyond requested target dimensions
+    jlong outCapacity = env->GetDirectBufferCapacity(outBuffer);
+    if (outCapacity < 0) {
+        // Not a direct buffer
+        return false;
+    }
+
+    // Calculate required capacity: max possible output is targetWidth * targetHeight * 4 bytes (RGBA)
+    // Resolution fallback only downscales, so this is the maximum required capacity
+    const int64_t requiredCapacity = static_cast<int64_t>(targetWidth) * targetHeight * 4;
+    if (static_cast<int64_t>(outCapacity) < requiredCapacity) {
+        // Buffer too small for the requested output resolution
+        return false;
+    }
+
     return g_rife_engine.processFrameBuffer(
         in0Ptr, in1Ptr,
         srcWidth, srcHeight,

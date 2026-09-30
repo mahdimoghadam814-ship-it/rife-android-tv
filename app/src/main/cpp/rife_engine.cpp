@@ -33,7 +33,6 @@
 #define LOGW_ERROR(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG_RIFE_ERROR, __VA_ARGS__)
 #define LOGE_ERROR(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG_RIFE_ERROR, __VA_ARGS__)
 
-// Generic log helper for internal use with dynamic tags
 static inline void logWithTag(const char* tag, int priority, const char* fmt, va_list args) {
     __android_log_vprint(priority, tag, fmt, args);
 }
@@ -128,12 +127,71 @@ RifeEngine::RifeEngine()
       device_profile(DeviceProfile::UNKNOWN) {
 }
 
-RifeEngine::~RifeEngine() {
-    rife_impl.reset();
+// Private helper to create and load RIFE instance with given GPU ID
+bool RifeEngine::createRifeInstance_locked(int gpu_id, const std::string& model_dir, bool is_v2, bool is_v4) {
+    try {
+        std::string gpu_name_local;
+        const ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device(gpu_id);
+        if (vkdev) {
+            const VkPhysicalDeviceProperties& props = vkdev->info.physicalDeviceProperties();
+            gpu_name_local = props.deviceName;
+        }
+
+        rife_impl = std::make_unique<RIFE>(
+            gpu_id,
+            false, // tta_mode
+            false, // tta_temporal_mode
+            false, // uhd_mode
+            1,     // num_threads
+            is_v2,
+            is_v4,
+            gpu_name_local
+        );
+
+        // Apply centralized ncnn options from DevicePolicy
+        if (device_policy_.isInitialized()) {
+            const auto& opt_policy = device_policy_.ncnnOptionPolicy();
+            rife_impl->setOptions(opt_policy);
+            LOGI_LIFECYCLE("Applied centralized ncnn options: vulkan=%s threads=%d lightmode=%s",
+                           opt_policy.use_vulkan_compute ? "YES" : "NO",
+                           opt_policy.num_threads,
+                           opt_policy.lightmode ? "YES" : "NO");
+        }
+
+        LOGI_LIFECYCLE(
+            "Calling RIFE::load() with gpu_id=%d from: %s",
+            gpu_id,
+            model_dir.c_str()
+        );
+
+        int ret = rife_impl->load(model_dir);
+
+        if (ret != 0) {
+            last_error = std::string("RIFE load failed with error code: ") + std::to_string(ret);
+            LOGE_ERROR("%s", last_error.c_str());
+            rife_impl.reset();
+            return false;
+        }
+
+        model_loaded = true;
+        LOGI_LIFECYCLE("RIFE model successfully loaded with gpu_id=%d from %s", gpu_id, model_dir.c_str());
+        return true;
+
+    } catch (const std::exception& e) {
+        last_error = std::string("Exception during RIFE load: ") + e.what();
+        LOGE_ERROR("%s", last_error.c_str());
+        rife_impl.reset();
+        return false;
+    } catch (...) {
+        last_error = "Unknown exception during RIFE load.";
+        LOGE_ERROR("%s", last_error.c_str());
+        rife_impl.reset();
+        return false;
+    }
 }
 
 bool RifeEngine::init(int requested_gpu_id) {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(mutex_);
     gpu_id = requested_gpu_id;
 
     int gpu_count = ncnn::get_gpu_count();
@@ -144,6 +202,7 @@ bool RifeEngine::init(int requested_gpu_id) {
         vulkan_available = false;
         gpu_name.clear();
         vulkan_api_version.clear();
+        device_profile = DeviceProfile::CPU_FALLBACK;
         last_error =
             "No Vulkan compatible GPU found. "
             "RIFE will use CPU fallback.";
@@ -182,51 +241,35 @@ bool RifeEngine::init(int requested_gpu_id) {
             props.deviceID
         );
 
-        // Check for known problematic GPU: Mali-G310 crashes in glslang::GlslangToSpv()
-        // during RIFE Vulkan shader compilation. Disable Vulkan for this device to avoid SIGSEGV.
-        if (gpu_name.find("Mali-G310") != std::string::npos) {
-            LOGW_DEVICE(
-                "Mali-G310 detected - known to crash in glslang during RIFE Vulkan shader compilation. "
-                "Disabling Vulkan and falling back to CPU mode."
-            );
+        // Initialize DevicePolicy with the GPU - it handles all device detection,
+        // capability assessment, backend selection, and profile assignment
+        if (!device_policy_.initialize(gpu_id)) {
+            LOGE_ERROR("DevicePolicy initialization failed");
             vulkan_available = false;
             gpu_name.clear();
             vulkan_api_version.clear();
             device_profile = DeviceProfile::CPU_FALLBACK;
-            last_error =
-                "Mali-G310 GPU detected. Vulkan disabled due to known glslang crash. "
-                "RIFE will use CPU fallback.";
             return true;
         }
 
-        // Check for known problematic GPU: Adreno 825 crashes in glslang::GlslangToSpv()
-        // during runtime shader compilation due to a glslang compiler bug triggered by if/else
-        // statements in shader code (TIntermSelection traversal). Disable Vulkan for this device
-        // to avoid SIGSEGV.
-        // Match Qualcomm vendor (0x5143) and Adreno 825 device ID range (0x4403xxxx)
-        if (props.vendorID == 0x5143 && (props.deviceID & 0xFFFF0000) == 0x44030000) {
-            LOGW_DEVICE(
-                "Adreno 825 detected - known to crash in glslang during RIFE Vulkan shader "
-                "compilation (glslang::TIntermSelection traversal). Disabling Vulkan and "
-                "falling back to CPU mode."
-            );
-            vulkan_available = false;
-            gpu_name.clear();
-            vulkan_api_version.clear();
-            device_profile = DeviceProfile::CPU_FALLBACK;
-            last_error =
-                "Adreno 825 GPU detected. Vulkan disabled due to known glslang crash in "
-                "TIntermSelection traversal. RIFE will use CPU fallback.";
-            return true;
+        // Sync state from DevicePolicy
+        vulkan_available = device_policy_.activeBackend() == rife::Backend::VULKAN;
+        device_profile = device_policy_.deviceProfile();
+
+        // Get fallback reason if Vulkan was disabled
+        if (!vulkan_available) {
+            last_error = device_policy_.backendPolicy().disable_reason;
+            if (last_error.empty()) {
+                last_error = "Vulkan disabled by device policy";
+            }
         }
 
-        // Detect Vulkan capabilities
-        detectVulkanCapabilities(vkdev);
+        LOGI_LIFECYCLE("RIFE init completed: vulkan=%s, profile=%d, gpu=%s",
+                       vulkan_available ? "YES" : "NO",
+                       static_cast<int>(device_profile),
+                       gpu_name.c_str());
 
-        // Select device profile based on detected GPU and capabilities
-        selectDeviceProfile();
-
-        vulkan_available = true;
+        return true;
     } else {
         LOGE_ERROR(
             "Failed to obtain Vulkan device for GPU id %d",
@@ -239,11 +282,6 @@ bool RifeEngine::init(int requested_gpu_id) {
         device_profile = DeviceProfile::CPU_FALLBACK;
     }
 
-    LOGI_LIFECYCLE("RIFE init completed: vulkan=%s, profile=%d, gpu=%s",
-                   vulkan_available ? "YES" : "NO",
-                   static_cast<int>(device_profile),
-                   gpu_name.c_str());
-
     return true;
 }
 
@@ -254,7 +292,17 @@ bool RifeEngine::loadModelFromAssets(
     bool is_v2,
     bool is_v4
 ) {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(mutex_);
+    return loadModelFromAssets_locked(mgr, base_cache_dir, model_dir, is_v2, is_v4);
+}
+
+bool RifeEngine::loadModelFromAssets_locked(
+    AAssetManager* mgr,
+    const std::string& base_cache_dir,
+    const std::string& model_dir,
+    bool is_v2,
+    bool is_v4
+) {
     model_loaded = false;
     last_error.clear();
     op_details.clear();
@@ -266,15 +314,11 @@ bool RifeEngine::loadModelFromAssets(
         return false;
     }
 
-/*
-     * The Android TV device previously crashed inside
-     * glslang::GlslangToSpv() while RIFE::load() was building
-     * Vulkan shader modules.
-     *
-     * Mali-G310 is detected in init() and Vulkan is disabled for it.
-     * For other devices, we attempt Vulkan first (if available) and fall back to
-     * CPU only if Vulkan initialization genuinely fails.
-     */
+    // Cache model parameters for potential fallback/reload
+    cached_base_cache_dir = base_cache_dir;
+    cached_model_dir = model_dir;
+    cached_is_v2 = is_v2;
+    cached_is_v4 = is_v4;
 
     std::string target_dir =
         base_cache_dir + "/" + model_dir;
@@ -337,110 +381,31 @@ bool RifeEngine::loadModelFromAssets(
         }
     }
 
-    auto try_load_with_gpu = [&](int gpu_id, const char* backend_name) -> bool {
-        try {
-            // Get GPU name for device-specific optimizations
-            std::string gpu_name;
-            const ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device(gpu_id);
-            if (vkdev) {
-                const VkPhysicalDeviceProperties& props = vkdev->info.physicalDeviceProperties();
-                gpu_name = props.deviceName;
-            }
-
-            rife_impl = std::make_unique<RIFE>(
-                gpu_id,
-                false, // tta_mode
-                false, // tta_temporal_mode
-                false, // uhd_mode
-                1,     // num_threads
-                is_v2,
-                is_v4,
-                gpu_name
-            );
-
-            LOGI_LIFECYCLE(
-                "Calling RIFE::load() with %s (gpu_id=%d) from: %s",
-                backend_name,
-                gpu_id,
-                target_dir.c_str()
-            );
-
-            int ret = rife_impl->load(target_dir);
-
-            if (ret != 0) {
-                last_error =
-                    std::string("RIFE ") + backend_name + " load failed with error code: " +
-                    std::to_string(ret);
-
-LOGE_ERROR(
-                "%s",
-                last_error.c_str()
-            );
-
-                rife_impl.reset();
-                return false;
-            }
-
-            model_loaded = true;
-
-            op_details =
-                std::string("RIFE model loaded with ") + backend_name + ".";
-
-LOGI_LIFECYCLE(
-            "RIFE model successfully loaded with %s from %s",
-            backend_name,
-            target_dir.c_str()
-        );
-
-            return true;
-
-        } catch (const std::exception& e) {
-            last_error =
-                std::string("Exception during RIFE ") + backend_name + " load: " + e.what();
-
-            LOGE_ERROR(
-                "%s",
-                last_error.c_str()
-            );
-
-            rife_impl.reset();
-            return false;
-
-        } catch (...) {
-            last_error =
-                std::string("Unknown exception during RIFE ") + backend_name + " load.";
-
-            LOGE_ERROR(
-                "%s",
-                last_error.c_str()
-            );
-
-            rife_impl.reset();
-            return false;
-        }
-    };
-
     int gpu_id_to_use = vulkan_available ? gpu_id : -1;
     const char* backend_name = vulkan_available ? "Vulkan" : "CPU fallback";
 
-LOGI_LIFECYCLE(
-            "Loading RIFE model with %s. Vulkan detected=%s, GPU id=%d",
-            backend_name,
-            vulkan_available ? "YES" : "NO",
-            gpu_id_to_use
-        );
+    LOGI_LIFECYCLE(
+        "Loading RIFE model with %s. Vulkan detected=%s, GPU id=%d",
+        backend_name,
+        vulkan_available ? "YES" : "NO",
+        gpu_id_to_use
+    );
 
-    if (!try_load_with_gpu(gpu_id_to_use, backend_name)) {
+    if (!createRifeInstance_locked(gpu_id_to_use, target_dir, is_v2, is_v4)) {
         if (vulkan_available) {
             LOGW_LIFECYCLE(
                 "Vulkan load failed, falling back to CPU mode. Error: %s",
                 last_error.c_str()
             );
             last_error.clear();
-            if (try_load_with_gpu(-1, "CPU fallback")) {
-                vulkan_available = false;
-                gpu_name.clear();
-                vulkan_api_version.clear();
+            // Synchronize DevicePolicy with CPU fallback state
+            device_policy_.reinitializeForCPUFallback();
+            // Sync engine state with DevicePolicy
+            vulkan_available = false;
+            device_profile = DeviceProfile::CPU_FALLBACK;
+            // Preserve hardware identity (gpu_name, vulkan_api_version) for diagnostics
+            if (createRifeInstance_locked(-1, target_dir, is_v2, is_v4)) {
+                LOGI_LIFECYCLE("Vulkan load failed, CPU fallback initialized successfully");
                 return true;
             }
         }
@@ -460,7 +425,7 @@ bool RifeEngine::processFrameBuffer(
     float timestep,
     uint8_t* out_rgba
 ) {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!model_loaded || !rife_impl) {
         last_error =
             "RIFE model not loaded.";
@@ -492,8 +457,28 @@ bool RifeEngine::processFrameBuffer(
         return false;
     }
 
+    // Build resolution policy with actual input dimensions if not already built
+    if (device_policy_.isInitialized() && device_policy_.resolutionPolicy().adaptive) {
+        const auto& res_policy = device_policy_.resolutionPolicy();
+        if (res_policy.source_width != src_w || res_policy.source_height != src_h) {
+            device_policy_.buildResolutionPolicy(src_w, src_h);
+        }
+    }
+
     auto start =
         std::chrono::high_resolution_clock::now();
+
+    // Use RIFE's internal target dimensions from DevicePolicy if available
+    int effective_target_w = target_w;
+    int effective_target_h = target_h;
+
+    if (device_policy_.isInitialized() && device_policy_.resolutionPolicy().adaptive) {
+        const auto& res_policy = device_policy_.resolutionPolicy();
+        if (res_policy.target_width > 0 && res_policy.target_height > 0) {
+            effective_target_w = res_policy.target_width;
+            effective_target_h = res_policy.target_height;
+        }
+    }
 
     ncnn::Mat in0_mat =
         ncnn::Mat::from_pixels_resize(
@@ -501,8 +486,8 @@ bool RifeEngine::processFrameBuffer(
             ncnn::Mat::PIXEL_RGBA2RGB,
             src_w,
             src_h,
-            target_w,
-            target_h
+            effective_target_w,
+            effective_target_h
         );
 
     ncnn::Mat in1_mat =
@@ -511,8 +496,8 @@ bool RifeEngine::processFrameBuffer(
             ncnn::Mat::PIXEL_RGBA2RGB,
             src_w,
             src_h,
-            target_w,
-            target_h
+            effective_target_w,
+            effective_target_h
         );
 
     if (in0_mat.empty() || in1_mat.empty()) {
@@ -522,7 +507,7 @@ bool RifeEngine::processFrameBuffer(
         return false;
     }
 
-    ncnn::Mat out_mat;
+    ncnn::Mat out_mat(effective_target_w, effective_target_h, ncnn::Mat::PIXEL_RGB);
 
     int ret =
         rife_impl->process(
@@ -532,7 +517,7 @@ bool RifeEngine::processFrameBuffer(
             out_mat
         );
 
-    if (ret != 0 || out_mat.empty()) {
+if (ret != 0 || out_mat.empty()) {
         last_error =
             std::string("RIFE ") + (vulkan_available ? "Vulkan" : "CPU") + " process failed with error: " +
             std::to_string(ret);
@@ -542,14 +527,47 @@ bool RifeEngine::processFrameBuffer(
             last_error.c_str()
         );
 
+        // Try deterministic fallback on process failure
+        // Both Vulkan and CPU failures can trigger fallback
+        if (tryFallback_locked()) {
+            if (vulkan_available) {
+                // Vulkan failure: fallback to CPU (model already reloaded by tryFallback_locked)
+                LOGW_LIFECYCLE("RIFE Vulkan process failed, fell back to CPU. Retrying...");
+            } else {
+                // CPU failure: resolution fallback applied by tryFallback_locked
+                LOGW_LIFECYCLE("RIFE CPU process failed, resolution fallback applied. Retrying...");
+            }
+            // Retry the process with updated state (vulkan_available may have changed)
+            // Recompute effective target dimensions from updated policy
+            if (device_policy_.isInitialized() && device_policy_.resolutionPolicy().adaptive) {
+                const auto& res_policy = device_policy_.resolutionPolicy();
+                if (res_policy.target_width > 0 && res_policy.target_height > 0) {
+                    effective_target_w = res_policy.target_width;
+                    effective_target_h = res_policy.target_height;
+                }
+            }
+            // Resize input mats to new effective target if needed
+            if (effective_target_w != target_w || effective_target_h != target_h) {
+                in0_mat = ncnn::Mat::from_pixels_resize(
+                    in0_rgba, ncnn::Mat::PIXEL_RGBA2RGB, src_w, src_h, effective_target_w, effective_target_h);
+                in1_mat = ncnn::Mat::from_pixels_resize(
+                    in1_rgba, ncnn::Mat::PIXEL_RGBA2RGB, src_w, src_h, effective_target_w, effective_target_h);
+                out_mat = ncnn::Mat(effective_target_w, effective_target_h, ncnn::Mat::PIXEL_RGB);
+            }
+            // Retry the process
+            ret = rife_impl->process(in0_mat, in1_mat, timestep, out_mat);
+            if (ret == 0 && !out_mat.empty()) {
+                goto process_output;
+            }
+        }
         return false;
     }
 
-    out_mat.to_pixels_resize(
+process_output:
+    // Copy output to caller's buffer - use PIXEL_RGB2RGBA to convert RGB to RGBA
+    out_mat.to_pixels(
         out_rgba,
-        ncnn::Mat::PIXEL_RGB2RGBA,
-        target_w,
-        target_h
+        ncnn::Mat::PIXEL_RGB2RGBA
     );
 
     auto end =
@@ -568,9 +586,9 @@ bool RifeEngine::processFrameBuffer(
         << "x"
         << src_h
         << " -> RIFE "
-        << target_w
+        << effective_target_w
         << "x"
-        << target_h
+        << effective_target_h
         << ") in "
         << last_inference_time_ms
         << " ms";
@@ -584,6 +602,7 @@ bool RifeEngine::interpolateTest(
     int width,
     int height
 ) {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (!model_loaded || !rife_impl) {
         last_error =
             "RIFE model not loaded before running test.";
@@ -632,7 +651,7 @@ bool RifeEngine::interpolateTest(
 }
 
 RifeEngineResult RifeEngine::getStatus() const {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(mutex_);
     RifeEngineResult res;
 
     res.success =
@@ -667,114 +686,125 @@ RifeEngineResult RifeEngine::getStatus() const {
     return res;
 }
 
-void RifeEngine::detectVulkanCapabilities(const ncnn::VulkanDevice* vkdev) {
-    if (!vkdev) {
-        LOGE_ERROR("detectVulkanCapabilities: vkdev is null");
-        return;
-    }
-
-    const auto& info = vkdev->info;
-
-    vulkan_caps.fp16_storage = info.support_fp16_storage();
-    vulkan_caps.fp16_packed = info.support_fp16_packed();
-    vulkan_caps.fp16_arithmetic = info.support_fp16_arithmetic();
-    vulkan_caps.int8_storage = info.support_int8_storage();
-    vulkan_caps.int8_packed = info.support_int8_packed();
-    vulkan_caps.int8_arithmetic = info.support_int8_arithmetic();
-    vulkan_caps.int16_storage = info.support_int16_storage();
-    vulkan_caps.int16_arithmetic = info.support_int16_arithmetic();
-
-    // shaderInt16 requires both int16 storage and arithmetic support
-    vulkan_caps.shader_int16 = info.support_int16_storage() && info.support_int16_arithmetic();
-
-    // shaderInt64 - check for 64-bit shader support via subgroup or cooperative matrix
-    // Conservative: requires cooperative matrix or explicit 64-bit support
-    vulkan_caps.shader_int64 = info.support_cooperative_matrix() ||
-                               info.support_VK_KHR_shader_integer_dot_product();
-
-    vulkan_caps.cooperative_matrix = info.support_cooperative_matrix();
-    vulkan_caps.subgroup_size_control = info.support_subgroup_size_control();
-    vulkan_caps.storage_buffer_16bit = info.support_VK_KHR_16bit_storage();
-    vulkan_caps.uniform_storage_buffer_16bit = false; // info.support_VK_KHR_uniform_buffer_standard_layout() not available in this ncnn version
-
-    LOGI_DEVICE("Vulkan capabilities detected:");
-    LOGI_DEVICE("  fp16_storage=%s, fp16_packed=%s, fp16_arithmetic=%s",
-                vulkan_caps.fp16_storage ? "YES" : "NO",
-                vulkan_caps.fp16_packed ? "YES" : "NO",
-                vulkan_caps.fp16_arithmetic ? "YES" : "NO");
-    LOGI_DEVICE("  int8_storage=%s, int8_packed=%s, int8_arithmetic=%s",
-                vulkan_caps.int8_storage ? "YES" : "NO",
-                vulkan_caps.int8_packed ? "YES" : "NO",
-                vulkan_caps.int8_arithmetic ? "YES" : "NO");
-    LOGI_DEVICE("  int16_storage=%s, int16_arithmetic=%s, shader_int16=%s, shader_int64=%s",
-                vulkan_caps.int16_storage ? "YES" : "NO",
-                vulkan_caps.int16_arithmetic ? "YES" : "NO",
-                vulkan_caps.shader_int16 ? "YES" : "NO",
-                vulkan_caps.shader_int64 ? "YES" : "NO");
-    LOGI_DEVICE("  cooperative_matrix=%s, subgroup_size_control=%s",
-                vulkan_caps.cooperative_matrix ? "YES" : "NO",
-                vulkan_caps.subgroup_size_control ? "YES" : "NO");
-    LOGI_DEVICE("  storage_buffer_16bit=%s, uniform_storage_buffer_16bit=%s",
-                vulkan_caps.storage_buffer_16bit ? "YES" : "NO",
-                vulkan_caps.uniform_storage_buffer_16bit ? "YES" : "NO");
-}
-
-void RifeEngine::selectDeviceProfile() {
-    // Try to identify specific device models from GPU name
-    std::string gpu_lower = gpu_name;
-    std::transform(gpu_lower.begin(), gpu_lower.end(), gpu_lower.begin(), ::tolower);
-
-    // Xiaomi TV Box S 3rd Gen - typically Mali-G310 or similar low-end GPU
-    // Also check device model if available via system properties
-    if (gpu_lower.find("mali-g310") != std::string::npos) {
-        device_profile = DeviceProfile::XIAOMI_TV_BOX_S_3RD_GEN;
-        LOGI_DEVICE("Device profile selected: XIAOMI_TV_BOX_S_3RD_GEN (Mali-G310 detected)");
-        return;
-    }
-
-    // Poco F7 - would typically have Adreno 740/750/825 or high-end Mali
-    // Check for high-end GPU indicators
-    if (gpu_lower.find("adreno 7") != std::string::npos ||
-        gpu_lower.find("adreno 8") != std::string::npos ||
-        gpu_lower.find("mali-g7") != std::string::npos ||
-        gpu_lower.find("immortalis") != std::string::npos) {
-        // Additional check for high performance score
-        const ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device(gpu_id);
-        if (vkdev && vkdev->info.rough_score() >= 75) {
-            device_profile = DeviceProfile::POCO_F7;
-            LOGI_DEVICE("Device profile selected: POCO_F7 (high-end GPU detected, score=%u)",
-                        vkdev->info.rough_score());
-            return;
-        }
-    }
-
-    // Generic profile selection based on capabilities and performance score
-    const ncnn::VulkanDevice* vkdev = ncnn::get_gpu_device(gpu_id);
-    uint32_t score = vkdev ? vkdev->info.rough_score() : 0;
-
-    if (score >= 75 && vulkan_caps.fp16_storage && vulkan_caps.fp16_packed) {
-        device_profile = DeviceProfile::GENERIC_HIGH_END;
-        LOGI_DEVICE("Device profile selected: GENERIC_HIGH_END (score=%u)", score);
-    } else if (score >= 25 && (vulkan_caps.fp16_storage || vulkan_caps.fp16_packed)) {
-        device_profile = DeviceProfile::GENERIC_MID_RANGE;
-        LOGI_DEVICE("Device profile selected: GENERIC_MID_RANGE (score=%u)", score);
-    } else if (vulkan_available) {
-        device_profile = DeviceProfile::GENERIC_LOW_END;
-        LOGI_DEVICE("Device profile selected: GENERIC_LOW_END (score=%u)", score);
-    } else {
-        device_profile = DeviceProfile::CPU_FALLBACK;
-        LOGI_DEVICE("Device profile selected: CPU_FALLBACK (Vulkan unavailable)");
-    }
+long RifeEngine::getLastInferenceTimeMs() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return last_inference_time_ms;
 }
 
 DeviceProfile RifeEngine::getDeviceProfile() const {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::lock_guard<std::mutex> lock(mutex_);
     return device_profile;
 }
 
-const VulkanCapabilities& RifeEngine::getVulkanCapabilities() const {
-    std::lock_guard<std::mutex> lock(mutex);
+const VulkanCapabilities RifeEngine::getVulkanCapabilities() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     return vulkan_caps;
+}
+
+bool RifeEngine::getActiveBackend() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return vulkan_available;
+}
+
+rife::NcnnOptionPolicy RifeEngine::getNcnnOptionPolicy() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (device_policy_.isInitialized()) {
+        return device_policy_.ncnnOptionPolicy();
+    }
+    return rife::NcnnOptionPolicy{};
+}
+
+rife::ResolutionPolicy RifeEngine::getResolutionPolicy() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (device_policy_.isInitialized()) {
+        return device_policy_.resolutionPolicy();
+    }
+    return rife::ResolutionPolicy{};
+}
+
+rife::MemoryPolicy RifeEngine::getMemoryPolicy() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (device_policy_.isInitialized()) {
+        return device_policy_.memoryPolicy();
+    }
+    return rife::MemoryPolicy{};
+}
+
+bool RifeEngine::tryFallback() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return tryFallback_locked();
+}
+
+bool RifeEngine::tryFallback_locked() {
+    LOGI_LIFECYCLE("RIFE deterministic fallback initiated");
+
+    if (!vulkan_available) {
+        // Already on CPU, try resolution fallback via DevicePolicy
+        if (device_policy_.isInitialized() && device_policy_.hasFallback()) {
+            // Apply the fallback resolution - this mutates the active target state
+            if (device_policy_.applyFallbackResolution()) {
+                auto fallback_res = device_policy_.getFallbackResolution();
+                LOGI_LIFECYCLE("Resolution fallback applied: %dx%d -> %dx%d",
+                               device_policy_.resolutionPolicy().target_width,
+                               device_policy_.resolutionPolicy().target_height,
+                               fallback_res.first, fallback_res.second);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Destroy Vulkan RIFE resources
+    unloadModel_locked();
+
+    // Switch to CPU backend - PRESERVE hardware identity (gpu_name, vulkan_api_version)
+    vulkan_available = false;
+    device_profile = DeviceProfile::CPU_FALLBACK;
+
+    // Re-initialize DevicePolicy for CPU-only mode using dedicated reinitialize method
+    // This preserves hardware identity while switching backend state
+    device_policy_.reinitializeForCPUFallback();
+
+    // Reload model with CPU backend using cached parameters
+    if (!cached_base_cache_dir.empty() && !cached_model_dir.empty()) {
+        std::string target_dir = cached_base_cache_dir + "/" + cached_model_dir;
+        if (createRifeInstance_locked(-1, target_dir, cached_is_v2, cached_is_v4)) {
+            LOGI_LIFECYCLE("Deterministic fallback complete: Vulkan -> CPU. Model reloaded successfully.");
+            return true;
+        } else {
+            LOGE_LIFECYCLE("Model reload failed after fallback");
+            return false;
+        }
+    }
+
+    LOGI_LIFECYCLE("Deterministic fallback complete: Vulkan -> CPU. No cached model params - caller must reload.");
+    return true;
+}
+
+bool RifeEngine::unloadModel() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    unloadModel_locked();
+    return true;
+}
+
+void RifeEngine::unloadModel_locked() {
+    if (rife_impl) {
+        rife_impl.reset();
+        model_loaded = false;
+        LOGI_LIFECYCLE("RIFE model unloaded");
+    }
+}
+
+bool RifeEngine::reloadModel(
+    AAssetManager* mgr,
+    const std::string& base_cache_dir,
+    const std::string& model_dir,
+    bool is_v2,
+    bool is_v4
+) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    unloadModel_locked();
+    return loadModelFromAssets_locked(mgr, base_cache_dir, model_dir, is_v2, is_v4);
 }
 
 std::string VulkanCapabilities::toString() const {
