@@ -489,6 +489,7 @@ int RIFE::load(const std::string& modeldir)
 
     if (vkdev && tta_temporal_mode)
     {
+        std::vector<ncnn::vk_specialization_type> specializations(0);
         if (!create_pipeline("rife_out_tta_temporal_avg",
                              rife_out_tta_temporal_avg_spv_data, rife_out_tta_temporal_avg_spv_data_size,
                              &rife_out_tta_temporal_avg, 8, 8, 1, specializations)) {
