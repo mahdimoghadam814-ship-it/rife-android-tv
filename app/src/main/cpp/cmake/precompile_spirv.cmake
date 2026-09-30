@@ -4,12 +4,21 @@
 # SHADER_REQUIRED: If ON (default), fail the build if precompilation fails.
 #                  If OFF, generate zero-size fallback header for optional shaders.
 
-# Find glslangValidator
+# Find glslangValidator - add common CI/Android NDK locations
 find_program(GLSLANG_VALIDATOR
     NAMES glslangValidator
     PATHS
         $ENV{ANDROID_NDK_HOME}/shader-tools
         $ENV{ANDROID_NDK_ROOT}/shader-tools
+        $ENV{ANDROID_SDK_ROOT}/ndk-bundle/shader-tools
+        $ENV{ANDROID_HOME}/ndk-bundle/shader-tools
+        /opt/android/ndk/shader-tools
+        /opt/android/ndk-*/shader-tools
+        /opt/android/sdk/ndk-bundle/shader-tools
+        /opt/android/sdk/ndk-*/shader-tools
+        /usr/local/lib/android/sdk/ndk-bundle/shader-tools
+        /usr/local/lib/android/sdk/ndk-*/shader-tools
+        /usr/lib/android/sdk/ndk-bundle/shader-tools
         /usr/bin
         /usr/local/bin
     DOC "glslangValidator executable"
