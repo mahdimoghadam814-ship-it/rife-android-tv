@@ -80,7 +80,8 @@ else()
 
     # Step 1: Extract #version line from shader source (must be first non-comment line)
     # Handle optional leading comments and whitespace
-    string(REGEX MATCH "^[ \t]*\n*[ \t]*#[ \t]*version[^\n]*\n" version_line "${shader_source}")
+    # First, strip leading comment lines and empty lines to find the #version directive
+    string(REGEX MATCH "^(//[^\n]*\n)*[ \t]*\n*[ \t]*#[ \t]*version[^\n]*\n" version_line "${shader_source}")
     if(NOT version_line)
         message(FATAL_ERROR "Shader ${SHADER_SRC} missing required #version directive at start of file")
     endif()
