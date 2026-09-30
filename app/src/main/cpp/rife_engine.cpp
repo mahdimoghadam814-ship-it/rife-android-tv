@@ -127,6 +127,10 @@ RifeEngine::RifeEngine()
       device_profile(DeviceProfile::UNKNOWN) {
 }
 
+RifeEngine::~RifeEngine() {
+    unloadModel_locked();
+}
+
 // Private helper to create and load RIFE instance with given GPU ID
 bool RifeEngine::createRifeInstance_locked(int gpu_id, const std::string& model_dir, bool is_v2, bool is_v4) {
     try {
