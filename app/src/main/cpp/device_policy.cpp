@@ -451,11 +451,6 @@ void DevicePolicy::buildResolutionPolicy(int input_width, int input_height) {
 }
 
 bool DevicePolicy::isKnownProblematicGpu(const DeviceIdentity& id, std::string& reason) {
-    if (isMaliG310(id.gpu_name)) {
-        reason = "Mali-G310 GPU detected. Vulkan disabled due to known glslang crash during shader compilation. RIFE will use CPU fallback.";
-        return true;
-    }
-
     if (isAdreno825(id.vendor_id, id.device_id)) {
         reason = "Adreno 825 GPU detected. Vulkan disabled due to known glslang crash in TIntermSelection traversal. RIFE will use CPU fallback.";
         return true;
