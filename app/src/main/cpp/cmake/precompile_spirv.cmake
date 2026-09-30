@@ -177,16 +177,16 @@ else()
         math(EXPR words_len "${words_len} - 1")
         string(SUBSTRING "${spv_words}" 0 ${words_len} spv_words)
 
-        # spv_data_size is in WORDS (uint32_t count) for the C++ registry
-        math(EXPR spv_data_size_words "${word_count}")
+        # spv_data_size is in BYTES (uint32_t count * 4) for the C++ registry validation
+        math(EXPR spv_data_size_bytes "${word_count} * 4")
 
         # Write the header file with uint32_t array
         file(WRITE ${SHADER_SPV_HEADER}
             "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = {${spv_words}};\n"
-            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = ${spv_data_size_words};\n"
+            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = ${spv_data_size_bytes};\n"
         )
 
-        message(STATUS "Generated ${SHADER_SPV_HEADER} with ${word_count} uint32_t words")
+        message(STATUS "Generated ${SHADER_SPV_HEADER} with ${word_count} uint32_t words (${spv_data_size_bytes} bytes)")
     else()
         message(WARNING "Failed to compile ${SHADER_SRC} to SPIR-V: ${error}")
         message(WARNING "Output: ${output}")
