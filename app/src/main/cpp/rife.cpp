@@ -563,7 +563,7 @@ int RIFE::load(const std::string& modeldir)
             const uint32_t* timestep_spv_data = tta_mode ? rife_v4_timestep_tta_spv_data : rife_v4_timestep_spv_data;
             size_t timestep_spv_data_size = tta_mode ? rife_v4_timestep_tta_spv_data_size : rife_v4_timestep_spv_data_size;
 
-            std::vector<ncnn::vk_specialization_type> specializations;
+            std::vector<ncnn::vk_specialization_type> specializations(0);
             if (!create_pipeline(tta_mode ? "rife_v4_timestep_tta" : "rife_v4_timestep",
                                  timestep_spv_data, timestep_spv_data_size,
                                  &rife_v4_timestep, 8, 8, 1, specializations)) {
