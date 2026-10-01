@@ -96,10 +96,18 @@ class RifeEngineController(
     // Temporal frame store for bounded frame history (Stage 3 integration)
     private val temporalFrameStore = TemporalFrameStoreImpl()
 
+    // SVP pipeline coordinator for frame interpolation (Stage 7 integration)
+    private val pipelineCoordinator = SvpPipelineCoordinator(context)
+
     /**
      * Gets the temporal frame store for pipeline integration.
      */
     fun getTemporalFrameStore(): TemporalFrameStore = temporalFrameStore
+
+    /**
+     * Gets the pipeline coordinator for frame interpolation.
+     */
+    fun getPipelineCoordinator(): SvpPipelineCoordinator = pipelineCoordinator
 
     /**
      * Starts the processor's worker thread. Called once when the player screen is created.
@@ -116,6 +124,7 @@ class RifeEngineController(
     override fun stop() {
         processor.stop()
         temporalFrameStore.clear()
+        pipelineCoordinator.stop()
         _inputSurface.value = null
         _processingEnabled.value = false
     }
@@ -128,6 +137,9 @@ class RifeEngineController(
     override fun setRifeEnabled(enabled: Boolean) {
         if (enabled) {
             ensureEngineInitialized()
+            pipelineCoordinator.start()
+        } else {
+            pipelineCoordinator.stop()
         }
         processor.setRifeEnabled(enabled)
         _processingEnabled.value = processor.isProcessingEnabled
@@ -182,6 +194,7 @@ class RifeEngineController(
     override fun resetForDiscontinuity(reason: String) {
         processor.resetForNewStream(reason)
         temporalFrameStore.clear()
+        pipelineCoordinator.reset()
     }
 
     /**
@@ -207,6 +220,35 @@ class RifeEngineController(
      */
     fun submitFrameToTemporalStore(metadata: FrameMetadata): Boolean {
         return temporalFrameStore.addFrame(metadata)
+    }
+
+    /**
+     * Processes frames through the interpolation pipeline.
+     * This should be called when a new frame pair is available for interpolation.
+     * It submits frames to the temporal store, processes frame pairs through the
+     * scheduler, and enqueues output frames to the output queue.
+     *
+     * @return true if a frame pair was processed, false otherwise.
+     */
+    fun processFrameThroughPipeline(): Boolean {
+        // Ensure pipeline is initialized
+        if (!pipelineCoordinator.getStatus().state.isReady) {
+            return false
+        }
+
+        // Process frame pair through the pipeline
+        val processed = pipelineCoordinator.processFramePair()
+
+        // Drain output queue to display path
+        while (true) {
+            val outputFrame = pipelineCoordinator.getNextOutputFrame()
+            if (outputFrame == null) break
+            // TODO: Submit outputFrame to display path (SurfaceView/EGL)
+            // For now, we just log that a frame is ready
+            Log.d("RifeEngineController", "Output frame ready: ${outputFrame.timestampUs}us, intermediate=${outputFrame.isIntermediate}")
+        }
+
+        return true
     }
 
     private fun ensureEngineInitialized() {

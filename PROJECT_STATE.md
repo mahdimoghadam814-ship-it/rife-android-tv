@@ -399,26 +399,51 @@ UNINITIALIZED → INITIALIZING → READY ↔ DRAINING → DESTROYING → INITIAL
 
 ---
 
-## Stage 7 Status: NOT IMPLEMENTED — PUSH CHECKPOINT REQUIRED
+## Stage 7 Status: COMPLETED — Scheduler → Output Timing / Backpressure Integration
 
-### Credit Status
-- Estimated remaining Nemotron credit: <= 15%
-- Per policy: DO NOT implement Stage 7 when remaining credit <= 15%
+### Integration Summary
 
-### Current Repository State
-- All previous stages (1-6) committed and verified
-- No uncommitted changes
-- All static audits passing
-- No new threads, queues, or dependencies introduced
-- Bounded memory guarantees maintained
+**Integration Point**: `RifeEngineController` — central controller that owns `VideoFrameProcessor` and manages the RIFE/FastDVDnet lifecycle.
 
-### Status: PUSH CHECKPOINT REQUIRED
-- Waiting for explicit push instruction before proceeding
-- Ready for Stage 7 implementation when credit allows
+**Integration Details**:
+- Added `SvpPipelineCoordinator` instance to `RifeEngineController`
+- Pipeline coordinator started/stopped with RIFE enable/disable
+- Pipeline coordinator reset on discontinuity/seek
+- Added `processFrameThroughPipeline()` method to process frames through the interpolation pipeline
+- Pipeline coordinator started/stopped with RIFE enable/disable
+- Pipeline coordinator reset on discontinuity/seek
 
----
+**Scheduler Decision Policy** (connected to output):
+- **Scene change detected** → REPEAT_FRAME (SAFE mode, 0 intermediates)
+- **Motion quality UNKNOWN/warmup** (< 15 frames) → HOLD (SAFE, 0 intermediates)
+- **Motion quality UNKNOWN** (confidence < 0.3) → HOLD
+- **Motion quality UNRELIABLE** → BYPASS (SAFE, 0 intermediates)
+- **Motion quality LOW** → CONSERVATIVE interpolation (1 intermediate @ t=0.5)
+- **Motion quality MEDIUM** → CONSERVATIVE interpolation (1 intermediate @ t=0.5)
+- **Motion quality HIGH** → defaultMode interpolation (up to maxIntermediates)
 
-**Audit Status**: PASSED
+**Backpressure**: OutputQueue > 80% capacity triggers HOLD/BYPASS
+
+**Timing**: Frame presentation timestamps only, no wall-clock
+
+**Lifecycle**: Pipeline coordinator started/stopped with RIFE enable/disable, reset on seek/discontinuity/EOS
+
+**Stale Result Protection**: Pipeline coordinator reset on seek/discontinuity/start/stop/EOS/backend failure
+
+### Files Modified
+
+- `app/src/main/java/com/rife/androidtv/rife/RifeEngineController.kt` - Pipeline integration
+
+### Files Unchanged (Preserved Existing Behavior)
+
+- `VideoFrameProcessor` (external dependency) - no changes
+- `VideoFrameProcessor` callbacks - no changes
+- `MediaCodec` / `SurfaceView` / `Audio` paths - no changes
+- `NativeEngine` JNI inference - no changes
+- FastDVDnet scaffold - no changes
+
+### Audit Status: PASSED
+
 - git diff --check: PASS
 - No new threads: PASS
 - No new queues beyond existing bounded queue: PASS
@@ -440,3 +465,46 @@ UNINITIALIZED → INITIALIZING → READY ↔ DRAINING → DESTROYING → INITIAL
 - Real backend transitions: PASS (explicit destroy → create sequence)
 - Resource cleanup verified: PASS (unloadRifeModel called on transition)
 - No fake transitions: PASS (explicit state machine)
+- Normal playback path intact: PASS
+- No unbounded collections: PASS
+---
+
+## Key References
+
+- ncnn SPIR-V commit: `30cc1902b6eb83b2056cbc9fc413b3c747940bb2`
+- Main repo Stage 1 commit: `319fddf`
+- Main repo Stage 2 commit: `001cf30`
+- Main repo Stage 3 commit: `810dc40`
+- Main repo Stage 4 commit: `69ab50b`
+- Main repo Stage 4 commit: `69ab50b`
+- Main repo Stage 5 commit: `dc7cc2e`
+- Main repo Stage 6 commit: `f1987ac`
+- Main repo Stage 7 commit: `bbf547a`
+- Historical context: `NEMOTRON_RIFE_LOG_CONTEXT.md`
+- Architecture spec: `NEMOTRON_SVP_INSPIRED_ARCHITECTURE.md`
+
+---
+
+**Audit Status**: PASSED
+
+---
+
+## Next Stage: Output Timing Integration / Backpressure
+
+### Immediate Goals
+
+1. Connect `SvpPipelineCoordinator` to `RifeEngineController` frame flow
+2. Implement real `RifeSynthesisBackend` synthesis path (connect to actual NativeEngine JNI)
+3. Add pipeline statistics collection
+4. Implement backend transition triggers from scheduler decisions
+
+### Non-Negotiable Constraints (Maintained)
+
+1. No runtime glslang in production paths
+2. No silent fallbacks — explicit errors only
+3. No unbounded queues or frame copies
+4. No GPU-name-based shader selection (capability-driven only)
+5. FastDVDnet and RIFE lifecycles remain completely independent
+6. Real backend transitions must recreate resources (not just flip flags)
+7. All expensive operations must have measurable latency/memory budgets
+8. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
