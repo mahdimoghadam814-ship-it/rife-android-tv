@@ -613,9 +613,9 @@ Comment at line 262-268: "This is a placeholder - real implementation would..."
 
 ---
 
-## VERDICT: **B — BRIDGE EXISTS BUT PIXEL HANDOFF IS INCOMPLETE**
+## VERDICT: **C — ARCHITECTURAL BLOCKER**
 
-**Meaning**: Media3 hooks (`VideoFrameProcessor` callbacks) are real, but the current implementation only carries metadata. The actual image contents never reach RIFE Vulkan, and RIFE output never reaches display.
+**Meaning**: Current Media3/NextPlayer integration prevents a safe real GPU pixel path without a larger renderer/video-sink/player modification.
 
 ---
 
@@ -624,9 +624,9 @@ Comment at line 262-268: "This is a placeholder - real implementation would..."
 The blocker is **fundamental**: `VideoFrameProcessor.Listener.onInputFrameAvailable(frame: VideoFrame)` provides only metadata (`presentationTimeUs`, `width`, `height`, `format`, `bufferInfo`). The actual pixel data in `VideoFrame` is **not accessible** via Media3's public API. The underlying `SurfaceTexture`/GL texture is not exposed.
 
 To fix this requires:
-- **Option A**: Fork `nextplayer` to expose frame texture callbacks
-- **Option B**: Replace NextPlayer's renderer with custom Media3 renderer that exposes textures
-- **Option C**: Use `MediaCodec` + `SurfaceTexture` directly, bypassing NextPlayer's renderer
+- **Option A**: Fork `androidx.media3` to expose frame texture callbacks in `VideoFrameProcessor`
+- **Option B**: Replace Media3's `VideoFrameProcessor` with custom implementation that exposes textures
+- **Option C**: Use `MediaCodec` + `SurfaceTexture` directly, bypassing Media3's `VideoFrameProcessor`
 
 **None of these are "minimal corrections" - they require architectural changes.**
 
@@ -634,12 +634,10 @@ To fix this requires:
 
 ## VERDICT: **C — ARCHITECTURAL BLOCKER**
 
----
-
-## FINAL AUDIT STATUS: **C — ARCHITECTURAL BLOCKER**
+## Final Audit Status: DESIGN DOCUMENTED — IMPLEMENTATION BLOCKED BY MEDIA3 API LIMITATION
 
 ### Explicit Blocker Statement
-**Real RIFE GPU interpolation on Mali-G310 cannot be completed without integrating with the `VideoFrameProcessor` from the `nextplayer` external library. The current architecture has a clean seam at the `VideoFrameProcessor` frame capture point, but the external library does not expose frame capture callbacks. A fork of the `nextplayer` library (Option A) or a custom `VideoFrameProcessor` implementation (Option B) is required to bridge the GPU texture pipeline to the RIFE Vulkan implementation.**
+**Real RIFE GPU interpolation on Mali-G310 cannot be completed without integrating with the `VideoFrameProcessor` from Media3 (`androidx.media3.exoplayer.video`). The current architecture has a clean seam at the `VideoFrameProcessor` frame capture point, but Media3's public API does not expose frame texture callbacks. A fork of `androidx.media3` (Option A) or a custom `VideoFrameProcessor` implementation (Option B) is required to bridge the GPU texture pipeline to the RIFE Vulkan implementation.**
 
 ---
 
