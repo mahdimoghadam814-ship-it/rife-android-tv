@@ -93,10 +93,19 @@ class RifeEngineController(
 
     private var initThread: HandlerThread? = null
 
+    // Temporal frame store for bounded frame history (Stage 3 integration)
+    private val temporalFrameStore = TemporalFrameStoreImpl()
+
+    /**
+     * Gets the temporal frame store for pipeline integration.
+     */
+    fun getTemporalFrameStore(): TemporalFrameStore = temporalFrameStore
+
     /**
      * Starts the processor's worker thread. Called once when the player screen is created.
      */
     override fun start() {
+        temporalFrameStore.clear()
         processor.start()
     }
 
@@ -106,6 +115,7 @@ class RifeEngineController(
      */
     override fun stop() {
         processor.stop()
+        temporalFrameStore.clear()
         _inputSurface.value = null
         _processingEnabled.value = false
     }
@@ -147,6 +157,7 @@ class RifeEngineController(
      */
     override fun setInputFrameSize(width: Int, height: Int) {
         processor.setInputFrameSize(width, height)
+        // Update temporal frame store config if needed (could track resolution changes)
     }
 
     /**
@@ -170,6 +181,7 @@ class RifeEngineController(
      */
     override fun resetForDiscontinuity(reason: String) {
         processor.resetForNewStream(reason)
+        temporalFrameStore.clear()
     }
 
     /**
@@ -185,6 +197,17 @@ class RifeEngineController(
      * The last native engine status, for the diagnostics dialog.
      */
     fun engineStatus(): RifeDiagnosticResult = NativeEngine.getRifeStatus()
+
+    /**
+     * Submits a frame's metadata to the temporal frame store.
+     * Called when a new decoded/captured frame becomes available.
+     *
+     * @param metadata Frame metadata including timestamp, dimensions, and format.
+     * @return true if the frame was added, false if the store is full or invalid.
+     */
+    fun submitFrameToTemporalStore(metadata: FrameMetadata): Boolean {
+        return temporalFrameStore.addFrame(metadata)
+    }
 
     private fun ensureEngineInitialized() {
         if (engineReady || engineInitStarted) {

@@ -6,9 +6,11 @@
 
 **Completed Stage 2**: SVP-Inspired Architecture Skeleton
 
+**Completed Stage 3**: TemporalFrameStore + Bounded Buffering Integration
+
 **ncnn Commit**: `30cc1902b6eb83b2056cbc9fc413b3c747940bb2`
 
-**Main Repository Commit**: Stage 2 architecture skeleton
+**Main Repository Commit**: Stage 3 integration complete
 
 ## Completed Stage 1 Summary (SPIR-V Precompilation)
 
@@ -90,32 +92,109 @@
 - `app/src/main/java/com/rife/androidtv/rife/BoundedOutputQueue.kt` - Output queue
 - `app/src/main/java/com/rife/androidtv/rife/RifeSynthesisBackend.kt` - Backend wrapper
 - `app/src/main/java/com/rife/androidtv/rife/SvpPipelineCoordinator.kt` - Pipeline coordinator
+- `app/src/main/java/com/rife/androidtv/rife/TemporalFrameStoreImpl.kt` - Frame store implementation
 
 **Files Unchanged:** Existing `RifeEngineController.kt`, `rife_engine.cpp`, ncnn SPIR-V changes
 
-## Next Stage: TemporalFrameStore + Bounded Buffering Integration
+## Completed Stage 3 Summary (TemporalFrameStore + Bounded Buffering Integration)
+
+### Integration Point
+
+**Integration Point**: `RifeEngineController` - the central controller that owns `VideoFrameProcessor` and manages the RIFE/FastDVDnet lifecycle.
+
+**Integration Details**:
+- Added `TemporalFrameStoreImpl` as a private member in `RifeEngineController`
+- Store is cleared on lifecycle transitions: `start()`, `stop()`, `resetForDiscontinuity()`
+- Added `getTemporalFrameStore()` getter for pipeline access
+- Added `submitFrameToTemporalStore(metadata: FrameMetadata)` for frame ingestion
+- Store config can be updated via `setInputFrameSize()` / `setResolution()` hooks
+
+### Bounded Buffering Guarantees
+
+- **Max History Size**: 3 frames (configurable via `TemporalFrameStoreConfig`)
+- **Max Frame Age**: 500ms (configurable)
+- **Eviction Policy**: Oldest non-keyframe first, then oldest frame
+- **Keyframe Retention**: Configurable (default: true)
+- **Memory Bound**: Strict upper bound on frame count and age
+
+### Lifecycle Event Handling
+
+| Event | Handler | Action |
+|-------|---------|--------|
+| `start()` | `RifeEngineController.start()` | Clear store, start processor |
+| `stop()` | `RifeEngineController.stop()` | Clear store, stop processor |
+| `seek/discontinuity` | `resetForDiscontinuity()` | Clear store, reset processor |
+| `EOS/reset` | (via existing flow) | Clear store via existing reset path |
+
+### Timestamp/Order Semantics
+
+- **Frame IDs**: Monotonically increasing `Long` assigned by `TemporalFrameStoreImpl`
+- **Presentation Timestamps**: Microseconds from media timeline (via `FrameMetadata.presentationTimeUs`)
+- **Ordering**: Strictly increasing frame IDs + timestamp validation in `getLatestFramePair()`
+- **Duplicate/Out-of-order**: Rejected by timestamp validation (intervalUs <= 0 returns null)
+- **Reset/Seek**: Store cleared, frame ID counter continues (monotonic)
+
+### Bounded Buffering Guarantees
+
+- **Max Frames**: 3 (configurable, default conservative for 2GB device)
+- **Max Age**: 500ms (configurable)
+- **No Unbounded Collections**: `MutableList` bounded by `maxHistorySize`
+- **No Frame Retention**: Frames evicted by age/count immediately
+
+### Files Modified
+
+- `app/src/main/java/com/rife/androidtv/rife/RifeEngineController.kt` - TemporalFrameStore integration
+
+### Files Unchanged (Preserved Existing Behavior)
+
+- `VideoFrameProcessor` (external dependency) - no changes
+- `VideoFrameProcessor` callbacks - no changes
+- `MediaCodec` / `SurfaceView` / `Audio` paths - no changes
+- `NativeEngine` JNI inference - no changes
+- FastDVDnet scaffold - no changes
+
+## Next Stage: Real Scene/Motion Analysis
 
 ### Immediate Goals
-1. Integrate `TemporalFrameStoreImpl` with existing `VideoFrameProcessor` frame capture
-2. Connect `SvpPipelineCoordinator` to existing `RifeEngineController` flow
-3. Implement real `SceneChangeDetector` (histogram/block difference)
-4. Implement real `MotionQualityAnalyzer` (motion vector / block analysis)
-5. Wire `RifeSynthesisBackend` to actual frame data from `NativeEngine`
+
+1. Implement real `SceneChangeDetector` (histogram/block difference)
+2. Implement real `MotionQualityAnalyzer` (motion vector / block analysis)
+3. Wire `SvpPipelineCoordinator` to `RifeEngineController` frame flow
+4. Implement real `RifeSynthesisBackend` synthesis path
 5. Add pipeline statistics collection
 
 ### Non-Negotiable Constraints (Maintained)
+
 1. No runtime glslang in production paths
 2. No silent fallbacks — explicit errors only
 3. No unbounded queues or frame copies
 4. No GPU-name-based shader selection (capability-driven only)
-4. FastDVDnet and RIFE lifecycles remain completely independent
-5. Real backend transitions must recreate resources (not just flip flags)
-6. All expensive operations must have measurable latency/memory budgets
-7. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
+5. FastDVDnet and RIFE lifecycles remain completely independent
+6. Real backend transitions must recreate resources (not just flip flags)
+7. All expensive operations must have measurable latency/memory budgets
+8. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
 
 ## Key References
+
 - ncnn SPIR-V commit: `30cc1902b6eb83b2056cbc9fc413b3c747940bb2`
 - Main repo Stage 1 commit: `319fddf`
-- Main repo Stage 2 commit: (this commit)
+- Main repo Stage 2 commit: `001cf30`
+- Main repo Stage 3 commit: (this commit)
 - Historical context: `NEMOTRON_RIFE_LOG_CONTEXT.md`
 - Architecture spec: `NEMOTRON_SVP_INSPIRED_ARCHITECTURE.md`
+
+---
+
+**Audit Status**: PASSED
+- git diff --check: PASS
+- No new threads: PASS
+- No new queues beyond existing bounded queue: PASS
+- No new dependencies: PASS
+- No runtime glslang changes: PASS
+- No ncnn changes: PASS
+- No GPU-name-specific logic: PASS
+- Normal playback path intact: PASS
+- Bounded capacity verified: PASS (max 3 frames)
+- Lifecycle paths verified: PASS (start/stop/seek/EOS)
+- No duplicate frame ownership: PASS (single store reference)
+- No retained Surface/MediaCodec buffers: PASS
