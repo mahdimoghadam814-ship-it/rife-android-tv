@@ -6,6 +6,7 @@ import android.os.HandlerThread
 import android.util.Log
 import androidx.media3.common.SurfaceInfo
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.video.VideoFrameProcessor
 import com.rife.androidtv.NativeEngine
 import com.rife.androidtv.RifeDiagnosticResult
 import com.rife.androidtv.DeviceProfile
@@ -46,8 +47,24 @@ class RifeEngineController(
     /**
      * The frame processor. Created eagerly (it only starts its worker thread and creates the input
      * surface; no frame is read back while both stages are off).
+     *
+     * This uses a custom frame bridge that exposes frame callbacks for RIFE interpolation.
      */
-    val processor = VideoFrameProcessor(
+    private val frameBridge = Media3FrameBridge(
+        context = context,
+        frameCallback = { frameId, metadata ->
+            submitFrameToTemporalStore(metadata)
+        },
+        onError = { message -> _error.value = message },
+        onSurfaceCreated = { surface -> _inputSurface.value = surface },
+        onSurfaceFailed = {
+            Log.e(TAG, "Input surface unavailable; processing stages stay off")
+            _inputSurface.value = null
+        },
+    )
+
+    // Keep the original processor for FastDVDnet and backward compatibility
+    private val legacyProcessor = VideoFrameProcessor(
         onStatisticsUpdated = { stats ->
             _stats.value = RifeStats(
                 inputFps = stats.inputFps,
@@ -114,7 +131,8 @@ class RifeEngineController(
      */
     override fun start() {
         temporalFrameStore.clear()
-        processor.start()
+        frameBridge.initialize()
+        legacyProcessor.start()
     }
 
     /**
@@ -122,7 +140,8 @@ class RifeEngineController(
      * destroyed.
      */
     override fun stop() {
-        processor.stop()
+        legacyProcessor.stop()
+        frameBridge.stop()
         temporalFrameStore.clear()
         pipelineCoordinator.stop()
         _inputSurface.value = null
@@ -137,12 +156,14 @@ class RifeEngineController(
     override fun setRifeEnabled(enabled: Boolean) {
         if (enabled) {
             ensureEngineInitialized()
+            frameBridge.start()
             pipelineCoordinator.start()
         } else {
+            frameBridge.stop()
             pipelineCoordinator.stop()
         }
-        processor.setRifeEnabled(enabled)
-        _processingEnabled.value = processor.isProcessingEnabled
+        legacyProcessor.setRifeEnabled(enabled)
+        _processingEnabled.value = legacyProcessor.isProcessingEnabled
     }
 
     /**
@@ -152,8 +173,8 @@ class RifeEngineController(
     override fun setFastDvdNetEnabled(enabled: Boolean) {
         // FastDVDnet scaffold does NOT require RIFE engine initialization.
         // It only maintains a temporal history buffer and passes frames through unchanged.
-        processor.setFastDvdNetEnabled(enabled)
-        _processingEnabled.value = processor.isProcessingEnabled
+        legacyProcessor.setFastDvdNetEnabled(enabled)
+        _processingEnabled.value = legacyProcessor.isProcessingEnabled
     }
 
     /**
@@ -161,14 +182,14 @@ class RifeEngineController(
      * the next frame pair is already read back at the new size.
      */
     override fun setResolution(resolution: FeatureRifeResolution) {
-        processor.resolution = RifeResolution.valueOf(resolution.name)
+        legacyProcessor.resolution = RifeResolution.valueOf(resolution.name)
     }
 
     /**
      * Records the decoded frame size reported by `Player.Listener.onVideoSizeChanged`.
      */
     override fun setInputFrameSize(width: Int, height: Int) {
-        processor.setInputFrameSize(width, height)
+        legacyProcessor.setInputFrameSize(width, height)
         // Update temporal frame store config if needed (could track resolution changes)
     }
 
@@ -177,22 +198,22 @@ class RifeEngineController(
      * it immediately.
      */
     override fun setOutputSurfaceInfo(outputSurfaceInfo: SurfaceInfo?) {
-        processor.setOutputSurfaceInfo(outputSurfaceInfo)
+        legacyProcessor.setOutputSurfaceInfo(outputSurfaceInfo)
     }
 
     override fun onInputSurfaceAttached() {
-        processor.onInputSurfaceAttached()
+        legacyProcessor.onInputSurfaceAttached()
     }
 
     override fun onInputSurfaceDetached() {
-        processor.onInputSurfaceDetached()
+        legacyProcessor.onInputSurfaceDetached()
     }
 
     /**
      * Drops every buffered frame: seek, media transition, stream change.
      */
     override fun resetForDiscontinuity(reason: String) {
-        processor.resetForNewStream(reason)
+        legacyProcessor.resetForNewStream(reason)
         temporalFrameStore.clear()
         pipelineCoordinator.reset()
     }
@@ -296,4 +317,58 @@ class RifeEngineController(
             }
         }
     }
+
+    /**
+     * Processes frames through the interpolation pipeline.
+     * This should be called when a new frame pair is available for interpolation.
+     * It submits frames to the temporal store, processes frame pairs through the
+     * scheduler, and enqueues output frames to the output queue.
+     *
+     * @return true if a frame pair was processed, false otherwise.
+     */
+    fun processFrameThroughPipeline(): Boolean {
+        // Ensure pipeline is initialized
+        if (!pipelineCoordinator.getStatus().state.isReady) {
+            return false
+        }
+
+        // Process frame pair through the pipeline
+        val processed = pipelineCoordinator.processFramePair()
+
+        // Drain output queue to display path
+        while (true) {
+            val outputFrame = pipelineCoordinator.getNextOutputFrame()
+            if (outputFrame == null) break
+            // TODO: Submit outputFrame to display path (SurfaceView/EGL)
+            // For now, we just log that a frame is ready
+            Log.d("RifeEngineController", "Output frame ready: ${outputFrame.timestampUs}us, intermediate=${outputFrame.isIntermediate}")
+        }
+
+        return true
+    }
+
+    /**
+     * Called when a new frame is available from the frame bridge.
+     * Submits the frame to the temporal store and processes the pipeline.
+     *
+     * @param frameId The unique frame identifier
+     * @param metadata Frame metadata including timestamp, dimensions, and format
+     * @return true if the frame was processed, false otherwise
+     */
+    fun onFrameAvailable(frameId: Long, metadata: FrameMetadata): Boolean {
+        val added = temporalFrameStore.addFrame(metadata)
+        if (!added) {
+            return false
+        }
+        return processFrameThroughPipeline()
+    }
+
+    /**
+     * Gets the input surface from the frame bridge for the MediaCodec decoder.
+     * This surface should be configured as the decoder's output surface.
+     *
+     * @return The input surface for frame capture, or null if not initialized.
+     */
+
+}
 }

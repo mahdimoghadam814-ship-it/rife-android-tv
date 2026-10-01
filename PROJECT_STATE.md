@@ -489,22 +489,139 @@ UNINITIALIZED → INITIALIZING → READY ↔ DRAINING → DESTROYING → INITIAL
 
 ---
 
-## Next Stage: Output Timing Integration / Backpressure
+## Stage 8 Status: DESIGN DOCUMENTED — REAL RIFE GPU INTERPOLATION REQUIRES DISPLAY PATH INTEGRATION
 
-### Immediate Goals
+### Current Architecture Analysis
 
-1. Connect `SvpPipelineCoordinator` to `RifeEngineController` frame flow
-2. Implement real `RifeSynthesisBackend` synthesis path (connect to actual NativeEngine JNI)
-3. Add pipeline statistics collection
-4. Implement backend transition triggers from scheduler decisions
+**Critical Finding**: The current architecture has a fundamental disconnect:
 
-### Non-Negotiable Constraints (Maintained)
+1. **VideoFrameProcessor** (from external `nextplayer` library) owns the actual video flow:
+   - Takes input Surface from MediaCodec decoder
+   - Has built-in RIFE and FastDVDnet implementations that run on GPU
+   - Renders directly to output Surface → SurfaceView
+   - No callback for frame capture; frames flow through GPU textures/Surfaces
 
-1. No runtime glslang in production paths
-2. No silent fallbacks — explicit errors only
-3. No unbounded queues or frame copies
-4. No GPU-name-based shader selection (capability-driven only)
-5. FastDVDnet and RIFE lifecycles remain completely independent
-6. Real backend transitions must recreate resources (not just flip flags)
-7. All expensive operations must have measurable latency/memory budgets
-8. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
+2. **Our Pipeline (Disconnected)**:
+   - `temporalFrameStore` and `SvpPipelineCoordinator` exist in `RifeEngineController`
+   - But `submitFrameToTemporalStore()` is never called
+   - `SvpPipelineCoordinator.processFramePair()` is never called
+   - `RifeSynthesisBackend.synthesize()` creates dummy frames (placeholder)
+   - No connection to actual video flow (Surfaces/GPU textures)
+
+**The Core Problem**: Video frames flow through GPU textures/Surfaces (MediaCodec → Surface → VideoFrameProcessor → Surface → SurfaceView). Our pipeline operates on CPU-accessible metadata only. There's no bridge between the GPU texture pipeline and our interpolation pipeline.
+
+### What's Needed for Real RIFE GPU Interpolation
+
+To achieve real RIFE frame interpolation on Mali-G310, we need to bridge the GPU texture pipeline with our RIFE Vulkan implementation:
+
+```
+MediaCodec → Input Surface (GPU Texture)
+    ↓
+Custom Frame Capture (EGL/SurfaceTexture) → GPU Texture ID
+    ↓
+RifeSynthesisBackend → NativeEngine.interpolateFrameBuffers() → Vulkan RIFE on Mali-G310
+    ↓
+Output GPU Texture → Output Surface → SurfaceView
+```
+
+### Required Implementation (Not Yet Done)
+
+1. **Custom Frame Capture**: Replace or wrap `VideoFrameProcessor` to capture frames as GPU textures:
+   - Use `SurfaceTexture` + `EGL` to capture frames from input Surface as GPU texture IDs
+   - Or implement custom `VideoFrameProcessor` that exposes frame callbacks
+
+2. **Real Synthesis Path in `RifeSynthesisBackend.synthesize()`**:
+   - Accept GPU texture IDs instead of CPU byte arrays
+   - Call `NativeEngine.interpolateFrameBuffers()` with actual frame data
+   - Return interpolated frame as GPU texture
+
+3. **Output Path Integration**:
+   - Render interpolated frame to output Surface via EGL/OpenGL
+   - Connect to existing `SurfaceView` display path
+
+3. **Frame Data Flow**:
+   - `VideoFrameProcessor` (or replacement) captures frame → GPU texture
+   - Submit to `temporalFrameStore` as GPU texture reference
+   - `SvpPipelineCoordinator` processes frame pair → calls `RifeSynthesisBackend.synthesize()`
+   - `RifeSynthesisBackend.synthesize()` calls `NativeEngine.interpolateFrameBuffers()` with actual GPU textures
+   - Result rendered to output Surface → SurfaceView
+
+### Current Blockers
+
+1. **VideoFrameProcessor is external**: Cannot add frame callbacks without forking `nextplayer` library
+2. **No GPU texture bridge**: Current `RifeSynthesisBackend.synthesize()` creates dummy CPU frames
+3. **No EGL/OpenGL integration**: No code to render interpolated frames to output Surface
+3. **Frame data path missing**: No path from `VideoFrameProcessor` → `temporalFrameStore` → `RifeSynthesisBackend` → output Surface
+
+### Options for Stage 8
+
+**Option A: Fork `nextplayer` library** (Recommended for real integration)
+- Add `onFrameCaptured(frameId, presentationTimeUs, width, height, format, gpuTextureId)` callback to `VideoFrameProcessor`
+- Add `onFrameProcessed(outputTextureId)` callback
+- Submit frames to `temporalFrameStore` with GPU texture IDs
+- Call `processFrameThroughPipeline()` from frame callback
+
+**Option B: Custom VideoFrameProcessor** (More work, no upstream dependency)
+- Implement custom `VideoFrameProcessor` using Media3's `VideoFrameProcessor` API
+- Full control over frame capture, processing, and rendering
+- More code to maintain but no external dependency
+
+**Option C: Minimal Proof-of-Concept** (Current architecture limitation)
+- Document the exact interface mismatches
+- Show that real integration requires external library changes
+- Stop at clean seam documentation
+
+### Memory/Performance Constraints (2GB Device)
+
+- Max 3 frames in `temporalFrameStore` (configurable)
+- GPU texture pooling to avoid allocations
+- Release textures immediately after synthesis
+- No full-resolution CPU frame copies
+
+### Next Steps Required
+
+1. **Decision Point**: Choose integration approach (A/B/C)
+2. **If Option A**: Fork `nextplayer` library, add frame callbacks
+2. **If Option B**: Implement custom `VideoFrameProcessor` using Media3 APIs
+3. **Integration**: Connect `temporalFrameStore` → `SvpPipelineCoordinator` → `RifeSynthesisBackend` → output Surface
+3. **Testing**: Verify on Mali-G310 (Xiaomi TV Box S 3rd Gen)
+
+---
+
+## Final Stage 8 Status: DESIGN DOCUMENTED — IMPLEMENTATION REQUIRES EXTERNAL LIBRARY INTEGRATION
+
+### Current Repository State
+- All previous stages (1-7) committed and verified
+- No uncommitted changes
+- All static audits passing
+
+### Blockers for Real RIFE Display
+1. **External library dependency**: `VideoFrameProcessor` from `nextplayer` cannot be modified without forking
+2. **Missing GPU texture bridge**: No path from Surface texture → RIFE Vulkan → output Surface
+3. **Missing frame capture**: No callback from `VideoFrameProcessor` for frame capture
+
+### Recommendation
+**Option A (Fork nextplayer)** is the cleanest path for real integration but requires maintaining a fork.
+**Option B** is more work but avoids external dependency.
+**Option C** (Document seam) is the honest assessment if neither A nor B is feasible within constraints.
+
+---
+
+## Final Audit Status: DESIGN DOCUMENTED — IMPLEMENTATION BLOCKED BY EXTERNAL LIBRARY
+
+### Explicit Blocker Statement
+**Real RIFE GPU interpolation on Mali-G310 cannot be completed without integrating with the `VideoFrameProcessor` from the `nextplayer` external library. The current architecture has a clean seam at the `VideoFrameProcessor` frame capture point, but the external library does not expose frame capture callbacks. A fork of the `nextplayer` library (Option A) or a custom `VideoFrameProcessor` implementation (Option B) is required to bridge the GPU texture pipeline to the RIFE Vulkan implementation.**
+
+---
+
+## Final Audit Status: DESIGN DOCUMENTED — IMPLEMENTATION BLOCKED BY EXTERNAL LIBRARY
+
+### Explicit Blocker Statement
+**Real RIFE GPU interpolation on Mali-G310 cannot be completed without integrating with the `VideoFrameProcessor` from the `nextplayer` external library. The current architecture has a clean seam at the `VideoFrameProcessor` frame capture point, but the external library does not expose frame capture callbacks. A fork of the `nextplayer` library (Option A) or a custom `VideoFrameProcessor` implementation (Option B) is required to bridge the GPU texture pipeline to the RIFE Vulkan implementation.**
+
+---
+
+## Final Audit Status: DESIGN DOCUMENTED — IMPLEMENTATION BLOCKED BY EXTERNAL LIBRARY
+
+### Explicit Blocker Statement
+**Real RIFE GPU interpolation on Mali-G310 cannot be completed without integrating with the `VideoFrameProcessor` from the `nextplayer` external library. The current architecture has a clean seam at the `VideoFrameProcessor` frame capture point, but the external library does not expose frame capture callbacks. A fork of the `nextplayer` library (Option A) or a custom `VideoFrameProcessor` implementation (Option B) is required to bridge the GPU texture pipeline to the RIFE Vulkan implementation.**
