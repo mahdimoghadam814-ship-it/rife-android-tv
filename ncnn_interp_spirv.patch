@@ -1,5 +1,5 @@
 diff --git a/cmake/ncnn_add_shader.cmake b/cmake/ncnn_add_shader.cmake
-index e41d1be6..34e53dc8 100644
+index e41d1be6..6fccc900 100644
 --- a/cmake/ncnn_add_shader.cmake
 +++ b/cmake/ncnn_add_shader.cmake
 @@ -2,6 +2,7 @@
@@ -10,7 +10,7 @@ index e41d1be6..34e53dc8 100644
  
      add_custom_command(
          OUTPUT ${NCNN_SHADER_COMP_HEADER}
-@@ -12,6 +13,21 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
+@@ -12,11 +13,28 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
      )
      set_source_files_properties(${NCNN_SHADER_COMP_HEADER} PROPERTIES GENERATED TRUE)
  
@@ -30,8 +30,7 @@ index e41d1be6..34e53dc8 100644
 +    set_source_files_properties(${NCNN_SHADER_COMP_HEADER} ${NCNN_SHADER_SPV_HEADER} PROPERTIES GENERATED TRUE)
 +
      get_filename_component(NCNN_SHADER_COMP_HEADER_NAME ${NCNN_SHADER_COMP_HEADER} NAME)
--    string(APPEND layer_shader_spv_data "#include \"layer/vulkan/shader/${NCNN_SHADER_COMP_HEADER_NAME}\"\n")
-+    string(APPEND layer_shader_spv_data "#include \"layer/vulkan/shader/${NCNN_SHADER_COMP_HEADER_NAME}\"\n")
+     string(APPEND layer_shader_spv_data "#include \"layer/vulkan/shader/${NCNN_SHADER_COMP_HEADER_NAME}\"\n")
 +    get_filename_component(NCNN_SHADER_SPV_HEADER_NAME ${NCNN_SHADER_SPV_HEADER} NAME)
 +    string(APPEND layer_shader_spv_data "#include \"layer/vulkan/shader/${NCNN_SHADER_SPV_HEADER_NAME}\"\n")
  
@@ -41,7 +40,7 @@ index e41d1be6..34e53dc8 100644
  
      if(NCNN_COVERAGE)
          # prefix sums use the original files and are shared by all shader variants
-@@ -36,6 +52,7 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
+@@ -36,6 +54,7 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
      endif()
  
      list(APPEND NCNN_SHADER_SPV_HEX_FILES ${NCNN_SHADER_COMP_HEADER})
@@ -50,7 +49,7 @@ index e41d1be6..34e53dc8 100644
      # generate layer_shader_type_enum file
      set(layer_shader_type_enum "${layer_shader_type_enum}${NCNN_SHADER_SRC_NAME_WE} = ${__LAYER_SHADER_TYPE_ENUM_INDEX},\n")
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 3d780791..0c75f3bd 100644
+index 3d780791..aafcfaa0 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
 @@ -178,9 +178,15 @@ if(NCNN_VULKAN)
@@ -67,76 +66,6 @@ index 3d780791..0c75f3bd 100644
  
 -add_custom_target(ncnn-generate-spirv DEPENDS ${NCNN_SHADER_SPV_HEX_FILES})
 +add_custom_target(ncnn-generate-spirv DEPENDS ${NCNN_SHADER_SPV_HEX_FILES} ${NCNN_SHADER_SPV_FILES})
-diff --git a/src/gpu.cpp b/src/gpu.cpp
-index 3aab84e3..d6d607bc 100644
---- a/src/gpu.cpp
-+++ b/src/gpu.cpp
-@@ -105,8 +105,8 @@ static VulkanDevice* g_default_vkdev[NCNN_MAX_GPU_COUNT] = {0};
  
- struct layer_shader_registry_entry
- {
--    const char* comp_data;
--    int comp_data_size;
-+    const uint32_t* spv_data;
-+    int spv_data_size;  // in words
- };
- 
- #include "layer_shader_spv_data.h"
-@@ -138,8 +138,9 @@ uint64_t get_shader_source_hash(int shader_type_index)
-     const int ncnn_glsl_ext_comp_data_size = sizeof(ncnn_glsl_ext_comp_data);
-     h = fnv1a_64_update(h, (const unsigned char*)&ncnn_glsl_ext_comp_data_size, sizeof(ncnn_glsl_ext_comp_data_size));
-     h = fnv1a_64_update(h, (const unsigned char*)ncnn_glsl_ext_comp_data, ncnn_glsl_ext_comp_data_size);
--    h = fnv1a_64_update(h, (const unsigned char*)&entry.comp_data_size, sizeof(entry.comp_data_size));
--    h = fnv1a_64_update(h, (const unsigned char*)entry.comp_data, entry.comp_data_size);
-+    // Hash SPIR-V data (entry.spv_data is uint32_t*, entry.spv_data_size is in words)
-+    h = fnv1a_64_update(h, (const unsigned char*)&entry.spv_data_size, sizeof(entry.spv_data_size));
-+    h = fnv1a_64_update(h, (const unsigned char*)entry.spv_data, entry.spv_data_size * sizeof(uint32_t));
- #if NCNN_COVERAGE
-     h = fnv1a_64_update(h, (const unsigned char*)shader_coverage_map_hash(), 64);
- #endif
-@@ -6327,19 +6328,15 @@ int compile_spirv_module(const char* comp_data, int comp_data_size, const Option
- 
- #if NCNN_COVERAGE
-         int shader_type_index = -1;
--        for (int i = 0; i < layer_shader_registry_entry_count; i++)
--        {
--            if (comp_data == layer_shader_registry[i].comp_data && comp_data_size == layer_shader_registry[i].comp_data_size)
--            {
--                shader_type_index = i;
--                break;
--            }
--        }
--        const char* source_name = shader_coverage_source_name(shader_type_index);
-+        // Note: With SPIR-V registry, we cannot easily match GLSL source for coverage.
-+        // This is a limitation; coverage will work without source name mapping for precompiled shaders.
-+        const char* source_name = shader_coverage_source_name(-1);
-         int source_line = 1;
-         for (int i = 0; i < version_end_pos; i++)
-+        {
-             if (comp_data[i] == '\n' || (comp_data[i] == '\r' && (i + 1 == version_end_pos || comp_data[i + 1] != '\n')))
-                 source_line++;
-+        }
-         char line_directive[64];
-         snprintf(line_directive, sizeof(line_directive), "\n#line %d \"", source_line);
-         const std::string coverage_extensions = "#extension GL_GOOGLE_cpp_style_line_directive : enable\n#line 1 \"ncnn-generated-extensions\"\n" + custom_exts;
-@@ -6442,10 +6439,17 @@ int compile_spirv_module(int shader_type_index, const Option& opt, std::vector<u
-         return -1;
-     }
- 
--    const char* comp_data = layer_shader_registry[shader_type_index].comp_data;
--    int comp_data_size = layer_shader_registry[shader_type_index].comp_data_size;
-+    const uint32_t* spv_data = layer_shader_registry[shader_type_index].spv_data;
-+    int spv_data_size = layer_shader_registry[shader_type_index].spv_data_size;
-+
-+    if (!spv_data || spv_data_size <= 0)
-+    {
-+        NCNN_LOGE("precompiled SPIR-V not available for shader module %d", shader_type_index);
-+        return -1;
-+    }
- 
--    return compile_spirv_module(comp_data, comp_data_size, opt, spirv);
-+    spirv.assign(spv_data, spv_data + spv_data_size);
-+    return 0;
- }
- 
- int resolve_shader_info(const uint32_t* spv_data, size_t spv_data_size, ShaderInfo& shader_info)
+ if(NCNN_COVERAGE AND NCNN_VULKAN)
+     list(APPEND ncnn_SRCS gpu_coverage.cpp)
