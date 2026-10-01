@@ -16,22 +16,47 @@ set(NCNN_DISABLE_EXCEPTION OFF CACHE BOOL "" FORCE)
 get_filename_component(NCNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/ncnn" ABSOLUTE)
 
 if (EXISTS "${NCNN_DIR}/CMakeLists.txt")
-    # Apply ncnn interp shader SPIR-V precompilation patch before building ncnn
-    # Patch file is at repository root (4 levels up from app/src/main/cpp)
-    get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../" ABSOLUTE)
-    execute_process(
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${REPO_ROOT}/ncnn_interp_spirv.patch"
-            "${CMAKE_CURRENT_BINARY_DIR}/ncnn_interp_spirv.patch"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-    )
-    execute_process(
-        COMMAND git apply "${CMAKE_CURRENT_BINARY_DIR}/ncnn_interp_spirv.patch"
-        WORKING_DIRECTORY "${NCNN_DIR}"
-        RESULT_VARIABLE PATCH_RESULT
-    )
-    if(NOT PATCH_RESULT EQUAL 0)
-        message(FATAL_ERROR "Failed to apply ncnn interp SPIR-V patch. Build cannot continue without SPIR-V precompilation.")
+    # Check if ncnn already contains the interp SPIR-V precompilation changes.
+    # The fix commit (56772c65) adds interp shaders to the precompilation list in src/CMakeLists.txt.
+    # We check for the presence of interp.comp in the ncnn shader list to avoid re-applying the patch.
+    set(NCNN_ALREADY_PATCHED FALSE)
+    if(EXISTS "${NCNN_DIR}/src/CMakeLists.txt")
+        file(READ "${NCNN_DIR}/src/CMakeLists.txt" ncnn_cmake_content)
+        if(ncnn_cmake_content MATCHES "interp\\.comp")
+            set(NCNN_ALREADY_PATCHED TRUE)
+            message(STATUS "ncnn already contains interp SPIR-V precompilation changes (commit 56772c65 or later). Skipping patch.")
+        endif()
+    endif()
+
+    if(NOT NCNN_ALREADY_PATCHED)
+        # Apply ncnn interp shader SPIR-V precompilation patch before building ncnn
+        # Patch file is at repository root (4 levels up from app/src/main/cpp)
+        get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../../../" ABSOLUTE)
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${REPO_ROOT}/ncnn_interp_spirv.patch"
+                "${CMAKE_CURRENT_BINARY_DIR}/ncnn_interp_spirv.patch"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        )
+        # First check if patch can be applied cleanly
+        execute_process(
+            COMMAND git apply --check "${CMAKE_CURRENT_BINARY_DIR}/ncnn_interp_spirv.patch"
+            WORKING_DIRECTORY "${NCNN_DIR}"
+            RESULT_VARIABLE PATCH_CHECK_RESULT
+        )
+        if(PATCH_CHECK_RESULT EQUAL 0)
+            execute_process(
+                COMMAND git apply "${CMAKE_CURRENT_BINARY_DIR}/ncnn_interp_spirv.patch"
+                WORKING_DIRECTORY "${NCNN_DIR}"
+                RESULT_VARIABLE PATCH_RESULT
+            )
+            if(NOT PATCH_RESULT EQUAL 0)
+                message(FATAL_ERROR "Failed to apply ncnn interp SPIR-V patch. Build cannot continue without SPIR-V precompilation.")
+            endif()
+            message(STATUS "Applied ncnn interp SPIR-V patch successfully.")
+        else()
+            message(FATAL_ERROR "ncnn interp SPIR-V patch does not apply cleanly and ncnn is not pre-patched. Build cannot continue without guaranteed SPIR-V precompilation for interp shaders. Ensure ncnn submodule is at commit 56772c65 or later, or that the patch applies to the current ncnn revision.")
+        endif()
     endif()
     
     add_subdirectory("${NCNN_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/ncnn")
