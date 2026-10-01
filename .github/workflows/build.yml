@@ -34,8 +34,11 @@ jobs:
           sudo apt-get update && sudo apt-get install -y glslang-tools
           which glslangValidator
           glslangValidator --version
+          echo "/usr/bin" >> $GITHUB_PATH
 
       - name: Run CMake Preflight
+        env:
+          PATH: /usr/bin:/usr/local/bin:${{ env.PATH }}
         run: |
           cmake -S app/src/main/cpp -B build/preflight -DCMAKE_BUILD_TYPE=Debug 2>&1 | tail -20
           cmake --build build/preflight --target rife-preflight 2>&1 | tail -30
@@ -68,8 +71,11 @@ jobs:
           sudo apt-get update && sudo apt-get install -y glslang-tools
           which glslangValidator
           glslangValidator --version
+          echo "/usr/bin" >> $GITHUB_PATH
 
       - name: Build Debug APK
+        env:
+          PATH: /usr/bin:/usr/local/bin:${{ env.PATH }}
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
