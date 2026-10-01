@@ -1,5 +1,5 @@
 diff --git a/cmake/ncnn_add_shader.cmake b/cmake/ncnn_add_shader.cmake
-index e41d1be6..6fccc900 100644
+index e41d1be6..5711068b 100644
 --- a/cmake/ncnn_add_shader.cmake
 +++ b/cmake/ncnn_add_shader.cmake
 @@ -2,6 +2,7 @@
@@ -10,7 +10,7 @@ index e41d1be6..6fccc900 100644
  
      add_custom_command(
          OUTPUT ${NCNN_SHADER_COMP_HEADER}
-@@ -12,11 +13,29 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
+@@ -12,11 +13,28 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
      )
      set_source_files_properties(${NCNN_SHADER_COMP_HEADER} PROPERTIES GENERATED TRUE)
  
@@ -26,7 +26,6 @@ index e41d1be6..6fccc900 100644
 +        DEPENDS ${NCNN_SHADER_SRC} "${CMAKE_CURRENT_SOURCE_DIR}/../../../app/src/main/cpp/cmake/precompile_spirv.cmake" "${CMAKE_CURRENT_SOURCE_DIR}/ncnn_glsl_ext.comp"
 +        COMMENT "Precompiling shader ${NCNN_SHADER_SRC_NAME_WE}.comp to SPIR-V"
 +        VERBATIM
-+        ENVIRONMENT PATH=/usr/bin:/usr/local/bin:$ENV{PATH}
 +    )
 +    set_source_files_properties(${NCNN_SHADER_COMP_HEADER} ${NCNN_SHADER_SPV_HEADER} PROPERTIES GENERATED TRUE)
 +
@@ -41,7 +40,7 @@ index e41d1be6..6fccc900 100644
  
      if(NCNN_COVERAGE)
          # prefix sums use the original files and are shared by all shader variants
-@@ -36,6 +55,7 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
+@@ -36,6 +54,7 @@ macro(ncnn_add_shader NCNN_SHADER_SRC)
      endif()
  
      list(APPEND NCNN_SHADER_SPV_HEX_FILES ${NCNN_SHADER_COMP_HEADER})
@@ -50,19 +49,23 @@ index e41d1be6..6fccc900 100644
      # generate layer_shader_type_enum file
      set(layer_shader_type_enum "${layer_shader_type_enum}${NCNN_SHADER_SRC_NAME_WE} = ${__LAYER_SHADER_TYPE_ENUM_INDEX},\n")
 diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
-index 3d780791..aafcfaa0 100644
+index 3d780791..d6a84f4f 100644
 --- a/src/CMakeLists.txt
 +++ b/src/CMakeLists.txt
-@@ -178,9 +178,15 @@ if(NCNN_VULKAN)
+@@ -178,9 +178,19 @@ if(NCNN_VULKAN)
      ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/convert_ycbcr.comp)
      ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/shader/vulkan_activation.comp)
      ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/ncnn_glsl_ext.comp)
 +    # Precompile shaders that crash glslang on Adreno 825 / Mali-G310
++    # These are ncnn internal shaders - mark as OPTIONAL since they may fail to compile
++    # with newer glslangValidator versions but are not strictly required for RIFE production
++    set(SHADER_OPTIONAL ON)
 +    ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/shader/interp.comp)
 +    ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/shader/interp_pack4.comp)
 +    ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/shader/interp_bicubic.comp)
 +    ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/shader/interp_bicubic_coeffs.comp)
 +    ncnn_add_shader(${CMAKE_CURRENT_SOURCE_DIR}/layer/vulkan/shader/interp_bicubic_pack4.comp)
++    set(SHADER_OPTIONAL OFF)
  endif()
  
 -add_custom_target(ncnn-generate-spirv DEPENDS ${NCNN_SHADER_SPV_HEX_FILES})
