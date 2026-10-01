@@ -20,10 +20,10 @@ index e41d1be6..6fccc900 100644
 +        COMMAND ${CMAKE_COMMAND}
 +            -DSHADER_SRC=${NCNN_SHADER_SRC}
 +            -DSHADER_SPV_HEADER=${NCNN_SHADER_SPV_HEADER}
-+            -DNCNN_DIR=${CMAKE_CURRENT_SOURCE_DIR}
++            -DNCNN_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..
 +            -DSHADER_REQUIRED=ON
 +            -P "${CMAKE_CURRENT_SOURCE_DIR}/../../../app/src/main/cpp/cmake/precompile_spirv.cmake"
-+        DEPENDS ${NCNN_SHADER_SRC} "${CMAKE_CURRENT_SOURCE_DIR}/../../../app/src/main/cpp/cmake/precompile_spirv.cmake" "${CMAKE_CURRENT_SOURCE_DIR}/ncnn_glsl_ext.comp"
++        DEPENDS ${NCNN_SHADER_SRC} "${CMAKE_CURRENT_SOURCE_DIR}/../../../app/src/main/cpp/cmake/precompile_spirv.cmake" "${CMAKE_CURRENT_SOURCE_DIR}/../ncnn_glsl_ext.comp"
 +        COMMENT "Precompiling shader ${NCNN_SHADER_SRC_NAME_WE}.comp to SPIR-V"
 +        VERBATIM
 +        ENVIRONMENT PATH=/usr/bin:/usr/local/bin:$ENV{PATH}
