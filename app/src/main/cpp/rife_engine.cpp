@@ -183,23 +183,6 @@ bool RifeEngine::init(int requested_gpu_id) {
             props.deviceID
         );
 
-        // Check for known problematic GPU: Mali-G310 crashes in glslang::GlslangToSpv()
-        // during RIFE Vulkan shader compilation. Disable Vulkan for this device to avoid SIGSEGV.
-        if (gpu_name.find("Mali-G310") != std::string::npos) {
-            LOGW_DEVICE(
-                "Mali-G310 detected - known to crash in glslang during RIFE Vulkan shader compilation. "
-                "Disabling Vulkan and falling back to CPU mode."
-            );
-            vulkan_available = false;
-            gpu_name.clear();
-            vulkan_api_version.clear();
-            device_profile = DeviceProfile::CPU_FALLBACK;
-            last_error =
-                "Mali-G310 GPU detected. Vulkan disabled due to known glslang crash. "
-                "RIFE will use CPU fallback.";
-            return true;
-        }
-
         // Detect Vulkan capabilities
         detectVulkanCapabilities(vkdev);
 
