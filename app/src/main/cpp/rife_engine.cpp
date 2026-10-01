@@ -132,6 +132,15 @@ RifeEngine::~RifeEngine() {
     rife_impl.reset();
 }
 
+void RifeEngine::unloadModel() {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (rife_impl) {
+        rife_impl.reset();
+        model_loaded = false;
+        LOGI_LIFECYCLE("RIFE model unloaded");
+    }
+}
+
 bool RifeEngine::init(int requested_gpu_id) {
     std::lock_guard<std::mutex> lock(mutex);
     gpu_id = requested_gpu_id;

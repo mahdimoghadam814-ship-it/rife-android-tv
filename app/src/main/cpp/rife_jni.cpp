@@ -71,6 +71,14 @@ Java_com_rife_androidtv_NativeEngine_loadRifeModel(
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rife_androidtv_NativeEngine_unloadRifeModel(
+    JNIEnv* env, jclass clazz
+) {
+    g_rife_engine.unloadModel();
+    return true;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
     JNIEnv* env, jclass clazz,
     jobject in0Buffer, jobject in1Buffer,

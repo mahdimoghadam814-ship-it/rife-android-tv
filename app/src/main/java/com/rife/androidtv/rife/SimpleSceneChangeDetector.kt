@@ -18,7 +18,7 @@ class SimpleSceneChangeDetector(
         // Real implementation would compute histogram difference
         val isSceneChange = false // Placeholder
         val confidence = 0.0f
-        
+
         return SceneChangeResult(
             isSceneChange = isSceneChange,
             confidence = confidence,

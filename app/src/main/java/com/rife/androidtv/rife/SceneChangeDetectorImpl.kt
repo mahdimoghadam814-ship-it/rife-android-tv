@@ -5,13 +5,13 @@ import androidx.media3.common.util.UnstableApi
 
 /**
  * Lightweight scene change detector using metadata and compact statistics.
- * 
+ *
  * Detection signals (in order of preference):
  * 1. Keyframe (I-frame) detection via decoder metadata
  * 2. Frame property changes (resolution, format)
  * 3. Frame size / QP discontinuities from decoder metadata
  * 4. [Future] Compact luminance histogram if pixel data available
- * 
+ *
  * Uses hysteresis/debouncing to avoid flickering on noisy boundaries.
  */
 @UnstableApi

@@ -18,6 +18,9 @@ object NativeEngine {
     external fun loadRifeModel(assetManager: AssetManager, baseCacheDir: String, modelDir: String, isV2: Boolean, isV4: Boolean): Boolean
 
     @JvmStatic
+    external fun unloadRifeModel(): Boolean
+
+    @JvmStatic
     external fun interpolateFrameBuffers(
         in0Buffer: ByteBuffer,
         in1Buffer: ByteBuffer,

@@ -47,9 +47,9 @@ class SvpPipelineCoordinator(
     /** Start the pipeline */
     fun start() {
         if (_state.value != PipelineState.IDLE && _state.value != PipelineState.STOPPED) return
-        
+
         _state.value = PipelineState.BUFFERING
-        
+
         // Initialize backend
         val config = SynthesisConfig(
             backendType = BackendType.RIFE_VULKAN,
@@ -59,12 +59,12 @@ class SvpPipelineCoordinator(
             numThreads = config.numThreads,
             modelPath = "rife-v2.4"
         )
-        
+
         if (!synthesisBackend.initialize(config)) {
             _state.value = PipelineState.ERROR
             return
         }
-        
+
         _state.value = PipelineState.READY
     }
 
@@ -73,14 +73,14 @@ class SvpPipelineCoordinator(
         job?.cancel()
         job = null
         coroutineScope = null
-        
+
         outputQueue.complete()
         synthesisBackend.release()
         frameStore.clear()
         scheduler.reset()
         sceneDetector.reset()
         motionAnalyzer.reset()
-        
+
         _state.value = PipelineState.STOPPED
     }
 
@@ -92,7 +92,7 @@ class SvpPipelineCoordinator(
     /** Process a frame pair if available */
     fun processFramePair(): Boolean {
         val framePair = frameStore.getLatestFramePair() ?: return false
-        
+
         // Check for scene change
         val sceneChange = sceneDetector.detect(framePair.previous, framePair.current)
         if (sceneChange.isSceneChange) {
@@ -108,17 +108,17 @@ class SvpPipelineCoordinator(
             ))
             return true
         }
-        
+
         // Analyze motion quality
         val motionQuality = motionAnalyzer.analyze(framePair.previous, framePair.current)
-        
+
         // Schedule interpolation
         val decision = scheduler.schedule(framePair.copy(
             previous = framePair.previous,
             current = framePair.current,
             frameIntervalUs = framePair.frameIntervalUs
         ).also { it.motionQuality = motionQuality; it.sceneChange = sceneChange })
-        
+
         if (decision.shouldSkip || decision.numIntermediates == 0) {
             // No interpolation needed
             outputQueue.tryEnqueue(OutputFrame(
@@ -132,7 +132,7 @@ class SvpPipelineCoordinator(
             ))
             return true
         }
-        
+
         // Submit synthesis
         synthesisBackend.synthesize(
             framePair = framePair,
@@ -158,7 +158,7 @@ class SvpPipelineCoordinator(
                         format = frame.format
                     ))
                 }
-                
+
                 scheduler.onSynthesisComplete(decision, SynthesisResult(
                     success = true,
                     intermediateFrames = intermediates,
@@ -166,7 +166,7 @@ class SvpPipelineCoordinator(
                 ))
             }
         )
-        
+
         return true
     }
 

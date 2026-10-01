@@ -58,6 +58,7 @@ public:
 
     bool init(int gpu_id = 0);
     bool loadModelFromAssets(AAssetManager* mgr, const std::string& base_cache_dir, const std::string& model_dir, bool is_v2 = true, bool is_v4 = false);
+    void unloadModel();
 
     bool processFrameBuffer(
         const uint8_t* in0_rgba, const uint8_t* in1_rgba,

@@ -26,26 +26,26 @@ class TemporalFrameStoreImpl(
                 frames.removeAt(0)
             }
         }
-        
+
         // Add new frame with assigned ID
         val newMetadata = metadata.copy(frameId = nextFrameId++)
         frames.add(newMetadata)
-        
+
         // Evict old frames based on age
         evictOlderThan(newMetadata.presentationTimeUs - config.maxFrameAgeUs)
-        
+
         return true
     }
 
     override fun getLatestFramePair(): FramePair? {
         if (frames.size < 2) return null
-        
+
         val current = frames[frames.size - 1]
         val previous = frames[frames.size - 2]
-        
+
         val intervalUs = current.presentationTimeUs - previous.presentationTimeUs
         if (intervalUs <= 0) return null
-        
+
         return FramePair(previous, current, intervalUs)
     }
 

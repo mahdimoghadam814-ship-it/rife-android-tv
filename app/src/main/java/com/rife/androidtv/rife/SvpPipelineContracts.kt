@@ -172,7 +172,7 @@ enum class PipelineState {
 interface SynthesisBackend {
     /** Initialize the backend with given configuration */
     fun initialize(config: SynthesisConfig): Boolean
-    
+
     /** Synthesize intermediate frame(s) for the given frame pair */
     fun synthesize(
         framePair: FramePair,
@@ -181,10 +181,19 @@ interface SynthesisBackend {
         targetHeight: Int,
         outputCallback: (intermediateFrames: List<IntermediateFrame>) -> Unit
     ): SynthesisResult
-    
+
+    /** Request a backend transition. Must perform real resource transition. */
+    fun transitionTo(targetBackend: BackendType, reason: String): BackendTransitionResult
+
+    /** Get current backend state */
+    fun getBackendState(): BackendState
+
+    /** Get current active backend type */
+    fun getActiveBackend(): BackendType
+
     /** Release all resources */
     fun release()
-    
+
     /** Get current backend status */
     fun getStatus(): BackendStatus
 }
@@ -205,6 +214,33 @@ enum class BackendType {
     RIFE_CPU,
     PLACEHOLDER // For future backends (e.g., shader warping)
 }
+
+/** Backend lifecycle states */
+@UnstableApi
+enum class BackendState {
+    UNINITIALIZED,
+    INITIALIZING,
+    READY,
+    DRAINING,
+    DESTROYING,
+    FAILED
+}
+
+/** Backend transition request */
+@UnstableApi
+data class BackendTransitionRequest(
+    val targetBackend: BackendType,
+    val reason: String
+)
+
+/** Result of a backend transition */
+@UnstableApi
+data class BackendTransitionResult(
+    val success: Boolean,
+    val previousBackend: BackendType,
+    val newBackend: BackendType,
+    val errorMessage: String? = null
+)
 
 /** Result of a synthesis operation */
 @UnstableApi
@@ -229,8 +265,9 @@ data class IntermediateFrame(
 /** Backend status information */
 @UnstableApi
 data class BackendStatus(
-    val isInitialized: Boolean,
-    val backendType: BackendType,
+    val backendState: BackendState,
+    val activeBackend: BackendType,
+    val requestedBackend: BackendType,
     val currentResolution: String,
     val lastSynthesisTimeUs: Long,
     val errorMessage: String? = null
@@ -244,25 +281,25 @@ data class BackendStatus(
 interface OutputQueue {
     /** Try to enqueue a frame, returns false if queue is full */
     fun tryEnqueue(frame: OutputFrame): Boolean
-    
+
     /** Dequeue the next frame for display, blocks if empty */
     fun dequeue(): OutputFrame?
-    
+
     /** Try to dequeue without blocking */
     fun tryDequeue(): OutputFrame?
-    
+
     /** Current queue size */
     fun size(): Int
-    
+
     /** Maximum queue capacity */
     fun capacity(): Int
-    
+
     /** Clear all frames */
     fun clear()
-    
+
     /** Signal end of stream */
     fun complete()
-    
+
     /** Check if queue is completed */
     fun isCompleted(): Boolean
 }
@@ -301,25 +338,25 @@ data class TemporalFrameStoreConfig(
 interface TemporalFrameStore {
     /** Add a new frame to the store */
     fun addFrame(metadata: FrameMetadata): Boolean
-    
+
     /** Get the most recent frame pair for interpolation */
     fun getLatestFramePair(): FramePair?
-    
+
     /** Get a specific frame by ID */
     fun getFrame(frameId: Long): FrameMetadata?
-    
+
     /** Remove frames older than the given timestamp */
     fun evictOlderThan(timestampUs: Long): Int
-    
+
     /** Clear all frames (e.g., on seek/discontinuity) */
     fun clear()
-    
+
     /** Current number of frames in store */
     fun size(): Int
-    
+
     /** Check if store has enough frames for interpolation */
     fun hasValidFramePair(): Boolean
-    
+
     /** Get configuration */
     fun getConfig(): TemporalFrameStoreConfig
 }
@@ -331,7 +368,7 @@ interface TemporalFrameStore {
 interface SceneChangeDetector {
     /** Analyze a frame pair for scene changes */
     fun detect(previous: FrameMetadata, current: FrameMetadata): SceneChangeResult
-    
+
     /** Reset detector state (e.g., on seek) */
     fun reset()
 }
@@ -343,7 +380,7 @@ interface SceneChangeDetector {
 interface MotionQualityAnalyzer {
     /** Analyze motion quality for a frame pair */
     fun analyze(previous: FrameMetadata, current: FrameMetadata): MotionQuality
-    
+
     /** Reset analyzer state */
     fun reset()
 }
@@ -377,19 +414,19 @@ data class InterpolationSchedulerConfig(
 interface InterpolationScheduler {
     /** Schedule interpolation for a frame pair */
     fun schedule(framePair: FramePair): ScheduleDecision
-    
+
     /** Called when a frame is successfully synthesized */
     fun onSynthesisComplete(decision: ScheduleDecision, result: SynthesisResult)
-    
+
     /** Called when synthesis fails */
     fun onSynthesisFailed(decision: ScheduleDecision, error: String)
-    
+
     /** Update scheduler configuration */
     fun updateConfig(config: InterpolationSchedulerConfig)
-    
+
     /** Get current scheduler state */
     fun getState(): SchedulerState
-    
+
     /** Reset scheduler (e.g., on seek) */
     fun reset()
 }

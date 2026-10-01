@@ -5,13 +5,13 @@ import androidx.media3.common.util.UnstableApi
 
 /**
  * Lightweight motion quality analyzer using cheap metadata signals.
- * 
+ *
  * Classification is based on measurable signals available without optical flow:
  * - Frame interval consistency (jitter)
  * - Keyframe frequency (I-frame interval)
  * - Decoder metadata (QP variance, frame size variance)
  * - Frame timing regularity
- * 
+ *
  * Does NOT compute optical flow or use full-resolution analysis.
  * Classification is conservative by default.
  */
