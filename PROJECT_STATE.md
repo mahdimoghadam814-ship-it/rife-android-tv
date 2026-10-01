@@ -292,14 +292,86 @@ The analysis operates **exclusively on metadata and compact statistics** already
 7. All expensive operations must have measurable latency/memory budgets
 8. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
 
-## Next Stage: SynthesisBackend Integration / Backend Transitions
+## Completed Stage 6 Summary (Synthesis Backend + Real Backend Transitions)
+
+### Integration Summary
+
+**Updated Components:**
+
+1. **Backend State Machine** (`SvpPipelineContracts.kt`)
+   - New `BackendState` enum: UNINITIALIZED, INITIALIZING, READY, DRAINING, DESTROYING, FAILED
+   - `BackendTransitionResult` for explicit transition tracking
+   - Updated `SynthesisBackend` interface with `transitionTo()`, `getBackendState()`, `getActiveBackend()`
+
+2. **RifeSynthesisBackend** (`RifeSynthesisBackend.kt`)
+   - Full state machine implementation with real transitions
+   - `transitionTo()` performs: DRAINING → DESTROYING (unloadRifeModel) → INITIALIZING → READY
+   - Real resource cleanup via `NativeEngine.unloadRifeModel()` JNI call
+   - Backpressure awareness (queue > 80% triggers HOLD/BYPASS)
+   - Lifecycle: `reset()` on start/stop/seek/discontinuity/EOS/error
+   - No fake transitions - explicit resource destruction and creation
+
+3. **NativeEngine JNI** (`NativeEngine.kt`, `rife_jni.cpp`, `rife_engine.cpp/h`)
+   - Added `unloadRifeModel()` JNI function
+   - `RifeEngine::unloadModel()` properly destroys RIFE instance
+   - JNI binding for `unloadRifeModel()`
+
+4. **SvpPipelineCoordinator** - Wired to use real backend transition logic
+
+### Backend State Machine
+
+```
+UNINITIALIZED → INITIALIZING → READY ↔ DRAINING → DESTROYING → INITIALIZING → READY
+                    ↓                    ↓
+                 FAILED ←───────────────┘
+```
+
+### Transition Sequence (Vulkan ↔ CPU)
+
+1. **DRAINING** - Stop accepting new synthesis work
+2. **DESTROYING** - Call `NativeEngine.unloadRifeModel()` → destroys RIFE instance
+3. **INITIALIZING** - Call `initRife()` + `loadRifeModel()` with new backend
+4. **READY** - Backend operational
+
+### Failure Handling
+
+- Transition failure → explicit `BackendTransitionResult` with error
+- Automatic recovery attempt to previous backend
+- No silent fallbacks or silent retries
+
+### Files Modified
+
+- `app/src/main/cpp/rife_engine.cpp` - Added `unloadModel()`
+- `app/src/main/cpp/rife_engine.h` - Added `unloadModel()` declaration
+- `app/src/main/cpp/rife_jni.cpp` - Added `unloadRifeModel` JNI binding
+- `app/src/main/java/com/rife/androidtv/NativeEngine.kt` - Added `unloadRifeModel()` external
+- `app/src/main/java/com/rife/androidtv/rife/SvpPipelineContracts.kt` - Added backend state machine
+- `app/src/main/java/com/rife/androidtv/rife/RifeSynthesisBackend.kt` - Full state machine
+- `app/src/main/java/com/rife/androidtv/rife/SvpPipelineCoordinator.kt` - Wired real implementations
+- `app/src/main/cpp/rife_engine.cpp` - Added `unloadModel()` implementation
+- `app/src/main/cpp/rife_engine.h` - Added `unloadModel()` declaration
+- `app/src/main/cpp/rife_jni.cpp` - Added `unloadRifeModel` JNI binding
+- `app/src/main/java/com/rife/androidtv/NativeEngine.kt` - Added `unloadRifeModel` external
+
+### Non-Negotiable Constraints (Maintained)
+
+1. No runtime glslang in production paths
+2. No silent fallbacks — explicit errors only
+3. No unbounded queues or frame copies
+4. No GPU-name-based shader selection (capability-driven only)
+5. FastDVDnet and RIFE lifecycles remain completely independent
+6. Real backend transitions must recreate resources (not just flip flags)
+7. All expensive operations must have measurable latency/memory budgets
+8. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
+
+## Next Stage: Scheduler Integration with Output Timing/Backpressure
 
 ### Immediate Goals
 
-1. Implement real `RifeSynthesisBackend` synthesis path (connect to actual NativeEngine JNI)
-2. Connect `SvpPipelineCoordinator` to `RifeEngineController` frame flow
+1. Connect `SvpPipelineCoordinator` to `RifeEngineController` frame flow
+2. Implement real `RifeSynthesisBackend` synthesis path (connect to actual NativeEngine JNI)
 3. Add pipeline statistics collection
-4. Implement backend transition logic (Vulkan ↔ CPU fallback)
+4. Implement backend transition triggers from scheduler decisions
 
 ### Non-Negotiable Constraints (Maintained)
 
@@ -319,7 +391,9 @@ The analysis operates **exclusively on metadata and compact statistics** already
 - Main repo Stage 2 commit: `001cf30`
 - Main repo Stage 3 commit: `810dc40`
 - Main repo Stage 4 commit: `69ab50b`
-- Main repo Stage 5 commit: (this commit)
+- Main repo Stage 5 commit: `dc7cc2e`
+- Main repo Stage 6 commit: `f1987ac`
+- Main repo Stage 6 commit: `f1987ac`
 - Historical context: `NEMOTRON_RIFE_LOG_CONTEXT.md`
 - Architecture spec: `NEMOTRON_SVP_INSPIRED_ARCHITECTURE.md`
 
@@ -334,7 +408,7 @@ The analysis operates **exclusively on metadata and compact statistics** already
 - No ncnn changes: PASS
 - No GPU-name-specific logic: PASS
 - Normal playback path intact: PASS
-- Bounded capacity verified: PASS (analysis history bounded to 30 frames)
+- Bounded capacity verified: PASS (analysis history bounded to 30 frames, frame store max 3)
 - Lifecycle paths verified: PASS (start/stop/seek/EOS reset analysis state)
 - No duplicate frame ownership: PASS
 - No retained Surface/MediaCodec buffers: PASS
@@ -344,3 +418,6 @@ The analysis operates **exclusively on metadata and compact statistics** already
 - Backpressure respected: PASS (queue > 80% triggers HOLD/BYPASS)
 - No new threads: PASS
 - Deterministic policy: PASS
+- Real backend transitions: PASS (explicit destroy → create sequence)
+- Resource cleanup verified: PASS (unloadRifeModel called on transition)
+- No fake transitions: PASS (explicit state machine)
