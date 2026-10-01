@@ -94,7 +94,9 @@ data class MotionQuality(
     /** Whether motion is suitable for interpolation */
     val isInterpolationSuitable: Boolean,
     /** Recommended interpolation mode based on motion quality */
-    val recommendedMode: InterpolationMode = InterpolationMode.CONSERVATIVE
+    val recommendedMode: InterpolationMode = InterpolationMode.CONSERVATIVE,
+    /** Motion quality classification */
+    val motionQualityClass: MotionQualityClass = MotionQualityClass.UNKNOWN
 ) {
     companion object {
         /** Default conservative quality for unknown/unsafe frames */
@@ -105,7 +107,8 @@ data class MotionQuality(
             textureComplexity = 1f,
             vectorConsistency = 0f,
             isInterpolationSuitable = false,
-            recommendedMode = InterpolationMode.SAFE
+            recommendedMode = InterpolationMode.SAFE,
+            motionQualityClass = MotionQualityClass.UNRELIABLE
         )
     }
 }

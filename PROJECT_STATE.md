@@ -10,9 +10,11 @@
 
 **Completed Stage 4**: Scene/Motion Analysis Implementation
 
+**Completed Stage 5**: Motion Quality + Interpolation Scheduler Integration
+
 **ncnn Commit**: `30cc1902b6eb83b2056cbc9fc413b3c747940bb2`
 
-**Main Repository Commit**: Stage 4 analysis implementation
+**Main Repository Commit**: Stage 5 scheduler integration complete
 
 ## Completed Stage 1 Summary (SPIR-V Precompilation)
 
@@ -234,6 +236,51 @@ The analysis operates **exclusively on metadata and compact statistics** already
 
 **Files Unchanged:** Existing pipeline contracts, frame store, scheduler, backend, coordinator
 
+## Completed Stage 5 Summary (Motion Quality + Interpolation Scheduler Integration)
+
+### Integration Summary
+
+**Updated Components:**
+
+1. **InterpolationSchedulerImpl** (`InterpolationSchedulerImpl.kt`)
+   - Now accepts `SceneChangeDetector`, `MotionQualityAnalyzer`, and `OutputQueue` as constructor dependencies
+   - Implements deterministic decision policy:
+     - **Scene change detected** → REPEAT_FRAME (SAFE mode, 0 intermediates)
+     - **Motion quality UNKNOWN/warmup** (< 15 frames) → HOLD (SAFE, 0 intermediates)
+     - **Motion quality UNKNOWN** (confidence < 0.3) → HOLD
+     - **Motion quality UNRELIABLE** → BYPASS (SAFE, 0 intermediates)
+     - **Motion quality LOW** → CONSERVATIVE interpolation (1 intermediate at t=0.5)
+     - **Motion quality MEDIUM** → CONSERVATIVE interpolation (1 intermediate at t=0.5)
+     - **Motion quality HIGH** → defaultMode interpolation (up to maxIntermediates)
+   - **Backpressure**: Checks OutputQueue capacity (80% threshold), applies HOLD/BYPASS under pressure
+   - **Timing**: Uses frame presentation timestamps only, no wall-clock
+   - **Lifecycle**: `reset()` clears internal state and calls `reset()` on analysis components
+
+2. **MotionQualityAnalyzerImpl** - Added `motionQualityClass` to returned `MotionQuality`
+3. **SvpPipelineContracts** - Added `motionQualityClass` field to `MotionQuality` data class
+4. **SvpPipelineCoordinator** - Now instantiates real `SceneChangeDetectorImpl`, `MotionQualityAnalyzerImpl`, and configures `InterpolationSchedulerImpl` with all dependencies
+
+### Decision Policy Summary
+
+| Condition | Decision | Mode | Intermediates |
+|-----------|----------|------|---------------|
+| Scene change | REPEAT_FRAME | SAFE | 0 |
+| UNKNOWN quality / warmup (<15 frames) | HOLD | SAFE | 0 |
+| UNKNOWN quality (confidence < 0.3) | HOLD | SAFE | 0 |
+| UNRELIABLE | BYPASS | SAFE | 0 |
+| LOW | INTERPOLATE* | CONSERVATIVE | 1 @ t=0.5 |
+| MEDIUM | INTERPOLATE* | CONSERVATIVE | 1 @ t=0.5 |
+| HIGH | INTERPOLATE* | defaultMode | up to maxIntermediates |
+
+*Under backpressure (queue > 80%): HIGH→HOLD, MEDIUM→HOLD, LOW→BYPASS
+
+### Files Modified
+
+- `app/src/main/java/com/rife/androidtv/rife/InterpolationSchedulerImpl.kt` - Full scheduler policy implementation
+- `app/src/main/java/com/rife/androidtv/rife/MotionQualityAnalyzerImpl.kt` - Added motionQualityClass to output
+- `app/src/main/java/com/rife/androidtv/rife/SvpPipelineContracts.kt` - Added motionQualityClass field
+- `app/src/main/java/com/rife/androidtv/rife/SvpPipelineCoordinator.kt` - Wire real implementations
+
 ### Non-Negotiable Constraints (Maintained)
 
 1. No runtime glslang in production paths
@@ -245,15 +292,14 @@ The analysis operates **exclusively on metadata and compact statistics** already
 7. All expensive operations must have measurable latency/memory budgets
 8. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
 
-## Next Stage: MotionQuality + InterpolationScheduler Integration
+## Next Stage: SynthesisBackend Integration / Backend Transitions
 
 ### Immediate Goals
 
-1. Wire `SceneChangeDetectorImpl` and `MotionQualityAnalyzerImpl` into `InterpolationSchedulerImpl`
-2. Update `InterpolationSchedulerImpl` to use analysis results for mode selection
-3. Connect `SvpPipelineCoordinator` to `RifeEngineController` frame flow
-4. Implement real `RifeSynthesisBackend` synthesis path
-5. Add pipeline statistics collection
+1. Implement real `RifeSynthesisBackend` synthesis path (connect to actual NativeEngine JNI)
+2. Connect `SvpPipelineCoordinator` to `RifeEngineController` frame flow
+3. Add pipeline statistics collection
+4. Implement backend transition logic (Vulkan ↔ CPU fallback)
 
 ### Non-Negotiable Constraints (Maintained)
 
@@ -272,7 +318,8 @@ The analysis operates **exclusively on metadata and compact statistics** already
 - Main repo Stage 1 commit: `319fddf`
 - Main repo Stage 2 commit: `001cf30`
 - Main repo Stage 3 commit: `810dc40`
-- Main repo Stage 4 commit: (this commit)
+- Main repo Stage 4 commit: `69ab50b`
+- Main repo Stage 5 commit: (this commit)
 - Historical context: `NEMOTRON_RIFE_LOG_CONTEXT.md`
 - Architecture spec: `NEMOTRON_SVP_INSPIRED_ARCHITECTURE.md`
 
@@ -294,3 +341,6 @@ The analysis operates **exclusively on metadata and compact statistics** already
 - No full-resolution frame analysis: PASS (metadata-only)
 - No optical flow/GPU compute: PASS
 - Hysteresis/debouncing implemented: PASS
+- Backpressure respected: PASS (queue > 80% triggers HOLD/BYPASS)
+- No new threads: PASS
+- Deterministic policy: PASS

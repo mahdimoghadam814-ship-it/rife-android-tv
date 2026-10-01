@@ -101,7 +101,8 @@ class MotionQualityAnalyzerImpl(
             textureComplexity = textureComplexity,
             vectorConsistency = vectorConsistency,
             isInterpolationSuitable = isSuitable,
-            recommendedMode = recommendedMode
+            recommendedMode = recommendedMode,
+            motionQualityClass = classification
         )
 
         // Log quality changes (not every frame)

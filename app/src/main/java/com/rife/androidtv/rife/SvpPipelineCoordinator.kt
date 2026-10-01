@@ -1,5 +1,6 @@
 package com.rife.androidtv.rife
 
+import android.content.Context
 import androidx.media3.common.util.UnstableApi
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,9 +20,14 @@ import kotlinx.coroutines.flow.StateFlow
 class SvpPipelineCoordinator(
     private val context: Context,
     private val frameStore: TemporalFrameStore = TemporalFrameStoreImpl(),
-    private val sceneDetector: SceneChangeDetector = SimpleSceneChangeDetector(),
-    private val motionAnalyzer: MotionQualityAnalyzer = PlaceholderMotionQualityAnalyzer(),
-    private val scheduler: InterpolationScheduler = InterpolationSchedulerImpl(),
+    private val sceneDetector: SceneChangeDetector = SceneChangeDetectorImpl(),
+    private val motionAnalyzer: MotionQualityAnalyzer = MotionQualityAnalyzerImpl(),
+    private val scheduler: InterpolationScheduler = InterpolationSchedulerImpl(
+        sceneDetector = SceneChangeDetectorImpl(),
+        motionAnalyzer = MotionQualityAnalyzerImpl(),
+        outputQueue = BoundedOutputQueue(),
+        config = InterpolationSchedulerConfig()
+    ),
     private val synthesisBackend: SynthesisBackend = RifeSynthesisBackend(context),
     private val outputQueue: OutputQueue = BoundedOutputQueue(),
     private val config: SchedulerConfig = SchedulerConfig()
