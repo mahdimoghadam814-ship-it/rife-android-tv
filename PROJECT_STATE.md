@@ -8,9 +8,11 @@
 
 **Completed Stage 3**: TemporalFrameStore + Bounded Buffering Integration
 
+**Completed Stage 4**: Scene/Motion Analysis Implementation
+
 **ncnn Commit**: `30cc1902b6eb83b2056cbc9fc413b3c747940bb2`
 
-**Main Repository Commit**: Stage 3 integration complete
+**Main Repository Commit**: Stage 4 analysis implementation
 
 ## Completed Stage 1 Summary (SPIR-V Precompilation)
 
@@ -153,13 +155,103 @@
 - `NativeEngine` JNI inference - no changes
 - FastDVDnet scaffold - no changes
 
-## Next Stage: Real Scene/Motion Analysis
+## Completed Stage 4 Summary (Scene/Motion Analysis Implementation)
+
+### New Analysis Components Added
+
+1. **SceneChangeDetectorImpl** (`SceneChangeDetectorImpl.kt`)
+   - Lightweight deterministic scene change detector using metadata and compact statistics
+   - Detection signals (weighted):
+     - Keyframe (I-frame) transition: 0.5 weight
+     - Resolution change: 0.3 weight
+     - Format change: 0.2 weight
+     - Decoder metadata discontinuity (frame size, QP, frame type): 0.4 weight
+     - Timestamp anomaly (>100ms): 0.1 weight
+   - Hysteresis/debouncing:
+     - Confirmation frames: 2 consecutive above threshold
+     - Minimum 5 frames between confirmed scene changes
+   - Change type classification: NONE, HARD_CUT, GRADUAL_TRANSITION, FLASH, UNKNOWN
+   - Configurable thresholds and weights via `SceneChangeConfig`
+
+2. **MotionQualityAnalyzerImpl** (`MotionQualityAnalyzerImpl.kt`)
+   - Conservative motion quality classification based on cheap metadata signals:
+     - Frame interval jitter (rolling statistics)
+     - QP variance from decoder metadata
+     - Frame size variance from decoder metadata
+     - Keyframe interval regularity
+   - Quality classes: UNKNOWN, LOW, MEDIUM, HIGH, UNRELIABLE
+   - Produces `MotionQuality` with:
+     - motionMagnitude, confidence, occlusionRatio, textureComplexity, vectorConsistency
+     - isInterpolationSuitable flag
+     - recommendedMode (SAFE, CONSERVATIVE, BALANCED, AGGRESSIVE)
+   - Rolling statistics over 30-frame history (configurable)
+   - Warm-up period: 15 frames before reliable classification
+   - Configurable thresholds and weights via `MotionQualityConfig`
+
+### Signal Sources (No Full-Resolution Analysis)
+
+The analysis operates **exclusively on metadata and compact statistics** already available in the playback path:
+
+1. **FrameMetadata fields**: `isKeyFrame`, `width`, `height`, `format`, `presentationTimeUs`
+2. **Decoder metadata** (via `FrameMetadata.decoderMetadata`):
+   - `frame_type` (I/P/B frame classification)
+   - `frame_size` (compressed frame byte size)
+   - `qp` (quantization parameter)
+3. **Derived temporal statistics** (maintained in rolling windows):
+   - Frame interval jitter (stddev/mean)
+   - QP variance
+   - Frame size variance
+   - Keyframe interval regularity
+
+**No full-resolution pixel processing, no optical flow, no GPU readbacks, no Vulkan compute.**
+
+### Hysteresis/Debouncing
+
+- **SceneChangeDetector**: Requires 2 consecutive frames above threshold, minimum 5 frames between confirmed changes
+- **MotionQualityAnalyzer**: 15-frame warm-up, rolling 30-frame statistics, classification changes only on sustained shifts
+
+### Memory Characteristics
+
+- **SceneChangeDetector**: O(1) state (few scalars, no frame buffers)
+- **MotionQualityAnalyzer**: O(historySize) = O(30) rolling statistics (primitive arrays)
+- **Total analysis overhead**: < 1KB additional memory, zero full-resolution frame buffers
+
+### Lifecycle Reset Correctness
+
+- `SceneChangeDetector.reset()`: Clears hysteresis counters, resets last change tracking
+- `MotionQualityAnalyzer.reset()`: Clears all rolling statistics, frame counter, classification state
+- Both called automatically via `TemporalFrameStore.clear()` on seek/discontinuity/start/stop
+
+### Files Added/Modified
+
+**New Files:**
+- `app/src/main/java/com/rife/androidtv/rife/SceneChangeDetectorImpl.kt` - Real scene change detector
+- `app/src/main/java/com/rife/androidtv/rife/MotionQualityAnalyzerImpl.kt` - Real motion quality analyzer
+
+**Files Replaced/Updated:**
+- `app/src/main/java/com/rife/androidtv/rife/SimpleSceneChangeDetector.kt` - Kept for reference but not used
+- `app/src/main/java/com/rife/androidtv/rife/PlaceholderMotionQualityAnalyzer.kt` - Kept for reference but not used
+
+**Files Unchanged:** Existing pipeline contracts, frame store, scheduler, backend, coordinator
+
+### Non-Negotiable Constraints (Maintained)
+
+1. No runtime glslang in production paths
+2. No silent fallbacks — explicit errors only
+3. No unbounded queues or frame copies
+4. No GPU-name-based shader selection (capability-driven only)
+5. FastDVDnet and RIFE lifecycles remain completely independent
+6. Real backend transitions must recreate resources (not just flip flags)
+7. All expensive operations must have measurable latency/memory budgets
+8. Mali-G310 target: sustained playback without lmkd kills, memory < 1.2GB
+
+## Next Stage: MotionQuality + InterpolationScheduler Integration
 
 ### Immediate Goals
 
-1. Implement real `SceneChangeDetector` (histogram/block difference)
-2. Implement real `MotionQualityAnalyzer` (motion vector / block analysis)
-3. Wire `SvpPipelineCoordinator` to `RifeEngineController` frame flow
+1. Wire `SceneChangeDetectorImpl` and `MotionQualityAnalyzerImpl` into `InterpolationSchedulerImpl`
+2. Update `InterpolationSchedulerImpl` to use analysis results for mode selection
+3. Connect `SvpPipelineCoordinator` to `RifeEngineController` frame flow
 4. Implement real `RifeSynthesisBackend` synthesis path
 5. Add pipeline statistics collection
 
@@ -179,7 +271,8 @@
 - ncnn SPIR-V commit: `30cc1902b6eb83b2056cbc9fc413b3c747940bb2`
 - Main repo Stage 1 commit: `319fddf`
 - Main repo Stage 2 commit: `001cf30`
-- Main repo Stage 3 commit: (this commit)
+- Main repo Stage 3 commit: `810dc40`
+- Main repo Stage 4 commit: (this commit)
 - Historical context: `NEMOTRON_RIFE_LOG_CONTEXT.md`
 - Architecture spec: `NEMOTRON_SVP_INSPIRED_ARCHITECTURE.md`
 
@@ -194,7 +287,10 @@
 - No ncnn changes: PASS
 - No GPU-name-specific logic: PASS
 - Normal playback path intact: PASS
-- Bounded capacity verified: PASS (max 3 frames)
-- Lifecycle paths verified: PASS (start/stop/seek/EOS)
-- No duplicate frame ownership: PASS (single store reference)
+- Bounded capacity verified: PASS (analysis history bounded to 30 frames)
+- Lifecycle paths verified: PASS (start/stop/seek/EOS reset analysis state)
+- No duplicate frame ownership: PASS
 - No retained Surface/MediaCodec buffers: PASS
+- No full-resolution frame analysis: PASS (metadata-only)
+- No optical flow/GPU compute: PASS
+- Hysteresis/debouncing implemented: PASS
