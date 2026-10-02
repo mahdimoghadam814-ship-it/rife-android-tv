@@ -561,6 +561,8 @@ class VideoFrameProcessor(
     override fun setOutputSurfaceInfo(outputSurfaceInfo: SurfaceInfo?) {
         runOnWorker("setOutputSurfaceInfo()") {
             pendingOutputSurfaceInfo = outputSurfaceInfo
+            displaySurfaceWidth = outputSurfaceInfo?.width ?: 0
+            displaySurfaceHeight = outputSurfaceInfo?.height ?: 0
             val display = bundleDisplay()
             if (display == null) {
                 // The output window surface can only be created on the input bundle's EGL

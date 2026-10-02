@@ -419,6 +419,54 @@ bool RifeEngine::loadModelFromAssets_locked(
     return true;
 }
 
+// RIFE::process() writes packed 8-bit RGB into the caller supplied out Mat through
+// Mat::to_pixels(PIXEL_RGB), which converts from float. For timestep 0 and 1 it instead
+// replaces that Mat with the float RGB input frame.
+//
+// ncnn's Mat::to_pixels(PIXEL_RGB2RGBA) unconditionally reinterprets its source as float and
+// reads channel(0..2), so it is only valid on a plain 3 channel float Mat. Using it on the
+// 8-bit RGB layout both misinterprets the pixels and, if the Mat is not a 3 channel Mat,
+// reads the channel pointers straight past the end of the allocation. Expand the 8-bit
+// layout here instead.
+static bool writeRifeOutputToRgba(
+    const ncnn::Mat& out_mat,
+    uint8_t* out_rgba,
+    int w,
+    int h
+) {
+    if (!out_mat.data || !out_rgba || w <= 0 || h <= 0) {
+        return false;
+    }
+
+    if (out_mat.w != w || out_mat.h != h || out_mat.elempack != 1 || out_mat.c < 3) {
+        return false;
+    }
+
+    const size_t pixels = static_cast<size_t>(w) * static_cast<size_t>(h);
+
+    if (out_mat.elemsize == 4u) {
+        out_mat.to_pixels(out_rgba, ncnn::Mat::PIXEL_RGB2RGBA);
+        return true;
+    }
+
+    if (out_mat.elemsize == 1u) {
+        if (out_mat.total() * out_mat.elemsize < pixels * 3) {
+            return false;
+        }
+
+        const unsigned char* rgb = reinterpret_cast<const unsigned char*>(out_mat.data);
+        for (size_t i = 0; i < pixels; i++) {
+            out_rgba[i * 4 + 0] = rgb[i * 3 + 0];
+            out_rgba[i * 4 + 1] = rgb[i * 3 + 1];
+            out_rgba[i * 4 + 2] = rgb[i * 3 + 2];
+            out_rgba[i * 4 + 3] = 255;
+        }
+        return true;
+    }
+
+    return false;
+}
+
 bool RifeEngine::processFrameBuffer(
     const uint8_t* in0_rgba,
     const uint8_t* in1_rgba,
@@ -511,7 +559,13 @@ bool RifeEngine::processFrameBuffer(
         return false;
     }
 
-    ncnn::Mat out_mat(effective_target_w, effective_target_h, 3, static_cast<int>(ncnn::Mat::PIXEL_RGB));
+    // Packed 8-bit RGB buffer sized for exactly what RIFE::process writes back
+    // (w * h * 3 bytes). The 4th argument must be an elemsize, not ncnn::Mat::PIXEL_RGB:
+    // Mat(w, h, 3, PIXEL_RGB) resolves to the (w, h, d, c, elemsize) constructor and creates a
+    // 4-D single channel Mat, which made Mat::to_pixels(PIXEL_RGB2RGBA) read channel(1) and
+    // channel(2) past the end of the allocation and crash.
+    ncnn::Mat out_mat;
+    out_mat.create(effective_target_w, effective_target_h, 3, (size_t)1u, 1);
 
     int ret =
         rife_impl->process(
@@ -556,7 +610,7 @@ if (ret != 0 || out_mat.empty()) {
                     in0_rgba, ncnn::Mat::PIXEL_RGBA2RGB, src_w, src_h, effective_target_w, effective_target_h);
                 in1_mat = ncnn::Mat::from_pixels_resize(
                     in1_rgba, ncnn::Mat::PIXEL_RGBA2RGB, src_w, src_h, effective_target_w, effective_target_h);
-                out_mat = ncnn::Mat(effective_target_w, effective_target_h, 3, static_cast<int>(ncnn::Mat::PIXEL_RGB));
+                out_mat.create(effective_target_w, effective_target_h, 3, (size_t)1u, 1);
             }
             // Retry the process
             ret = rife_impl->process(in0_mat, in1_mat, timestep, out_mat);
@@ -568,11 +622,17 @@ if (ret != 0 || out_mat.empty()) {
     }
 
 process_output:
-    // Copy output to caller's buffer - use PIXEL_RGB2RGBA to convert RGB to RGBA
-    out_mat.to_pixels(
-        out_rgba,
-        ncnn::Mat::PIXEL_RGB2RGBA
-    );
+    if (!writeRifeOutputToRgba(out_mat, out_rgba, effective_target_w, effective_target_h)) {
+        last_error =
+            "RIFE produced an output matrix with an unexpected layout.";
+
+        LOGE_ERROR(
+            "%s",
+            last_error.c_str()
+        );
+
+        return false;
+    }
 
     auto end =
         std::chrono::high_resolution_clock::now();
@@ -598,6 +658,8 @@ process_output:
         << " ms";
 
     op_details = ss.str();
+
+    LOGI_DEVICE("%s", op_details.c_str());
 
     return true;
 }
