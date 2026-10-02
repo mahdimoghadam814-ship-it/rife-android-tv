@@ -106,6 +106,19 @@ class VideoFrameProcessor(
         private const val WORKER_TASK_TIMEOUT_MS = 3000L
 
         /**
+         * Per-stage timing is averaged over a window and reported as a single line. Logging every
+         * stage of every frame would put thousands of Log.d calls into the profile being measured.
+         */
+        private const val TIMING_WINDOW_FRAMES = 30
+
+        /**
+         * Verbose per-frame diagnostics: checksums, EGL state dumps and dimension traces. They were
+         * useful while bringing the pipeline up but cost several whole-buffer passes per frame and
+         * drown the timing signal, so they are off by default.
+         */
+        private const val VERBOSE_DIAGNOSTICS = false
+
+        /**
          * Only used to describe the input stream to Media3 before the real video size is known. It
          * is never used to size a readback or an inference buffer.
          */
@@ -253,6 +266,20 @@ class VideoFrameProcessor(
     private var endOfInputSignalled = false
     private var readbackInProgress = false
     private var released = false
+
+    // Per-stage timing window (see TIMING_WINDOW_FRAMES). MEMC is only a few ms per frame yet
+    // playback lands far below real time on both the TV box and the Poco F7, so the remaining
+    // cost has to be located in the GL readback / upload path rather than assumed.
+    private var timingStartNs = 0L
+    private var timingCycles = 0
+    private var nsReadback = 0L
+    private var nsCopy = 0L
+    private var nsChecksum = 0L
+    private var nsJni = 0L
+    private var nsRender = 0L
+    private var nsPair = 0L
+    private var capturedAtWindowStart = 0
+    private var droppedAtWindowStart = 0L
 
     private val mainHandler: Handler? = try {
         Handler(Looper.getMainLooper())
@@ -1034,7 +1061,7 @@ class VideoFrameProcessor(
         try {
             // Diagnostic logging before updateTexImage
             val bundle = inputBundle
-            if (bundle != null) {
+            if (VERBOSE_DIAGNOSTICS && bundle != null) {
                 val storedDisplay = bundle.display
                 val storedContext = bundle.context
                 val storedSurface = bundle.surface
@@ -1115,16 +1142,26 @@ class VideoFrameProcessor(
         val (captureWidth, captureHeight) =
             calculateTargetDimensions(sourceWidth, sourceHeight, resolution)
 
-        Log.d(
-            TAG,
-            "ALLOC DIAGNOSTICS: input=${sourceWidth}x$sourceHeight " +
-                "target=${captureWidth}x$captureHeight " +
-                "bytes=${captureWidth.toLong() * captureHeight.toLong() * 4L} " +
-                "pool=${frameBufferPool.size} resolution=$resolution"
-        )
+        if (VERBOSE_DIAGNOSTICS) {
+            Log.d(
+                TAG,
+                "ALLOC DIAGNOSTICS: input=${sourceWidth}x$sourceHeight " +
+                    "target=${captureWidth}x$captureHeight " +
+                    "bytes=${captureWidth.toLong() * captureHeight.toLong() * 4L} " +
+                    "pool=${frameBufferPool.size} resolution=$resolution"
+            )
+        }
 
+        // Cycle start: the window from here to the end of processNextFramePair() is what the
+        // decoder's BufferQueue actually experiences, so it is the number that has to reach the
+        // frame interval for playback to keep up.
+        timingStartNs = System.nanoTime()
+        val tCaptureStart = timingStartNs
         val pixels = obtainFrameBuffer(captureWidth, captureHeight)
-        if (pixels.capacity() <= 0 || !grabber.read(texture, captureWidth, captureHeight, pixels)) {
+        val readOk = pixels.capacity() > 0 &&
+            grabber.read(texture, captureWidth, captureHeight, pixels)
+        nsReadback += System.nanoTime() - tCaptureStart
+        if (!readOk) {
             releaseFrameBuffer(pixels)
             droppedFrameCount++
             return
@@ -1132,11 +1169,13 @@ class VideoFrameProcessor(
 
         frameCountInput++
 
-        Log.d(
-            TAG,
-            "FRAME CAPTURE LOG: decoded=${sourceWidth}x$sourceHeight -> " +
-                "preRife=${captureWidth}x$captureHeight"
-        )
+        if (VERBOSE_DIAGNOSTICS) {
+            Log.d(
+                TAG,
+                "FRAME CAPTURE LOG: decoded=${sourceWidth}x$sourceHeight -> " +
+                    "preRife=${captureWidth}x$captureHeight"
+            )
+        }
 
         val frame = FrameData(
             pixels = pixels,
@@ -1164,8 +1203,11 @@ class VideoFrameProcessor(
 
         if (prev == null) {
             // First frame: log checksum before rendering
-            val firstFrameChecksum = calculateChecksum(nextFrame.pixels, nextFrame.width, nextFrame.height)
-            Log.d(TAG, "PIPELINE CHECKSUM: firstFrame ${nextFrame.width}x${nextFrame.height} checksum=$firstFrameChecksum")
+            if (VERBOSE_DIAGNOSTICS) {
+                val firstFrameChecksum =
+                    calculateChecksum(nextFrame.pixels, nextFrame.width, nextFrame.height)
+                Log.d(TAG, "PIPELINE CHECKSUM: firstFrame ${nextFrame.width}x${nextFrame.height} checksum=$firstFrameChecksum")
+            }
             renderFrameToOutput(nextFrame)
             frameCountOutput++
             previousFrame = nextFrame
@@ -1216,17 +1258,25 @@ class VideoFrameProcessor(
 
         // Inputs keep the clear -> put -> flip contract: flip() is what publishes the number of
         // written bytes as the limit, so the readable range matches the frame handed to the stage.
+        val tCopyStart = System.nanoTime()
         in0Buf.clear()
         in1Buf.clear()
         in0Buf.put(prev.pixels)
         in1Buf.put(nextFrame.pixels)
         in0Buf.flip()
         in1Buf.flip()
+        nsCopy += System.nanoTime() - tCopyStart
 
         // DIAGNOSTICS: Log checksum of frames before FastDVDnet/RIFE
-        val prevChecksum = calculateChecksum(in0Buf, rifeInputW, rifeInputH)
-        val nextChecksum = calculateChecksum(in1Buf, rifeInputW, rifeInputH)
-        Log.d(TAG, "PIPELINE CHECKSUM: prevFrame ${rifeInputW}x${rifeInputH} checksum=$prevChecksum nextFrame checksum=$nextChecksum")
+        var prevChecksum = 0L
+        var nextChecksum = 0L
+        if (VERBOSE_DIAGNOSTICS) {
+            val tChecksumStart = System.nanoTime()
+            prevChecksum = calculateChecksum(in0Buf, rifeInputW, rifeInputH)
+            nextChecksum = calculateChecksum(in1Buf, rifeInputW, rifeInputH)
+            nsChecksum += System.nanoTime() - tChecksumStart
+            Log.d(TAG, "PIPELINE CHECKSUM: prevFrame ${rifeInputW}x${rifeInputH} checksum=$prevChecksum nextFrame checksum=$nextChecksum")
+        }
 
         val startTime = SystemClock.elapsedRealtime()
 
@@ -1291,9 +1341,13 @@ class VideoFrameProcessor(
         }
 
         // DIAGNOSTICS: Log checksum before RIFE JNI
-        val src0Checksum = calculateChecksum(src0Buf, rifeInputW, rifeInputH)
-        val src1Checksum = calculateChecksum(src1Buf, rifeInputW, rifeInputH)
-        Log.d(TAG, "PIPELINE CHECKSUM: before RIFE src0 checksum=$src0Checksum src1 checksum=$src1Checksum")
+        if (VERBOSE_DIAGNOSTICS) {
+            val tChecksumStart = System.nanoTime()
+            val src0Checksum = calculateChecksum(src0Buf, rifeInputW, rifeInputH)
+            val src1Checksum = calculateChecksum(src1Buf, rifeInputW, rifeInputH)
+            nsChecksum += System.nanoTime() - tChecksumStart
+            Log.d(TAG, "PIPELINE CHECKSUM: before RIFE src0 checksum=$src0Checksum src1 checksum=$src1Checksum")
+        }
 
         Log.i(
             TAG,
@@ -1308,6 +1362,7 @@ class VideoFrameProcessor(
         // the Java position stays at 0 and a flip() would only publish limit = 0.
         outBuf.clear()
 
+        val tJniStart = System.nanoTime()
         val success = NativeEngine.interpolateFrameBuffers(
             src0Buf,
             src1Buf,
@@ -1318,6 +1373,7 @@ class VideoFrameProcessor(
             0.5f,
             outBuf
         )
+        nsJni += System.nanoTime() - tJniStart
 
         lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
 
@@ -1329,18 +1385,21 @@ class VideoFrameProcessor(
             outBuf.position(0)
             outBuf.limit(requiredOutputBytes.toInt())
 
-            // DIAGNOSTICS: Log checksum after RIFE interpolation
-            val rifeOutputChecksum = calculateChecksum(outBuf, rifeOutputW, rifeOutputH)
-            Log.d(TAG, "PIPELINE CHECKSUM: after RIFE ${rifeOutputW}x${rifeOutputH} checksum=$rifeOutputChecksum")
+            if (VERBOSE_DIAGNOSTICS) {
+                val tChecksumStart = System.nanoTime()
+                val rifeOutputChecksum = calculateChecksum(outBuf, rifeOutputW, rifeOutputH)
+                nsChecksum += System.nanoTime() - tChecksumStart
+                Log.d(TAG, "PIPELINE CHECKSUM: after RIFE ${rifeOutputW}x${rifeOutputH} checksum=$rifeOutputChecksum")
+            }
 
             // Temporal order: previous frame was already rendered when it was captured (or as the
             // first frame), so we only render the interpolated frame and the next frame.
             // Sequence: A, M(A,B), B, M(B,C), C — correct 2x interpolation without duplication.
+            val tRenderStart = System.nanoTime()
             renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
-            frameCountOutput++
-
             renderFrameToOutput(nextFrame)
-            frameCountOutput++
+            nsRender += System.nanoTime() - tRenderStart
+            frameCountOutput += 2
         } else {
             val status = NativeEngine.getRifeStatus()
             reportError(
@@ -1350,15 +1409,65 @@ class VideoFrameProcessor(
                     "RIFE frame interpolation failed"
                 }
             )
+            val tRenderStart = System.nanoTime()
             renderFrameToOutput(nextFrame)
+            nsRender += System.nanoTime() - tRenderStart
             frameCountOutput++
         }
 
         releaseFrameBuffer(prev.pixels)
         previousFrame = nextFrame
 
+        reportStageTiming()
         updateStats()
     }
+
+    /**
+     * Accumulates one capture-to-render cycle and, every [TIMING_WINDOW_FRAMES] of them, emits a
+     * single averaged line. The window covers readback (including any buffer-pool allocation),
+     * the input copies, the optional checksum passes, the JNI interpolation and both output
+     * uploads/swaps, so `total` is directly comparable to the frame interval the decoder sees.
+     */
+    private fun reportStageTiming() {
+        if (timingStartNs == 0L) {
+            return
+        }
+        nsPair += System.nanoTime() - timingStartNs
+        timingStartNs = 0L
+        timingCycles++
+        if (timingCycles < TIMING_WINDOW_FRAMES) {
+            return
+        }
+
+        val n = timingCycles.toDouble()
+        val dropped = droppedFrameCount - droppedAtWindowStart
+        val captured = frameCountInput - capturedAtWindowStart
+        Log.i(
+            TAG,
+            "PIPELINE TIMING: n=$timingCycles " +
+                "readback=${fmtMs(nsReadback / n)} " +
+                "copy=${fmtMs(nsCopy / n)} " +
+                "checksum=${fmtMs(nsChecksum / n)} " +
+                "jni=${fmtMs(nsJni / n)} " +
+                "render=${fmtMs(nsRender / n)} " +
+                "total=${fmtMs(nsPair / n)} ms/cycle | " +
+                "captured=$captured dropped=$dropped " +
+                "in=${frameCountInput} out=$frameCountOutput rife=$isRifeEnabled"
+        )
+
+        timingCycles = 0
+        nsReadback = 0
+        nsCopy = 0
+        nsChecksum = 0
+        nsJni = 0
+        nsRender = 0
+        nsPair = 0
+        capturedAtWindowStart = frameCountInput
+        droppedAtWindowStart = droppedFrameCount
+    }
+
+    private fun fmtMs(nsPerCycle: Double): String =
+        String.format(java.util.Locale.US, "%.1f", nsPerCycle / 1_000_000.0)
 
     /**
      * Allocates the reusable direct buffers used by the JNI stage, keeping one allocation per size

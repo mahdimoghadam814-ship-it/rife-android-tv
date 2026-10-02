@@ -35,6 +35,12 @@ class GlOutputRenderer {
     companion object {
         private const val TAG = "GlOutputRenderer"
 
+        /**
+         * Per-frame render diagnostics. Runs twice per interpolated pair and includes whole-buffer
+         * checksums plus three EGL queries, so it is off while profiling the real cost.
+         */
+        private const val VERBOSE_DIAGNOSTICS = false
+
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
             attribute vec4 aTextureCoord;
@@ -239,10 +245,12 @@ class GlOutputRenderer {
         }
 
         // DIAGNOSTICS: Log EGL state before rendering
-        val currentDisplay = EGL14.eglGetCurrentDisplay()
-        val currentContext = EGL14.eglGetCurrentContext()
-        val currentSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
-        Log.d(TAG, "RENDER EGL STATE: display=$currentDisplay context=$currentContext surface=$currentSurface")
+        if (VERBOSE_DIAGNOSTICS) {
+            val currentDisplay = EGL14.eglGetCurrentDisplay()
+            val currentContext = EGL14.eglGetCurrentContext()
+            val currentSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+            Log.d(TAG, "RENDER EGL STATE: display=$currentDisplay context=$currentContext surface=$currentSurface")
+        }
 
         if (surfaceWidth != width || surfaceHeight != height) {
             // The window surface keeps the size of the SurfaceView; the viewport is set from the
@@ -250,18 +258,20 @@ class GlOutputRenderer {
             updateSurfaceSize()
         }
 
-        // DIAGNOSTICS: Calculate output buffer checksum
-        val checksum = calculateChecksum(buffer, width, height)
-        Log.d(TAG, "RENDER INPUT CHECKSUM: ${width}x$height checksum=$checksum")
+        if (VERBOSE_DIAGNOSTICS) {
+            // DIAGNOSTICS: Calculate output buffer checksum
+            val checksum = calculateChecksum(buffer, width, height)
+            Log.d(TAG, "RENDER INPUT CHECKSUM: ${width}x$height checksum=$checksum")
 
-        // DIAGNOSTICS: Query framebuffer binding and viewport before drawing
-        val boundFbo = IntArray(1)
-        GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, boundFbo, 0)
-        val viewport = IntArray(4)
-        GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0)
-        val currentProgram = IntArray(1)
-        GLES20.glGetIntegerv(GLES20.GL_CURRENT_PROGRAM, currentProgram, 0)
-        Log.d(TAG, "RENDER PRE-DRAW: boundFbo=${boundFbo[0]} viewport=${viewport.contentToString()} currentProgram=${currentProgram[0]} surfaceSize=${surfaceWidth}x$surfaceHeight")
+            // DIAGNOSTICS: Query framebuffer binding and viewport before drawing
+            val boundFbo = IntArray(1)
+            GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, boundFbo, 0)
+            val viewport = IntArray(4)
+            GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, viewport, 0)
+            val currentProgram = IntArray(1)
+            GLES20.glGetIntegerv(GLES20.GL_CURRENT_PROGRAM, currentProgram, 0)
+            Log.d(TAG, "RENDER PRE-DRAW: boundFbo=${boundFbo[0]} viewport=${viewport.contentToString()} currentProgram=${currentProgram[0]} surfaceSize=${surfaceWidth}x$surfaceHeight")
+        }
 
         GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
 
@@ -309,10 +319,13 @@ class GlOutputRenderer {
         GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
 
-        // DIAGNOSTICS: Check eglSwapBuffers result and error
+        // DIAGNOSTICS: Check eglSwapBuffers result and error. Successful swaps are silent: this
+        // line fires twice per interpolated pair and is pure overhead at the frame rate we need.
         val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
         val swapError = EGL14.eglGetError()
-        Log.d(TAG, "eglSwapBuffers: result=$swapResult error=0x${swapError.toString(16)}")
+        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
+            Log.d(TAG, "eglSwapBuffers: result=$swapResult error=0x${swapError.toString(16)}")
+        }
     }
 
     /**

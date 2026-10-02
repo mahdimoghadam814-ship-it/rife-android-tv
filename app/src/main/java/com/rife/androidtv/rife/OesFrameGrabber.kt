@@ -46,6 +46,12 @@ class OesFrameGrabber {
     companion object {
         private const val TAG = "OesFrameGrabber"
 
+        /**
+         * Per-frame capture diagnostics. Costs a whole-buffer pass inside the timed readback, so
+         * it is off by default.
+         */
+        private const val VERBOSE_DIAGNOSTICS = false
+
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
             attribute vec4 aTextureCoord;
@@ -295,8 +301,10 @@ class OesFrameGrabber {
             out.limit(requiredBytesInt)
 
             // DIAGNOSTICS: Calculate cheap pixel checksum to verify capture is non-black
-            val checksum = calculateChecksum(out, targetWidth, targetHeight)
-            Log.d(TAG, "CAPTURE CHECKSUM: ${targetWidth}x$targetHeight checksum=$checksum")
+            if (VERBOSE_DIAGNOSTICS) {
+                val checksum = calculateChecksum(out, targetWidth, targetHeight)
+                Log.d(TAG, "CAPTURE CHECKSUM: ${targetWidth}x$targetHeight checksum=$checksum")
+            }
 
             true
         } catch (t: Throwable) {
