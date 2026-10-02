@@ -160,6 +160,35 @@ static long long nsSince(std::chrono::steady_clock::time_point t0) {
         .count();
 }
 
+// ARM YIELD: tells the SMT/scheduler we are in a benign spin. Costs nothing when unsupported.
+static inline void spinPause() {
+#if defined(__aarch64__) || defined(__arm__)
+    __asm__ volatile("yield" ::: "memory");
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_ia32_pause();
+#endif
+}
+
+// How long a thread may busy-wait for the next parallel phase before parking on the condition
+// variable. A futex wake on the box costs 1-2 ms of *wall* time per phase because MediaCodec and
+// SurfaceFlinger are fighting over the same four A55 cores: on run 6 the pool measured
+// runWall=44.0 ms against work=94.1 ms - 81.9 ms of thread-time idle across 11 phases, i.e. the
+// barriers alone were adding ~1.9 ms to every phase. The threads we would have parked are the
+// ones about to run the next phase anyway, so spinning for a few ms is close to free here and
+// recovers most of that.
+static constexpr long long kSpinNs = 3LL * 1000 * 1000;
+
+// Returns true if `pred` became true while spinning, false if the deadline was hit first.
+template <typename Pred>
+static bool spinUntil(Pred pred) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(kSpinNs);
+    for (int i = 0;; i++) {
+        if (pred()) return true;
+        spinPause();
+        if ((i & 511) == 511 && std::chrono::steady_clock::now() >= deadline) return false;
+    }
+}
+
 // A persistent team of worker threads. The alternative - spawning std::threads inside every
 // parallelFor() - costs ~33 thread creations per frame and measured *slower* than running the
 // whole frame on one thread.
@@ -185,9 +214,9 @@ public:
             started_ = true;
             return;
         }
-        stop_ = false;
-        pending_ = 0;
-        gen_ = 0;
+        stop_.store(false, std::memory_order_relaxed);
+        pending_.store(0, std::memory_order_relaxed);
+        gen_.store(0, std::memory_order_relaxed);
         threads_.clear();
         threads_.reserve(static_cast<size_t>(count - 1));
         for (int i = 1; i < count; i++) {
@@ -241,9 +270,15 @@ public:
             callerWork = nsSince(tWork);
         }
 
+        // Wait for the workers without leaving the core: the last worker publishes pending_==0
+        // with release, so an acquire load here is enough. The lock is taken only afterwards to
+        // merge the caller's own work time into the shared stats.
+        if (!spinUntil([this] { return pending_.load(std::memory_order_acquire) == 0; })) {
+            std::unique_lock<std::mutex> waitLk(m_);
+            cvDone_.wait(waitLk, [this] { return pending_.load(std::memory_order_relaxed) == 0; });
+        }
         std::unique_lock<std::mutex> lk(m_);
         work_ns_ += callerWork;
-        cvDone_.wait(lk, [this] { return pending_ == 0; });
         run_ns_ += nsSince(tStart);
         runs_ += 1;
     }
@@ -255,10 +290,23 @@ private:
             std::function<void(int, int)> copy;
             int b = 0, e = 0;
             {
+                // Lock-free wait for the next phase. run() publishes fn_/begin_/end_/chunk_
+                // under m_ and *then* bumps gen_, so an acquire load that observes the new
+                // generation is enough; the lock below is only needed to read them.
+                const bool got = spinUntil([this, seen] {
+                    return stop_.load(std::memory_order_acquire) ||
+                           gen_.load(std::memory_order_acquire) != seen;
+                });
+                if (!got) {
+                    std::unique_lock<std::mutex> parkLk(m_);
+                    cvStart_.wait(parkLk, [this, seen] {
+                        return stop_.load(std::memory_order_relaxed) ||
+                               gen_.load(std::memory_order_relaxed) != seen;
+                    });
+                }
+                if (stop_.load(std::memory_order_acquire)) return;
                 std::unique_lock<std::mutex> lk(m_);
-                cvStart_.wait(lk, [this, seen] { return stop_ || gen_ != seen; });
-                if (stop_) return;
-                seen = gen_;
+                seen = gen_.load(std::memory_order_relaxed);
                 copy = *fn_;
                 b = begin_ + index * chunk_;
                 e = std::min(end_, b + chunk_);
@@ -281,7 +329,7 @@ private:
         {
             std::unique_lock<std::mutex> lk(m_);
             if (!started_) return;
-            stop_ = true;
+            stop_.store(true, std::memory_order_release);
             cvStart_.notify_all();
         }
         for (auto& t : threads_) {
@@ -290,8 +338,8 @@ private:
         std::unique_lock<std::mutex> lk(m_);
         threads_.clear();
         started_ = false;
-        stop_ = false;
-        pending_ = 0;
+        stop_.store(false, std::memory_order_relaxed);
+        pending_.store(0, std::memory_order_relaxed);
     }
 
     std::mutex m_;
@@ -299,12 +347,12 @@ private:
     const std::function<void(int, int)>* fn_ = nullptr;
     int participants_ = 1;
     int begin_ = 0, end_ = 0, chunk_ = 0;
-    int pending_ = 0;
+    std::atomic<int> pending_ = 0;    // atomic: read lock-free by the spinning caller
     long long run_ns_ = 0;
     long long work_ns_ = 0;
     long long runs_ = 0;
-    uint64_t gen_ = 0;
-    bool stop_ = false;
+    std::atomic<uint64_t> gen_ = 0;   // atomic: bumped under m_ after the job is published
+    std::atomic<bool> stop_ = false;  // atomic: read lock-free by spinning workers
     bool started_ = false;
     std::vector<std::thread> threads_;
 };
