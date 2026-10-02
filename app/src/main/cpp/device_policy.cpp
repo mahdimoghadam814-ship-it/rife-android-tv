@@ -224,21 +224,23 @@ void DevicePolicy::selectDeviceProfile() {
 void DevicePolicy::applyDeviceProfilePolicies() {
     switch (device_profile_) {
         case DeviceProfile::XIAOMI_TV_BOX_S_3RD_GEN:
-            // 2 GB TV box: keep only the genuinely memory-saving options. The fast
-            // convolution/layout paths must stay enabled - disabling packing_layout made
-            // ncnn use its unpacked pack1 shaders, and disabling winograd AND sgemm left
-            // only the direct convolution, which together cost ~53 s per 1920x960 frame
-            // on Mali-G310 (measured GPU-bound: worker thread used 18% of one core).
-            // Packing costs no extra memory; winograd/sgemm cost some workspace but are
-            // the difference between unusable and usable frame times.
+            // 2 GB TV box. Enable only the memory-neutral fast paths:
+            //  - use_packing_layout is a layout change and costs no extra memory, but
+            //    disabling it forces ncnn's unpacked pack1 GPU shaders. Measured ~53 s
+            //    per 1920x960 frame with packing off (GPU-bound: the worker thread used
+            //    18% of one core while the GPU churned).
+            //  - use_sgemm_convolution is the standard path and adds little workspace.
+            // Keep winograd OFF: its F(4,3)/F(6,3) transform buffers at 1920x960 with
+            // wide channels pushed after_load RSS from 405 MB to 521 MB, and the app was
+            // then LMK-killed at ~940 MB RSS before it could finish a single frame.
             memory_policy_.lightmode = true;
-            memory_policy_.disable_winograd = false;
+            memory_policy_.disable_winograd = true;
             memory_policy_.disable_sgemm = false;
             memory_policy_.disable_packing_layout = false;
             memory_policy_.disable_int8 = true;
-            memory_policy_.disable_winograd_variants = false;
+            memory_policy_.disable_winograd_variants = true;
             memory_policy_.disable_bf16 = true;
-            memory_policy_.disable_shader_local_memory = false;
+            memory_policy_.disable_shader_local_memory = true;
             memory_policy_.num_threads = 2;
             memory_policy_.max_interpolation_width = 1920;
             memory_policy_.max_interpolation_height = 1080;

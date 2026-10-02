@@ -201,9 +201,9 @@ class RifeEngineController(
                     val loadSuccess = NativeEngine.loadRifeModel(
                         context.assets,
                         baseCacheDir,
-                        "rife-v2.4",
-                        isV2 = true,
-                        isV4 = false,
+                        "rife-v4.6",
+                        isV2 = false,
+                        isV4 = true,
                     )
                     engineReady = loadSuccess
                     if (loadSuccess) {
