@@ -6,10 +6,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #define LOGI_MEMC(...) __android_log_print(ANDROID_LOG_INFO, "RIFE-MEMC", __VA_ARGS__)
 
@@ -47,6 +50,15 @@ static inline int clampi(int v, int lo, int hi) {
 static inline int roundScaled(int32_t mv, float scale) {
     const float f = static_cast<float>(mv) * scale;
     return static_cast<int>(f >= 0.0f ? f + 0.5f : f - 0.5f);
+}
+
+// CPU time actually consumed by the calling thread, excluding time spent descheduled.
+// Comparing this against wall time separates "the core is too slow" from "the thread
+// is being starved by MediaCodec / GL / SurfaceFlinger sharing the same four cores".
+static long long threadCpuNs() {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<long long>(ts.tv_sec) * 1000000000LL + ts.tv_nsec;
 }
 
 }  // namespace
@@ -468,6 +480,58 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     });
 }
 
+void MemcInterpolator::microBench() {
+    static bool done = false;
+    if (done) return;
+    done = true;
+
+    // Streaming NEON: the extractLuma inner loop, 4 reps over 8 MB of RGBA.
+    // The result is folded into a sink so the loop cannot be dead-code eliminated.
+    {
+        const int W = 2048, H = 1024;
+        std::vector<uint8_t> rgba(static_cast<size_t>(W) * H * 4);
+        std::vector<uint8_t> luma(static_cast<size_t>(W) * H);
+        for (size_t i = 0; i < rgba.size(); i++) rgba[i] = static_cast<uint8_t>(i * 131u);
+
+        const auto w0 = std::chrono::steady_clock::now();
+        const long long c0 = threadCpuNs();
+        unsigned sink = 0;
+        for (int rep = 0; rep < 4; rep++) {
+            extractLuma(rgba.data(), W, H, luma.data());
+            for (size_t i = 0; i < luma.size(); i += 997) sink = sink * 31u + luma[i];
+        }
+        const long long cpu = threadCpuNs() - c0;
+        const long long wall = nsSince(w0);
+        const double mb = 4.0 * 10.0;  // 4 reps x (8 MB read + 2 MB written)
+        LOGI_MEMC("BENCH neon wall=%.2f cpu=%.2f ms  %.0f MB/s(wall) %.0f MB/s(cpu) "
+                  "sink=%u",
+                  wall / 1e6, cpu / 1e6, mb * 1e9 / wall, mb * 1e9 / cpu, sink);
+    }
+
+    // sad16x16 throughput: 100k calls over two 1 MB planes with the real stride pattern.
+    {
+        std::vector<uint8_t> planeA(1024 * 1024, 5);
+        std::vector<uint8_t> planeB(1024 * 1024, 9);
+        volatile int sink = 0;
+        int acc = 0;
+        const auto w0 = std::chrono::steady_clock::now();
+        const long long c0 = threadCpuNs();
+        for (int i = 0; i < 100000; i++) {
+            const size_t ra = static_cast<size_t>(i % 1000);
+            const size_t rb = static_cast<size_t>((i * 1021u) % 1000);
+            acc += sad16x16(planeA.data() + ra * 1024 + 16,
+                            planeB.data() + rb * 1024 + 16, 1024);
+        }
+        sink = acc;
+        const long long cpu = threadCpuNs() - c0;
+        const long long wall = nsSince(w0);
+        LOGI_MEMC("BENCH sad wall=%.2f cpu=%.2f ms  %.2f M calls/s(wall) "
+                  "%.2f M calls/s(cpu) sink=%d",
+                  wall / 1e6, cpu / 1e6, 100.0 / (wall / 1e6), 100.0 / (cpu / 1e6),
+                  static_cast<int>(sink));
+    }
+}
+
 bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
                                    int srcW, int srcHeight,
                                    int targetWidth, int targetHeight,
@@ -477,6 +541,8 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
     if (srcW <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
     if (targetWidth > srcW || targetHeight > srcHeight) return false;
     if (timestep < 0.0f || timestep > 1.0f) return false;
+
+    microBench();  // one-shot; logs raw NEON and sad16x16 throughput
 
     const auto tSetup0 = std::chrono::steady_clock::now();
     if (dirty_.exchange(false, std::memory_order_acq_rel)) {
@@ -519,8 +585,10 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
     }
 
     const auto tLuma = std::chrono::steady_clock::now();
+    const long long tLumaCpu = threadCpuNs();
     extractLuma(a, w, h, luma0_.data());
     extractLuma(b, w, h, luma1_.data());
+    acc_luma_cpu_ns_ += threadCpuNs() - tLumaCpu;
     acc_luma_ns_ += nsSince(tLuma);
 
     // buildPyramid only fills level 0 (it aliases the luma plane); the coarser levels
@@ -577,6 +645,7 @@ void MemcInterpolator::reportStagesIfDue() {
     const double setup = ms(acc_setup_ns_);
     const double resize = ms(acc_resize_ns_);
     const double luma = ms(acc_luma_ns_);
+    const double lumaCpu = ms(acc_luma_cpu_ns_);
     const double pyr = ms(acc_pyr_ns_);
     const double fwd = ms(acc_fwd_ns_);
     const double bwd = ms(acc_bwd_ns_);
@@ -593,16 +662,17 @@ void MemcInterpolator::reportStagesIfDue() {
                            ? 100.0 * workPerFrame / (runPerFrame * participants)
                            : 100.0;
 
-    LOGI_MEMC("STAGES n=%lld frame=%.1f setup=%.2f resize=%.2f luma=%.2f pyr=%.2f "
-              "fwd=%.1f bwd=%.1f warp=%.1f ms | pool runs/frame=%.1f runWall=%.1f "
-              "work=%.1f eff=%.0f%% thr=%d",
-              acc_frames_, frame, setup, resize, luma, pyr, fwd, bwd, warp,
+    LOGI_MEMC("STAGES n=%lld frame=%.1f setup=%.2f resize=%.2f luma=%.2f "
+              "lumaCpu=%.2f pyr=%.2f fwd=%.1f bwd=%.1f warp=%.1f ms | pool "
+              "runs/frame=%.1f runWall=%.1f work=%.1f eff=%.0f%% thr=%d",
+              acc_frames_, frame, setup, resize, luma, lumaCpu, pyr, fwd, bwd, warp,
               runsPerFrame, runPerFrame, workPerFrame, eff, participants);
 
     acc_frames_ = 0;
     acc_setup_ns_ = 0;
     acc_resize_ns_ = 0;
     acc_luma_ns_ = 0;
+    acc_luma_cpu_ns_ = 0;
     acc_pyr_ns_ = 0;
     acc_fwd_ns_ = 0;
     acc_bwd_ns_ = 0;

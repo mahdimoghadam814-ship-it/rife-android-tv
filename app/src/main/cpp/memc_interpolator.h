@@ -68,6 +68,10 @@ private:
     static constexpr int kFineRange = 2;
 
     void ensureCapacity(int w, int h);
+    // One-shot micro-benchmark logged on the first frame: raw NEON streaming throughput and
+    // raw sad16x16 throughput, each in wall time and thread CPU time. Used to tell an
+    // under-powered core apart from a thread that is being starved by the rest of the app.
+    void microBench();
     void extractLuma(const uint8_t* rgba, int w, int h, uint8_t* luma);
     void downsample2(const uint8_t* src, int sw, int sh, uint8_t* dst);
     void buildPyramid(const uint8_t* luma, int w, int h, uint8_t** pyr);
@@ -97,6 +101,7 @@ private:
     long long acc_setup_ns_ = 0;
     long long acc_resize_ns_ = 0;
     long long acc_luma_ns_ = 0;
+    long long acc_luma_cpu_ns_ = 0;
     long long acc_pyr_ns_ = 0;
     long long acc_fwd_ns_ = 0;
     long long acc_bwd_ns_ = 0;
