@@ -51,6 +51,12 @@ static inline int roundScaled(int32_t mv, float scale) {
 
 }  // namespace
 
+static long long nsSince(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now() - t0)
+        .count();
+}
+
 // A persistent team of worker threads. The alternative - spawning std::threads inside every
 // parallelFor() - costs ~33 thread creations per frame and measured *slower* than running the
 // whole frame on one thread.
@@ -87,10 +93,28 @@ public:
         started_ = true;
     }
 
+    // Diagnostics: run() wall time versus the summed time spent actually executing the
+    // region across the caller and every worker. `work` is what a single thread would
+    // roughly cost; if `runWall` >> work / participants then the barriers - not the
+    // arithmetic - are what the frame is paying for.
+    void stats(long long* runNs, long long* workNs, long long* runs, int* participants) {
+        std::unique_lock<std::mutex> lk(m_);
+        *runNs = run_ns_;
+        *workNs = work_ns_;
+        *runs = runs_;
+        *participants = participants_;
+    }
+
     void run(int begin, int end, const std::function<void(int, int)>& fn) {
+        const auto tStart = std::chrono::steady_clock::now();
         const int total = end - begin;
         if (total <= 1 || participants_ <= 1) {
             if (total > 0) fn(begin, end);
+            const long long d = nsSince(tStart);
+            std::unique_lock<std::mutex> lk(m_);
+            run_ns_ += d;
+            work_ns_ += d;
+            runs_ += 1;
             return;
         }
 
@@ -107,10 +131,18 @@ public:
             cvStart_.notify_all();
         }
 
-        if (myE > myB) fn(myB, myE);
+        long long callerWork = 0;
+        if (myE > myB) {
+            const auto tWork = std::chrono::steady_clock::now();
+            fn(myB, myE);
+            callerWork = nsSince(tWork);
+        }
 
         std::unique_lock<std::mutex> lk(m_);
+        work_ns_ += callerWork;
         cvDone_.wait(lk, [this] { return pending_ == 0; });
+        run_ns_ += nsSince(tStart);
+        runs_ += 1;
     }
 
 private:
@@ -128,9 +160,15 @@ private:
                 b = begin_ + index * chunk_;
                 e = std::min(end_, b + chunk_);
             }
-            if (e > b) copy(b, e);
+            long long workNs = 0;
+            if (e > b) {
+                const auto tWork = std::chrono::steady_clock::now();
+                copy(b, e);
+                workNs = nsSince(tWork);
+            }
             {
                 std::unique_lock<std::mutex> lk(m_);
+                work_ns_ += workNs;
                 if (--pending_ == 0) cvDone_.notify_one();
             }
         }
@@ -159,6 +197,9 @@ private:
     int participants_ = 1;
     int begin_ = 0, end_ = 0, chunk_ = 0;
     int pending_ = 0;
+    long long run_ns_ = 0;
+    long long work_ns_ = 0;
+    long long runs_ = 0;
     uint64_t gen_ = 0;
     bool stop_ = false;
     bool started_ = false;
@@ -437,6 +478,7 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
     if (targetWidth > srcW || targetHeight > srcHeight) return false;
     if (timestep < 0.0f || timestep > 1.0f) return false;
 
+    const auto tSetup0 = std::chrono::steady_clock::now();
     if (dirty_.exchange(false, std::memory_order_acq_rel)) {
         // A seek / stream change happened while the previous frame was in flight.
         work_w_ = 0;
@@ -452,10 +494,12 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
 
     // Capacity must be established before resized0_/resized1_ are written into.
     ensureCapacity(w, h);
+    acc_setup_ns_ += nsSince(tSetup0);
 
     const uint8_t* a = src0;
     const uint8_t* b = src1;
     if (!sameSize) {
+        const auto tResize = std::chrono::steady_clock::now();
         auto shrink = [&](const uint8_t* src, uint8_t* dst) {
             for (int y = 0; y < h; y++) {
                 const int sy = static_cast<int>(static_cast<int64_t>(y) * srcHeight / h);
@@ -471,31 +515,99 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
         shrink(src1, resized1_.data());
         a = resized0_.data();
         b = resized1_.data();
+        acc_resize_ns_ += nsSince(tResize);
     }
 
+    const auto tLuma = std::chrono::steady_clock::now();
     extractLuma(a, w, h, luma0_.data());
     extractLuma(b, w, h, luma1_.data());
+    acc_luma_ns_ += nsSince(tLuma);
 
     // buildPyramid only fills level 0 (it aliases the luma plane); the coarser levels
     // point at the scratch buffers sized by ensureCapacity().
     uint8_t* pyr0[kLevels] = {luma0_.data(), pyr0_[1].data(), pyr0_[2].data()};
     uint8_t* pyr1[kLevels] = {luma1_.data(), pyr1_[1].data(), pyr1_[2].data()};
+    const auto tPyr = std::chrono::steady_clock::now();
     buildPyramid(luma0_.data(), w, h, pyr0);
     buildPyramid(luma1_.data(), w, h, pyr1);
+    acc_pyr_ns_ += nsSince(tPyr);
 
     // forward  = where in0's blocks ended up in in1  (ref = in1, tgt = in0)
     // backward = where in1's blocks came from in in0 (ref = in0, tgt = in1)
+    const auto tFwd = std::chrono::steady_clock::now();
     motionEstimate(pyr0, pyr1, w, h, mvf_x_.data(), mvf_y_.data());
-    motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
+    acc_fwd_ns_ += nsSince(tFwd);
 
+    const auto tBwd = std::chrono::steady_clock::now();
+    motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
+    acc_bwd_ns_ += nsSince(tBwd);
+
+    const auto tWarp = std::chrono::steady_clock::now();
     motionCompensate(a, b, w, h, timestep,
                      mvf_x_.data(), mvf_y_.data(),
                      mvb_x_.data(), mvb_y_.data(),
                      out);
+    acc_warp_ns_ += nsSince(tWarp);
+
+    acc_total_ns_ += nsSince(t0);
+    acc_frames_ += 1;
 
     last_ms_.store(std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    reportStagesIfDue();
     return true;
+}
+
+void MemcInterpolator::reportStagesIfDue() {
+    if (acc_frames_ < kStageReportFrames) return;
+
+    const double n = static_cast<double>(acc_frames_);
+    auto ms = [n](long long ns) { return ns / n / 1e6; };
+
+    long long poolRun = 0, poolWork = 0, poolRuns = 0;
+    int participants = 1;
+    pool_->stats(&poolRun, &poolWork, &poolRuns, &participants);
+    const long long dRun = poolRun - last_pool_run_;
+    const long long dWork = poolWork - last_pool_work_;
+    const long long dRuns = poolRuns - last_pool_runs_;
+    last_pool_run_ = poolRun;
+    last_pool_work_ = poolWork;
+    last_pool_runs_ = poolRuns;
+
+    const double setup = ms(acc_setup_ns_);
+    const double resize = ms(acc_resize_ns_);
+    const double luma = ms(acc_luma_ns_);
+    const double pyr = ms(acc_pyr_ns_);
+    const double fwd = ms(acc_fwd_ns_);
+    const double bwd = ms(acc_bwd_ns_);
+    const double warp = ms(acc_warp_ns_);
+    const double frame = setup + resize + luma + pyr + fwd + bwd + warp;
+
+    const double runPerFrame = dRun / n / 1e6;
+    const double workPerFrame = dWork / n / 1e6;
+    const double runsPerFrame = dRuns / n;
+    // Ideally work ~= runWall * participants. A low value means the frame is paying for
+    // thread wakeups and barriers rather than for arithmetic; workPerFrame then estimates
+    // what the whole frame would cost on a single thread.
+    const double eff = (runPerFrame > 0.0 && participants > 1)
+                           ? 100.0 * workPerFrame / (runPerFrame * participants)
+                           : 100.0;
+
+    LOGI_MEMC("STAGES n=%lld frame=%.1f setup=%.2f resize=%.2f luma=%.2f pyr=%.2f "
+              "fwd=%.1f bwd=%.1f warp=%.1f ms | pool runs/frame=%.1f runWall=%.1f "
+              "work=%.1f eff=%.0f%% thr=%d",
+              acc_frames_, frame, setup, resize, luma, pyr, fwd, bwd, warp,
+              runsPerFrame, runPerFrame, workPerFrame, eff, participants);
+
+    acc_frames_ = 0;
+    acc_setup_ns_ = 0;
+    acc_resize_ns_ = 0;
+    acc_luma_ns_ = 0;
+    acc_pyr_ns_ = 0;
+    acc_fwd_ns_ = 0;
+    acc_bwd_ns_ = 0;
+    acc_warp_ns_ = 0;
+    acc_total_ns_ = 0;
 }
 
 }  // namespace rife

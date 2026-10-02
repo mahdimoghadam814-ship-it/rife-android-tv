@@ -90,6 +90,26 @@ private:
     std::atomic<int> threads_{1};
     std::atomic<double> last_ms_{0.0};
 
+    // Per-stage accumulation for diagnostics. Only touched by the pipeline worker thread
+    // (interpolate() is never re-entered), so no synchronisation is needed.
+    static constexpr long long kStageReportFrames = 60;
+    long long acc_frames_ = 0;
+    long long acc_setup_ns_ = 0;
+    long long acc_resize_ns_ = 0;
+    long long acc_luma_ns_ = 0;
+    long long acc_pyr_ns_ = 0;
+    long long acc_fwd_ns_ = 0;
+    long long acc_bwd_ns_ = 0;
+    long long acc_warp_ns_ = 0;
+    long long acc_total_ns_ = 0;
+
+    // Last reported MemcPool snapshot, so each report covers only its own window.
+    long long last_pool_run_ = 0;
+    long long last_pool_work_ = 0;
+    long long last_pool_runs_ = 0;
+
+    void reportStagesIfDue();
+
     // Only ever touched by the pipeline worker thread.
     int work_w_ = 0;
     int work_h_ = 0;
