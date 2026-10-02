@@ -278,6 +278,13 @@ class VideoFrameProcessor(
     private var nsJni = 0L
     private var nsRender = 0L
     private var nsPair = 0L
+    // Per-phase split of nsRender, drained from GlOutputRenderer once per report window.
+    private val renderBreakdown = LongArray(6)
+    private var nsRenderCurrent = 0L
+    private var nsRenderSetup = 0L
+    private var nsRenderUpload = 0L
+    private var nsRenderDraw = 0L
+    private var nsRenderSwap = 0L
     private var capturedAtWindowStart = 0
     private var droppedAtWindowStart = 0L
 
@@ -1440,6 +1447,14 @@ class VideoFrameProcessor(
         }
 
         val n = timingCycles.toDouble()
+        // Fold in the renderer's own per-phase split so `render` stops being a black box.
+        outputRenderer?.takeRenderBreakdown(renderBreakdown)
+        nsRenderCurrent += renderBreakdown[0]
+        nsRenderSetup += renderBreakdown[1]
+        nsRenderUpload += renderBreakdown[2]
+        nsRenderDraw += renderBreakdown[3]
+        nsRenderSwap += renderBreakdown[4]
+        val renderCalls = renderBreakdown[5]
         val dropped = droppedFrameCount - droppedAtWindowStart
         val captured = frameCountInput - capturedAtWindowStart
         Log.i(
@@ -1451,6 +1466,9 @@ class VideoFrameProcessor(
                 "jni=${fmtMs(nsJni / n)} " +
                 "render=${fmtMs(nsRender / n)} " +
                 "total=${fmtMs(nsPair / n)} ms/cycle | " +
+                "renderSplit calls=$renderCalls cur=${fmtMs(nsRenderCurrent / n)} " +
+                "st=${fmtMs(nsRenderSetup / n)} up=${fmtMs(nsRenderUpload / n)} " +
+                "dr=${fmtMs(nsRenderDraw / n)} sw=${fmtMs(nsRenderSwap / n)} | " +
                 "captured=$captured dropped=$dropped " +
                 "in=${frameCountInput} out=$frameCountOutput rife=$isRifeEnabled"
         )
@@ -1461,6 +1479,11 @@ class VideoFrameProcessor(
         nsChecksum = 0
         nsJni = 0
         nsRender = 0
+        nsRenderCurrent = 0
+        nsRenderSetup = 0
+        nsRenderUpload = 0
+        nsRenderDraw = 0
+        nsRenderSwap = 0
         nsPair = 0
         capturedAtWindowStart = frameCountInput
         droppedAtWindowStart = droppedFrameCount
@@ -1588,9 +1611,13 @@ class VideoFrameProcessor(
         pixels.position(0)
         pixels.limit(requiredBytes.toInt())
 
-        // DIAGNOSTICS: Log checksum before sending to GlOutputRenderer
-        val renderChecksum = calculateChecksum(pixels, width, height)
-        Log.d(TAG, "PIPELINE CHECKSUM: before GlOutputRenderer ${width}x$height checksum=$renderChecksum")
+        // DIAGNOSTICS: Log checksum before sending to GlOutputRenderer. This samples the buffer
+        // one byte at a time through ByteBuffer.get(offset), i.e. ~91k JNI calls per 854x427
+        // frame and ~182k per interpolated pair, so it must never run on the playback path.
+        if (VERBOSE_DIAGNOSTICS) {
+            val renderChecksum = calculateChecksum(pixels, width, height)
+            Log.d(TAG, "PIPELINE CHECKSUM: before GlOutputRenderer ${width}x$height checksum=$renderChecksum")
+        }
 
         try {
             renderer.render(pixels, width, height)

@@ -89,6 +89,10 @@ class GlOutputRenderer {
     private var uContentScaleHandle = -1
     private var textureId = 0
 
+    /** Dimensions currently described by [textureId]; 0 until the first upload. */
+    private var textureWidth = 0
+    private var textureHeight = 0
+
     /**
      * Clip-space scale that letterboxes the frame into the surface. Seeded to 0 so the very first
      * [updateContentScale] always reports a change and the uniform (defaulting to 0) gets set.
@@ -102,6 +106,19 @@ class GlOutputRenderer {
     private var outputSurface: Surface? = null
     private var surfaceWidth = 0
     private var surfaceHeight = 0
+
+    /**
+     * Accumulated nanoseconds per phase of [render], in order: eglMakeCurrent (+ surface resize),
+     * state setup (viewport/uniforms/clear), glTexImage2D upload, attribute setup + glDrawArrays,
+     * eglSwapBuffers. [VideoFrameProcessor] drains them into the PIPELINE TIMING line and resets
+     * them, so a single number like "render=28.0" can be attributed to the right call.
+     */
+    private var nsCurrent = 0L
+    private var nsSetup = 0L
+    private var nsUpload = 0L
+    private var nsDraw = 0L
+    private var nsSwap = 0L
+    private var renderCalls = 0L
 
     private val vertexBuffer: FloatBuffer = ByteBuffer
         .allocateDirect(FULL_QUAD_VERTICES.size * 4)
@@ -171,6 +188,8 @@ class GlOutputRenderer {
         val textures = IntArray(1)
         GLES20.glGenTextures(1, textures, 0)
         textureId = textures[0]
+        textureWidth = 0
+        textureHeight = 0
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
@@ -235,6 +254,25 @@ class GlOutputRenderer {
     }
 
     /**
+     * Moves the accumulated per-phase render costs into [into] (which must hold at least 6 longs,
+     * filled as makeCurrent, setup, upload, draw, swap, call count) and resets them.
+     */
+    fun takeRenderBreakdown(into: LongArray) {
+        into[0] = nsCurrent
+        into[1] = nsSetup
+        into[2] = nsUpload
+        into[3] = nsDraw
+        into[4] = nsSwap
+        into[5] = renderCalls
+        nsCurrent = 0L
+        nsSetup = 0L
+        nsUpload = 0L
+        nsDraw = 0L
+        nsSwap = 0L
+        renderCalls = 0L
+    }
+
+    /**
      * Uploads [buffer] (exactly [width] x [height] RGBA bytes, top row first) and presents it.
      * Must be called with the worker's EGL context current.
      */
@@ -251,7 +289,16 @@ class GlOutputRenderer {
             return
         }
 
-        if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+        var tPhase = System.nanoTime()
+        // Two renders run back to back per interpolated pair, and eglMakeCurrent is the first
+        // thing each of them does. The second call re-binds a context/surface pair that the
+        // first one just established, so ask EGL rather than paying for the redundant rebind.
+        // ensureEglContextCurrent() in VideoFrameProcessor uses the same query idiom.
+        val alreadyCurrent = EGL14.eglGetCurrentContext() == eglContext &&
+            EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW) == eglSurface
+        if (!alreadyCurrent &&
+            !EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        ) {
             Log.e(TAG, "eglMakeCurrent failed: 0x${EGL14.eglGetError().toString(16)}")
             return
         }
@@ -269,6 +316,7 @@ class GlOutputRenderer {
             // actual surface size so the frame is never stretched by a stale viewport.
             updateSurfaceSize()
         }
+        nsCurrent += System.nanoTime() - tPhase
 
         if (VERBOSE_DIAGNOSTICS) {
             // DIAGNOSTICS: Calculate output buffer checksum
@@ -285,6 +333,7 @@ class GlOutputRenderer {
             Log.d(TAG, "RENDER PRE-DRAW: boundFbo=${boundFbo[0]} viewport=${viewport.contentToString()} currentProgram=${currentProgram[0]} surfaceSize=${surfaceWidth}x$surfaceHeight")
         }
 
+        tPhase = System.nanoTime()
         GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
 
         GLES20.glUseProgram(program)
@@ -301,6 +350,7 @@ class GlOutputRenderer {
         // bars are painted black instead of leaving the previous frame's contents on screen.
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        nsSetup += System.nanoTime() - tPhase
 
         val requiredBytes = width.toLong() * height.toLong() * 4L
         if (requiredBytes > Int.MAX_VALUE) {
@@ -309,18 +359,39 @@ class GlOutputRenderer {
         }
         buffer.position(0)
         buffer.limit(requiredBytes.toInt())
-        GLES20.glTexImage2D(
-            GLES20.GL_TEXTURE_2D,
-            0,
-            GLES20.GL_RGBA,
-            width,
-            height,
-            0,
-            GLES20.GL_RGBA,
-            GLES20.GL_UNSIGNED_BYTE,
-            buffer
-        )
+        tPhase = System.nanoTime()
+        if (textureWidth != width || textureHeight != height) {
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D,
+                0,
+                GLES20.GL_RGBA,
+                width,
+                height,
+                0,
+                GLES20.GL_RGBA,
+                GLES20.GL_UNSIGNED_BYTE,
+                buffer
+            )
+            textureWidth = width
+            textureHeight = height
+        } else {
+            // Same shape as last frame: the storage already exists, so this is a plain
+            // memcpy into it instead of letting the driver re-specify the texture.
+            GLES20.glTexSubImage2D(
+                GLES20.GL_TEXTURE_2D,
+                0,
+                0,
+                0,
+                width,
+                height,
+                GLES20.GL_RGBA,
+                GLES20.GL_UNSIGNED_BYTE,
+                buffer
+            )
+        }
+        nsUpload += System.nanoTime() - tPhase
 
+        tPhase = System.nanoTime()
         vertexBuffer.position(0)
         GLES20.glEnableVertexAttribArray(aPositionHandle)
         GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
@@ -339,11 +410,15 @@ class GlOutputRenderer {
         GLES20.glDisableVertexAttribArray(aPositionHandle)
         GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        nsDraw += System.nanoTime() - tPhase
 
         // DIAGNOSTICS: Check eglSwapBuffers result and error. Successful swaps are silent: this
         // line fires twice per interpolated pair and is pure overhead at the frame rate we need.
+        tPhase = System.nanoTime()
         val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
         val swapError = EGL14.eglGetError()
+        nsSwap += System.nanoTime() - tPhase
+        renderCalls++
         if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
             Log.d(TAG, "eglSwapBuffers: result=$swapResult error=0x${swapError.toString(16)}")
         }
