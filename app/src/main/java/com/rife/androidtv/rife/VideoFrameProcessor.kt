@@ -1348,8 +1348,6 @@ class VideoFrameProcessor(
             return
         }
 
-        val in0Buf = cachedIn0Buf!!
-        val in1Buf = cachedIn1Buf!!
         val den0Buf = cachedDenoised0Buf!!
         val den1Buf = cachedDenoised1Buf!!
         val outBuf = cachedOutBuf!!
@@ -1357,15 +1355,42 @@ class VideoFrameProcessor(
         prev.pixels.clear()
         nextFrame.pixels.clear()
 
-        // Inputs keep the clear -> put -> flip contract: flip() is what publishes the number of
-        // written bytes as the limit, so the readable range matches the frame handed to the stage.
+        // The readback leaves every pooled frame at position 0 with limit = width*height*4, and
+        // this cycle's stage reads exactly that many bytes from offset 0, so the pixels can be
+        // handed over where they are instead of being memcpy'd into a second buffer. At 1080p that
+        // is 16 MB of copying per cycle, roughly 7 ms of it, for data that is already contiguous
+        // and already has the right readable range.
+        //
+        // Only the previous frame can disagree about the shape: the AUTO policy is allowed to step
+        // the capture size down between one frame and the next, and a frame on the wrong side of
+        // that step is still the old size. When that happens the copy runs as before, but clipped
+        // to what both buffers hold - unclipped it would overflow as soon as the source frame was
+        // larger than the destination, which is exactly the case the size change produces.
         val tCopyStart = System.nanoTime()
-        in0Buf.clear()
-        in1Buf.clear()
-        in0Buf.put(prev.pixels)
-        in1Buf.put(nextFrame.pixels)
-        in0Buf.flip()
-        in1Buf.flip()
+        val frameBytes = (rifeInputW.toLong() * rifeInputH.toLong() * 4L)
+            .coerceAtMost(Int.MAX_VALUE.toLong())
+        var in0Buf: ByteBuffer
+        val prevPixels = prev.pixels
+        val prevBytes = (prev.width.toLong() * prev.height.toLong() * 4L)
+            .coerceAtMost(prevPixels.capacity().toLong())
+        if (prev.width == rifeInputW && prev.height == rifeInputH &&
+            prevBytes >= frameBytes
+        ) {
+            in0Buf = prevPixels
+            in0Buf.position(0)
+            in0Buf.limit(frameBytes.toInt())
+        } else {
+            in0Buf = cachedIn0Buf!!
+            in0Buf.clear()
+            val savedPrevLimit = prevPixels.limit()
+            prevPixels.limit(minOf(prevBytes, in0Buf.remaining().toLong()).toInt())
+            in0Buf.put(prevPixels)
+            prevPixels.limit(savedPrevLimit)
+            in0Buf.flip()
+        }
+        val in1Buf = nextFrame.pixels
+        in1Buf.position(0)
+        in1Buf.limit(frameBytes.toInt())
         nsCopy += System.nanoTime() - tCopyStart
 
         // DIAGNOSTICS: Log checksum of frames before FastDVDnet/RIFE
