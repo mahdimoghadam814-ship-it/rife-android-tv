@@ -169,17 +169,35 @@ Java_com_rife_androidtv_NativeEngine_getRifeStatus(JNIEnv* env, jclass clazz) {
         res.vulkan_caps.uniform_storage_buffer_16bit
     );
 
-    // Get DeviceProfile enum value
+    // Get DeviceProfile enum value.
+    //
+    // DeviceProfile.values() is a static *method*, not a field, so GetStaticFieldID throws
+    // NoSuchFieldError. The next JNI call (GetStaticObjectField) was then entered with that
+    // exception still pending, which CheckJNI turns into a SIGABRT of the whole process -
+    // the Kotlin try/catch around this call never sees it. Use Class.getEnumConstants(),
+    // which works for any enum regardless of how it is named, and never call into JNI while
+    // an exception is pending.
     jclass profileClass = env->FindClass("com/rife/androidtv/DeviceProfile");
     if (profileClass == nullptr) {
         return nullptr;
     }
-    jfieldID profileField = env->GetStaticFieldID(
-        profileClass,
-        "values",
-        "()[Lcom/rife/androidtv/DeviceProfile;"
-    );
-    jobjectArray profileValues = static_cast<jobjectArray>(env->GetStaticObjectField(profileClass, profileField));
+
+    jobjectArray profileValues = nullptr;
+    jclass classClass = env->FindClass("java/lang/Class");
+    if (classClass != nullptr && !env->ExceptionCheck()) {
+        jmethodID getEnumConstants =
+            env->GetMethodID(classClass, "getEnumConstants", "()[Ljava/lang/Object;");
+        if (getEnumConstants != nullptr && !env->ExceptionCheck()) {
+            profileValues = static_cast<jobjectArray>(
+                env->CallObjectMethod(profileClass, getEnumConstants));
+        }
+        env->DeleteLocalRef(classClass);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        profileValues = nullptr;
+    }
+
     jobject profileObj = nullptr;
     if (profileValues) {
         jsize len = env->GetArrayLength(profileValues);
