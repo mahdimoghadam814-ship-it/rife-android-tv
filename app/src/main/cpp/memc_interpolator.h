@@ -108,6 +108,14 @@ private:
                           const int32_t* mvb_x, const int32_t* mvb_y,
                           uint8_t* out);
 
+    // One coherence pass: each block may adopt a neighbour's vector when that vector scores
+    // better on this block. Candidates come from mvx/mvy, results go to outx/outy, so the pass
+    // never reads what it is writing and parallel rows cannot race. Call it twice with the
+    // output fed back as the input to let a correction travel more than one block.
+    void regulariseField(const uint8_t* tgt, const uint8_t* ref, int w, int h,
+                         const int32_t* mvx, const int32_t* mvy,
+                         int32_t* outx, int32_t* outy);
+
     // Shared front half of interpolate() and motionField(): scratch sizing, the optional shrink to
     // the processing size, RGBA->luma, the pyramid and both motion estimates. On success *aOut and
     // *bOut (when non-null) point at the processing-sized frames - the inputs themselves when no
@@ -165,6 +173,8 @@ private:
     std::vector<uint8_t> pyr1_[kLevels];
     std::vector<uint8_t> resized0_, resized1_;
     std::vector<int32_t> mvf_x_, mvf_y_, mvb_x_, mvb_y_;
+    // Destination for one regulariseField() pass; a few kilobytes even at 1080p.
+    std::vector<int32_t> tmpx_, tmpy_;
 };
 
 }  // namespace rife

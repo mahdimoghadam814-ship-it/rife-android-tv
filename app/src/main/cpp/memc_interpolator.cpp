@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -40,6 +41,40 @@ static inline int sad16x16(const uint8_t* a, const uint8_t* b, int stride) {
     uint32x2_t q = vpadd_u32(p, p);
     return static_cast<int>(vget_lane_u32(q, 0));
 }
+
+// Sum of absolute differences over an 8x8 window. Used by the coherence pass, where four
+// candidates have to be scored per block and a full 16x16 evaluation for each would cost more
+// than the search it is cleaning up. Accumulator stays in uint16: 8 rows * 255 = 2040.
+static inline int sad8x8(const uint8_t* a, const uint8_t* b, int stride) {
+    uint16x8_t acc = vdupq_n_u16(0);
+    for (int y = 0; y < 8; y++) {
+        uint8x8_t d = vabd_u8(vld1_u8(a + y * stride), vld1_u8(b + y * stride));
+        acc = vaddq_u16(acc, vmovl_u8(d));
+    }
+    uint16x4_t s = vadd_u16(vget_low_u16(acc), vget_high_u16(acc));
+    uint32x2_t p = vpaddl_u16(s);
+    uint32x2_t q = vpadd_u32(p, p);
+    return static_cast<int>(vget_lane_u32(q, 0));
+}
+
+// MV coherence penalties, in SAD counts per full-resolution pixel of deviation. These are the
+// block-matching counterpart of SVP's penalty.* settings and they are what keeps a per-block
+// search from producing a field that is locally plausible but globally speckled:
+//
+//   kPenaltyNew    a candidate is charged for moving away from the estimate inherited from the
+//                  coarser pyramid level, so the fine pass refines instead of jumping to a
+//                  coincidental match in textured or repetitive areas.
+//   kPenaltyZero   a candidate is charged for its own magnitude, which breaks ties in favour of
+//                  stillness - flat and out-of-focus regions should read as no motion rather
+//                  than as whatever the noise happened to prefer.
+//   kPenaltyNeighbour a candidate is charged for differing from the block's current vector, so
+//                  the coherence pass only adopts a neighbour when it is clearly better here.
+//
+// Magnitudes are deliberately small against a 16x16 SAD (which runs into the thousands for a
+// mismatch): they decide between near-ties, they do not override the picture.
+static constexpr int kPenaltyNew = 16;
+static constexpr int kPenaltyZero = 4;
+static constexpr int kPenaltyNeighbour = 96;
 
 static inline int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -404,6 +439,8 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     mvf_y_.resize(blocks);
     mvb_x_.resize(blocks);
     mvb_y_.resize(blocks);
+    tmpx_.resize(blocks);
+    tmpy_.resize(blocks);
 
     work_w_ = w;
     work_h_ = h;
@@ -495,6 +532,12 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         const int lcols = std::min((lw + kBlock - 1) / kBlock, groupsX);
         const int range = (l == kLevels - 1) ? kCoarseRange : kFineRange;
         const int group = div;                      // full-res blocks per side
+        // Both penalties are scaled by div so they are charged per full-resolution pixel and
+        // their strength is the same at every level. The coarsest level is seeded from an
+        // all-zero field, so kPenaltyNew is switched off there - otherwise it would only be
+        // charging the search for finding motion at all.
+        const int newLambda = (l == kLevels - 1) ? 0 : kPenaltyNew * div;
+        const int zeroLambda = kPenaltyZero * div;
         const uint8_t* tgt = tgtPyr[l];
         const uint8_t* ref = refPyr[l];
 
@@ -522,7 +565,9 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         for (int dx = -range; dx <= range; dx++) {
                             const int xx = bx + gx + dx;
                             if (xx < 0 || xx + kBlock > lw) continue;
-                            const int s = sad16x16(tb, row + xx, lw);
+                            int s = sad16x16(tb, row + xx, lw);
+                            s += newLambda * (std::abs(dx) + std::abs(dy));
+                            s += zeroLambda * (std::abs(gx + dx) + std::abs(gy + dy));
                             if (s < best) {
                                 best = s;
                                 bestDx = gx + dx;
@@ -548,6 +593,78 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
             }
         });
     }
+}
+
+// One coherence step over the field. Each block may adopt a neighbour's vector when that vector
+// scores better on this block, and kPenaltyNeighbour charges it for the difference: speckle is
+// removed without flattening genuine motion boundaries, because a neighbour only wins where it
+// is actually the better explanation of the picture here.
+//
+// Every candidate is read from the source field and every result goes to a separate field, so the
+// pass is Jacobi-style and parallel rows cannot race. Callers run it twice with the output fed
+// back as the input, which lets a correction travel further than one block per invocation.
+void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, int w, int h,
+                                       const int32_t* mvx, const int32_t* mvy,
+                                       int32_t* outx, int32_t* outy) {
+    const int bwx = (w + kBlock - 1) / kBlock;
+    const int bwy = (h + kBlock - 1) / kBlock;
+    // Same guard as motionEstimate: below one full block there is no field to regularise.
+    if (w < kBlock || h < kBlock) return;
+
+    // Window anchored a quarter block in, so it stays clear of the block's outer edges while
+    // still covering the part the warp reads from most heavily. Eight pixels rather than sixteen
+    // keeps four candidates at about the cost of one extra full-block evaluation.
+    const int ox = kBlock / 4;
+    const int oy = kBlock / 4;
+    static const int kNx[4] = {-1, 1, 0, 0};
+    static const int kNy[4] = {0, 0, -1, 1};
+
+    auto inBounds = [&](int bx, int by, int mx, int my) {
+        const int xx = bx + ox + mx;
+        const int yy = by + oy + my;
+        return xx >= 0 && yy >= 0 && xx + 8 <= w && yy + 8 <= h;
+    };
+    auto score = [&](int bx, int by, int mx, int my) {
+        const uint8_t* a = tgt + static_cast<size_t>(by + oy) * w + (bx + ox);
+        const uint8_t* b = ref + static_cast<size_t>(by + oy + my) * w + (bx + ox + mx);
+        return sad8x8(a, b, w);
+    };
+
+    parallelFor(0, bwy, [&](int r0, int r1) {
+        for (int r = r0; r < r1; r++) {
+            const int by = std::min(r * kBlock, h - kBlock);
+            for (int c = 0; c < bwx; c++) {
+                const int bx = std::min(c * kBlock, w - kBlock);
+                const size_t idx = static_cast<size_t>(r) * bwx + c;
+
+                const int sx = mvx[idx];
+                const int sy = mvy[idx];
+                int bestCost = inBounds(bx, by, sx, sy) ? score(bx, by, sx, sy) : 0x3FFFFFFF;
+                int bestX = sx;
+                int bestY = sy;
+
+                for (int k = 0; k < 4; k++) {
+                    const int nc = c + kNx[k];
+                    const int nr = r + kNy[k];
+                    if (nc < 0 || nc >= bwx || nr < 0 || nr >= bwy) continue;
+                    const size_t nidx = static_cast<size_t>(nr) * bwx + nc;
+                    const int cx = mvx[nidx];
+                    const int cy = mvy[nidx];
+                    if (!inBounds(bx, by, cx, cy)) continue;
+                    int s = score(bx, by, cx, cy);
+                    s += kPenaltyNeighbour * (std::abs(cx - sx) + std::abs(cy - sy));
+                    if (s < bestCost) {
+                        bestCost = s;
+                        bestX = cx;
+                        bestY = cy;
+                    }
+                }
+
+                outx[idx] = bestX;
+                outy[idx] = bestY;
+            }
+        }
+    });
 }
 
 void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
@@ -760,12 +877,24 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
 
     // forward  = where in0's blocks ended up in in1  (ref = in1, tgt = in0)
     // backward = where in1's blocks came from in in0 (ref = in0, tgt = in1)
+    //
+    // Each estimate is followed by two coherence passes, fed output-first so a correction can
+    // travel more than one block. Their cost is folded into the same accumulator, so STAGES
+    // still reports one number per direction and keeps the same meaning.
     const auto tFwd = std::chrono::steady_clock::now();
     motionEstimate(pyr0, pyr1, w, h, mvf_x_.data(), mvf_y_.data());
+    regulariseField(luma0_.data(), luma1_.data(), w, h,
+                    mvf_x_.data(), mvf_y_.data(), tmpx_.data(), tmpy_.data());
+    regulariseField(luma0_.data(), luma1_.data(), w, h,
+                    tmpx_.data(), tmpy_.data(), mvf_x_.data(), mvf_y_.data());
     acc_fwd_ns_ += nsSince(tFwd);
 
     const auto tBwd = std::chrono::steady_clock::now();
     motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
+    regulariseField(luma1_.data(), luma0_.data(), w, h,
+                    mvb_x_.data(), mvb_y_.data(), tmpx_.data(), tmpy_.data());
+    regulariseField(luma1_.data(), luma0_.data(), w, h,
+                    tmpx_.data(), tmpy_.data(), mvb_x_.data(), mvb_y_.data());
     acc_bwd_ns_ += nsSince(tBwd);
 
     if (aOut) *aOut = a;
