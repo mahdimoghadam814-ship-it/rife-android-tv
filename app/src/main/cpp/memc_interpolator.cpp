@@ -441,6 +441,8 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     mvb_y_.resize(blocks);
     tmpx_.resize(blocks);
     tmpy_.resize(blocks);
+    maskf_.resize(blocks);
+    maskb_.resize(blocks);
 
     work_w_ = w;
     work_h_ = h;
@@ -501,10 +503,10 @@ void MemcInterpolator::buildPyramid(const uint8_t* luma, int w, int h, uint8_t**
     }
 }
 
-void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
-                                      uint8_t* const refPyr[kLevels],
-                                      int w, int h,
-                                      int32_t* mvx, int32_t* mvy) {
+long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
+                                           uint8_t* const refPyr[kLevels],
+                                           int w, int h,
+                                           int32_t* mvx, int32_t* mvy) {
     // Ceil grid: the last column/row of blocks is a partial tile covering the
     // remainder of a frame whose width is not a multiple of 16.
     const int bwx = (w + kBlock - 1) / kBlock;
@@ -513,7 +515,11 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
 
     std::fill(mvx, mvx + nblocks, 0);
     std::fill(mvy, mvy + nblocks, 0);
-    if (w < kBlock || h < kBlock) return;   // no full 16x16 window exists; MVs stay zero
+    if (w < kBlock || h < kBlock) return 0;   // no full 16x16 window exists; MVs stay zero
+
+    // Sum of the accepted vectors' plain SAD at the finest level, in luma counts over whole
+    // blocks. One fetch_add per parallel work unit, so the reduction costs nothing measurable.
+    std::atomic<long long> sadAcc{0};
 
     // Coarse -> fine. One search at level l covers a `group x group` set of
     // full-resolution blocks; the result is broadcast to that group so the next
@@ -542,6 +548,7 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         const uint8_t* ref = refPyr[l];
 
         parallelFor(0, lrows, [&](int r0, int r1) {
+            long long localSad = 0;
             for (int lr = r0; lr < r1; lr++) {
                 const int by = std::min(lr * kBlock, lh - kBlock);
                 for (int lc = 0; lc < lcols; lc++) {
@@ -557,6 +564,9 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                     const uint8_t* tb = tgt + by * lw + bx;
                     int best = 0x7FFFFFFF;
                     int bestDx = gx, bestDy = gy;
+                    // Plain SAD of the winning candidate, without the penalties: that is the
+                    // motion-compensated difference the scene-change gate reads.
+                    int bestPlain = -1;
 
                     for (int dy = -range; dy <= range; dy++) {
                         const int yy = by + gy + dy;
@@ -565,16 +575,19 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         for (int dx = -range; dx <= range; dx++) {
                             const int xx = bx + gx + dx;
                             if (xx < 0 || xx + kBlock > lw) continue;
-                            int s = sad16x16(tb, row + xx, lw);
-                            s += newLambda * (std::abs(dx) + std::abs(dy));
-                            s += zeroLambda * (std::abs(gx + dx) + std::abs(gy + dy));
-                            if (s < best) {
-                                best = s;
+                            const int s = sad16x16(tb, row + xx, lw);
+                            int score = s;
+                            score += newLambda * (std::abs(dx) + std::abs(dy));
+                            score += zeroLambda * (std::abs(gx + dx) + std::abs(gy + dy));
+                            if (score < best) {
+                                best = score;
                                 bestDx = gx + dx;
                                 bestDy = gy + dy;
+                                bestPlain = s;
                             }
                         }
                     }
+                    if (l == 0 && bestPlain >= 0) localSad += bestPlain;
 
                     const int32_t mvFullX = static_cast<int32_t>(bestDx * div);
                     const int32_t mvFullY = static_cast<int32_t>(bestDy * div);
@@ -591,8 +604,12 @@ void MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                     }
                 }
             }
+            if (l == 0 && localSad != 0) {
+                sadAcc.fetch_add(localSad, std::memory_order_relaxed);
+            }
         });
     }
+    return sadAcc.load(std::memory_order_relaxed);
 }
 
 // One coherence step over the field. Each block may adopt a neighbour's vector when that vector
@@ -667,10 +684,59 @@ void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, i
     });
 }
 
+// Cover/uncover masks, after MVTools' MakeVectorOcclusionMaskTime().
+//
+// The signal is the *divergence* of the field, not its agreement with the other direction. A
+// rigid translation leaves every block's vector equal to its neighbours', so the difference is
+// zero and the mask stays clear; where a moving object meets a stationary background one side of
+// the boundary folds, the two destinations stop covering the same area, and the content behind
+// one of them is being covered up. A warp taken from the covered side samples something that is
+// no longer there - that is the ghost the masks exist to reject.
+//
+// MVTools checks only the matching axis (x against the right neighbour, y against the one below)
+// and paints the whole cell pair, so a fold marks both blocks it spans and survives the bilinear
+// upsample as a band roughly one block wide instead of a single-cell spike.
+void MemcInterpolator::buildOcclusionMasks(int w, int h) {
+    const int bwx = (w + kBlock - 1) / kBlock;
+    const int bwy = (h + kBlock - 1) / kBlock;
+    const size_t nblocks = static_cast<size_t>(bwx) * bwy;
+    if (nblocks == 0) return;
+
+    auto fill = [&](const int32_t* mx, const int32_t* my, uint8_t* m) {
+        std::fill(m, m + nblocks, 0);
+        for (int r = 0; r < bwy; r++) {
+            const int row = r * bwx;
+            for (int c = 0; c + 1 < bwx; c++) {
+                const int fold = mx[row + c] - mx[row + c + 1];
+                if (fold <= 0) continue;
+                const int v = fold * kOccScale;
+                const uint8_t b = static_cast<uint8_t>(v > 255 ? 255 : v);
+                if (b > m[row + c]) m[row + c] = b;
+                if (b > m[row + c + 1]) m[row + c + 1] = b;
+            }
+        }
+        for (int r = 0; r + 1 < bwy; r++) {
+            const int row = r * bwx;
+            const int below = row + bwx;
+            for (int c = 0; c < bwx; c++) {
+                const int fold = my[row + c] - my[below + c];
+                if (fold <= 0) continue;
+                const int v = fold * kOccScale;
+                const uint8_t b = static_cast<uint8_t>(v > 255 ? 255 : v);
+                if (b > m[row + c]) m[row + c] = b;
+                if (b > m[below + c]) m[below + c] = b;
+            }
+        }
+    };
+    fill(mvf_x_.data(), mvf_y_.data(), maskf_.data());
+    fill(mvb_x_.data(), mvb_y_.data(), maskb_.data());
+}
+
 void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                                         int w, int h, float timestep,
                                         const int32_t* mvf_x, const int32_t* mvf_y,
                                         const int32_t* mvb_x, const int32_t* mvb_y,
+                                        const uint8_t* maskf, const uint8_t* maskb,
                                         uint8_t* out) {
     const int bwx = (w + kBlock - 1) / kBlock;
     const int bwy = (h + kBlock - 1) / kBlock;
@@ -723,6 +789,13 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                 const int32_t p1bx = mvb_x[i01] * wy0 + mvb_x[i11] * wy1;
                 const int32_t p0by = mvb_y[i00] * wy0 + mvb_y[i10] * wy1;
                 const int32_t p1by = mvb_y[i01] * wy0 + mvb_y[i11] * wy1;
+                // Same weighting for the occlusion masks, folded the same way. The weights sum
+                // to kBlock * kBlock, so the two terms below can never exceed 255 * 256 and the
+                // shift lands back on a byte without a clamp.
+                const int32_t rmf0 = maskf[i00] * wy0 + maskf[i10] * wy1;
+                const int32_t rmf1 = maskf[i01] * wy0 + maskf[i11] * wy1;
+                const int32_t rmb0 = maskb[i00] * wy0 + maskb[i10] * wy1;
+                const int32_t rmb1 = maskb[i01] * wy0 + maskb[i11] * wy1;
                 const int baseX = bc * kBlock + kBlock / 2;
 
                 for (int x = xStart; x < xEnd; x++) {
@@ -746,13 +819,56 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                     const uint8x8_t ca = sampleBilinear(in0, w, h, ax, ay);
                     const uint8x8_t cb = sampleBilinear(in1, w, h, bx, by);
 
-                    uint32_t px = 0;
-                    vst1_lane_u32(&px, vreinterpret_u32_u8(blend256(ca, cb, wt)), 0);
                     // Sources come from an opaque EGL readback, but force alpha to match
                     // RifeEngine's 255 contract exactly.
                     uint32_t* po = reinterpret_cast<uint32_t*>(
                         out + (outRow + static_cast<size_t>(x)) * 4);
-                    *po = px | 0xFF000000u;
+
+                    const int mf = (rmf0 * wx0 + rmf1 * wx1 + 128) >> 8;
+                    const int mb = (rmb0 * wx0 + rmb1 * wx1 + 128) >> 8;
+                    if ((mf | mb) == 0) {
+                        // The unoccluded case - and the only case a uniform field ever
+                        // produces - stays on the original path, byte for byte.
+                        uint32_t px = 0;
+                        vst1_lane_u32(&px, vreinterpret_u32_u8(blend256(ca, cb, wt)), 0);
+                        *po = px | 0xFF000000u;
+                        continue;
+                    }
+
+                    // MVTools' FlowInter, evaluated in float so the intermediate lerps carry the
+                    // same precision the shader's do and rounding happens once, at the store.
+                    // A side that is covered up hands over to the other side's warp, and if that
+                    // is covered too, to its own frame unwarped; both covered at once therefore
+                    // collapses to the plain temporal crossfade.
+                    uint8_t ca8[8], cb8[8];
+                    vst1_u8(ca8, ca);
+                    vst1_u8(cb8, cb);
+                    const uint8_t* p0 = in0 + (outRow + static_cast<size_t>(x)) * 4;
+                    const uint8_t* p1 = in1 + (outRow + static_cast<size_t>(x)) * 4;
+                    const float kf = static_cast<float>(mf) * (1.0f / 255.0f);
+                    const float kb = static_cast<float>(mb) * (1.0f / 255.0f);
+                    const float kt = static_cast<float>(wt) * (1.0f / 256.0f);
+                    const float kf0 = 1.0f - kf;
+                    const float kb0 = 1.0f - kb;
+                    const float kt0 = 1.0f - kt;
+                    uint8_t outPx[4];
+                    for (int c = 0; c < 3; c++) {
+                        const float va = static_cast<float>(ca8[c]);
+                        const float vb = static_cast<float>(cb8[c]);
+                        const float innerF = (mf > 0)
+                            ? va * kf0 + static_cast<float>(p1[c]) * kf
+                            : va;
+                        const float innerB = (mb > 0)
+                            ? vb * kb0 + static_cast<float>(p0[c]) * kb
+                            : vb;
+                        const float termF = va * kf0 + innerB * kf;
+                        const float termB = vb * kb0 + innerF * kb;
+                        const float v = termF * kt0 + termB * kt;
+                        outPx[c] = static_cast<uint8_t>(
+                            v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v + 0.5f));
+                    }
+                    outPx[3] = 255;
+                    memcpy(po, outPx, 4);
                 }
             }
         }
@@ -882,7 +998,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     // travel more than one block. Their cost is folded into the same accumulator, so STAGES
     // still reports one number per direction and keeps the same meaning.
     const auto tFwd = std::chrono::steady_clock::now();
-    motionEstimate(pyr0, pyr1, w, h, mvf_x_.data(), mvf_y_.data());
+    const long long sadFwd = motionEstimate(pyr0, pyr1, w, h, mvf_x_.data(), mvf_y_.data());
     regulariseField(luma0_.data(), luma1_.data(), w, h,
                     mvf_x_.data(), mvf_y_.data(), tmpx_.data(), tmpy_.data());
     regulariseField(luma0_.data(), luma1_.data(), w, h,
@@ -890,12 +1006,40 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     acc_fwd_ns_ += nsSince(tFwd);
 
     const auto tBwd = std::chrono::steady_clock::now();
-    motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
+    const long long sadBwd = motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
     regulariseField(luma1_.data(), luma0_.data(), w, h,
                     mvb_x_.data(), mvb_y_.data(), tmpx_.data(), tmpy_.data());
     regulariseField(luma1_.data(), luma0_.data(), w, h,
                     tmpx_.data(), tmpy_.data(), mvb_x_.data(), mvb_y_.data());
     acc_bwd_ns_ += nsSince(tBwd);
+
+    // Scene-change gate: MVTools' thSCD1/thSCD2, restated as the mean per-pixel luma SAD of the
+    // motion-compensated pair. One shot of video sits in single digits; two unrelated frames sit
+    // near 30 whatever the search managed, because there is nothing to match. Zeroing the field
+    // then costs nothing extra downstream: a zero field has no divergence, so the masks come out
+    // clear and both the CPU warp and the shader fall through to a plain temporal crossfade.
+    //
+    // Both directions have to fail. A single hard-to-match subject would otherwise be read as a
+    // cut, and a false positive replaces a good warp with a crossfade - far more visible than the
+    // one bad frame a missed cut costs.
+    const int bwx = (w + kBlock - 1) / kBlock;
+    const int bwy = (h + kBlock - 1) / kBlock;
+    const double nblocks = static_cast<double>(bwx) * bwy;
+    if (nblocks > 0.0) {
+        const double scale = 1.0 / (nblocks * kBlock * kBlock);
+        const double meanFwd = static_cast<double>(sadFwd) * scale;
+        const double meanBwd = static_cast<double>(sadBwd) * scale;
+        if (meanFwd > kSceneCutMeanSad && meanBwd > kSceneCutMeanSad) {
+            std::fill(mvf_x_.begin(), mvf_x_.end(), 0);
+            std::fill(mvf_y_.begin(), mvf_y_.end(), 0);
+            std::fill(mvb_x_.begin(), mvb_x_.end(), 0);
+            std::fill(mvb_y_.begin(), mvb_y_.end(), 0);
+            LOGI_MEMC("scene cut: compensated SAD %.1f/%.1f > %d, crossfading instead of warping",
+                      meanFwd, meanBwd, kSceneCutMeanSad);
+        }
+    }
+
+    buildOcclusionMasks(w, h);
 
     if (aOut) *aOut = a;
     if (bOut) *bOut = b;
@@ -921,6 +1065,7 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
     motionCompensate(a, b, targetWidth, targetHeight, timestep,
                      mvf_x_.data(), mvf_y_.data(),
                      mvb_x_.data(), mvb_y_.data(),
+                     maskf_.data(), maskb_.data(),
                      out);
     acc_warp_ns_ += nsSince(tWarp);
 
@@ -937,12 +1082,15 @@ size_t MemcInterpolator::motionFieldBytes(int targetWidth, int targetHeight) {
     if (targetWidth <= 0 || targetHeight <= 0) return 0;
     const size_t bwx = static_cast<size_t>((targetWidth + kBlock - 1) / kBlock);
     const size_t bwy = static_cast<size_t>((targetHeight + kBlock - 1) / kBlock);
-    return bwx * bwy * 4;
+    // Two contiguous RGBA halves: the field first, the cover/uncover masks after it. Each is a
+    // standalone texture image, so the caller uploads both out of this one buffer.
+    return bwx * bwy * 8;
 }
 
 void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
     const int bwx = (w + kBlock - 1) / kBlock;
     const int bwy = (h + kBlock - 1) / kBlock;
+    const size_t blocks = static_cast<size_t>(bwx) * bwy;
     // The hierarchical search bounds the field well inside +-127 whole pixels (|mv| <= 38 at
     // three levels with the ranges above), so the +128 bias always fits a byte. Clamp anyway: a
     // future range change must degrade to a saturated vector, never a wrapped one.
@@ -950,15 +1098,21 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
         const int32_t b = v + 128;
         return static_cast<uint8_t>(b < 0 ? 0 : (b > 255 ? 255 : b));
     };
+    uint8_t* outMask = outMv + blocks * 4;
     for (int r = 0; r < bwy; r++) {
         const size_t row = static_cast<size_t>(r) * bwx;
-        uint8_t* o = outMv + row * 4;
-        for (int c = 0; c < bwx; c++, o += 4) {
+        for (int c = 0; c < bwx; c++) {
             const size_t i = row + c;
+            uint8_t* o = outMv + i * 4;
             o[0] = bias(mvf_x_[i]);
             o[1] = bias(mvf_y_[i]);
             o[2] = bias(mvb_x_[i]);
             o[3] = bias(mvb_y_[i]);
+            uint8_t* m = outMask + i * 4;
+            m[0] = maskf_[i];
+            m[1] = maskb_[i];
+            m[2] = 0;
+            m[3] = 0;
         }
     }
 }

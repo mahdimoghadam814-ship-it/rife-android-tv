@@ -1386,7 +1386,7 @@ class VideoFrameProcessor(
 
         // GPU warp: motion estimation still runs on the CPU, because that is what the luma pyramid
         // and the SAD search are, but the per-pixel resample moves into the fragment shader. What
-        // crosses JNI is then the packed field - ceil(w/16) * ceil(h/16) * 4 bytes, a few kB -
+        // crosses JNI is then the packed field - ceil(w/16) * ceil(h/16) * 8 bytes, tens of kB -
         // instead of a full RGBA frame. computeMotionField() reports false when the algorithm is
         // not MEMC, so the RIFE path keeps working without this layer knowing about the switch.
         val motionBuf = cachedMotionBuf
@@ -1574,13 +1574,19 @@ class VideoFrameProcessor(
         val requiredBytesInt = requiredBytes.toInt()
         val gridW = (inputWidth + 15) / 16
         val gridH = (inputHeight + 15) / 16
-        val motionBytes = gridW.toLong() * gridH.toLong() * 4L
+        // Eight bytes per block: four for the vectors, four for the cover/uncover masks. Mirrors
+        // MemcInterpolator::motionFieldBytes(), which the JNI side re-checks against the buffer
+        // capacity before it writes anything.
+        val motionBytes = gridW.toLong() * gridH.toLong() * 8L
         if (motionBytes > Int.MAX_VALUE) {
             Log.e(TAG, "ensureCachedBuffers: motion field $motionBytes overflows Int")
             return false
         }
+        // Read into a local: a mutable property can never be smart-cast across the null check.
+        val motionCapacity = cachedMotionBuf?.capacity() ?: 0
         if (cachedIn0Buf == null || cachedIn1Buf == null || cachedDenoised0Buf == null ||
-            cachedDenoised1Buf == null || cachedOutBuf == null || cachedMotionBuf == null ||
+            cachedDenoised1Buf == null || cachedOutBuf == null ||
+            motionCapacity < motionBytes ||
             cachedTargetSize != requiredBytesInt
         ) {
             cachedIn0Buf = ByteBuffer.allocateDirect(requiredBytesInt)

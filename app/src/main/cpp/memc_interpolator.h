@@ -54,21 +54,26 @@ public:
                      uint8_t* out);
 
     // Everything interpolate() does up to and including both motion estimates, then packs the
-    // field instead of warping it: four bytes per block - forward x, forward y, backward x,
-    // backward y - each a whole-pixel vector biased by +128, row-major over
-    // ceil(targetW/kBlock) x ceil(targetH/kBlock). outMv must have at least
-    // motionFieldBytes(targetWidth, targetHeight) bytes of capacity.
+    // field instead of warping it: eight bytes per block, row-major over
+    // ceil(targetW/kBlock) x ceil(targetH/kBlock).
+    //
+    //   [0..4)   forward x, forward y, backward x, backward y - whole-pixel vectors biased by +128
+    //   [4..6)   forward and backward occlusion mask, 0 = fully trusted, 255 = covered up
+    //   [6..8)   reserved, written as 0
+    //
+    // outMv must have at least motionFieldBytes(targetWidth, targetHeight) bytes of capacity.
     //
     // This is the hand-off to the GPU warp: a fragment shader samples the two source frames with
     // the same bilinear field the CPU path builds, so the per-pixel resample - by far the most
     // expensive thing motionCompensate() does - costs a texture fetch instead of a NEON loop.
+    // The two halves are contiguous, so a caller uploads them as two textures out of one buffer.
     bool motionField(const uint8_t* src0, const uint8_t* src1,
                      int srcW, int srcHeight,
                      int targetWidth, int targetHeight,
                      uint8_t* outMv, size_t outMvBytes);
 
-    // Exact byte count motionField() writes for a processing size. Also the size the caller must
-    // allocate for the packed field, which is a few kilobytes even at 1080p.
+    // Exact byte count motionField() writes for a processing size: eight bytes per block. Also
+    // the size the caller must allocate for the packed field, still only tens of kB at 1080p.
     static size_t motionFieldBytes(int targetWidth, int targetHeight);
 
     void reset();
@@ -87,6 +92,17 @@ private:
     static constexpr int kCoarseRange = 8;
     static constexpr int kFineRange = 2;
 
+    // Occlusion is where the field folds: a block whose right/bottom neighbour travels *less*
+    // than it does means the destinations between them overlap and some of the content is being
+    // covered up. MVTools' MakeVectorOcclusionMaskTime works on exactly that divergence, scaled
+    // to a byte. This turns one pixel of fold into `kOccScale` counts, so a fold of
+    // 255/kOccScale pixels is already a fully untrusted sample.
+    static constexpr int kOccScale = 16;
+    // MVTools' thSCD1/thSCD2 scene-change gate, restated as the mean per-pixel luma SAD of the
+    // *motion-compensated* pair. Consecutive frames of one shot land in single digits; an
+    // unrelated pair lands near 30-60 no matter how good the search was.
+    static constexpr int kSceneCutMeanSad = 30;
+
     void ensureCapacity(int w, int h);
     // One-shot micro-benchmark logged on the first frame: raw NEON streaming throughput and
     // raw sad16x16 throughput, each in wall time and thread CPU time. Used to tell an
@@ -99,13 +115,16 @@ private:
     // tgt is the frame whose blocks we take; ref is the frame we search in.
     // On return mvx/mvy hold the full-resolution offset such that
     // ref(x + mv) matches tgt(x).
-    void motionEstimate(uint8_t* const tgtPyr[kLevels], uint8_t* const refPyr[kLevels],
-                        int w, int h, int32_t* mvx, int32_t* mvy);
+    // Returns the summed plain SAD of the accepted vectors at the finest level: the
+    // motion-compensated difference of the pair, which is the scene-change signal.
+    long long motionEstimate(uint8_t* const tgtPyr[kLevels], uint8_t* const refPyr[kLevels],
+                             int w, int h, int32_t* mvx, int32_t* mvy);
 
     void motionCompensate(const uint8_t* in0, const uint8_t* in1,
                           int w, int h, float timestep,
                           const int32_t* mvf_x, const int32_t* mvf_y,
                           const int32_t* mvb_x, const int32_t* mvb_y,
+                          const uint8_t* maskf, const uint8_t* maskb,
                           uint8_t* out);
 
     // One coherence pass: each block may adopt a neighbour's vector when that vector scores
@@ -115,6 +134,10 @@ private:
     void regulariseField(const uint8_t* tgt, const uint8_t* ref, int w, int h,
                          const int32_t* mvx, const int32_t* mvy,
                          int32_t* outx, int32_t* outy);
+
+    // Cover/uncover masks derived from the two fields, one byte per block. Parallel only over
+    // the two directions: each pass is a single linear sweep of a few thousand bytes.
+    void buildOcclusionMasks(int w, int h);
 
     // Shared front half of interpolate() and motionField(): scratch sizing, the optional shrink to
     // the processing size, RGBA->luma, the pyramid and both motion estimates. On success *aOut and
@@ -175,6 +198,8 @@ private:
     std::vector<int32_t> mvf_x_, mvf_y_, mvb_x_, mvb_y_;
     // Destination for one regulariseField() pass; a few kilobytes even at 1080p.
     std::vector<int32_t> tmpx_, tmpy_;
+    // Cover/uncover masks, one byte per block, derived from the two fields above.
+    std::vector<uint8_t> maskf_, maskb_;
 };
 
 }  // namespace rife

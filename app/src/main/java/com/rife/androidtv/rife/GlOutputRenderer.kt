@@ -90,6 +90,13 @@ class GlOutputRenderer {
          *
          * `highp` is requested because the field is stored biased by 128: a mediump (fp16) `mv`
          * would quantise to about a quarter of a pixel after `* 255.0 - 128.0`.
+         *
+         * `uMask` holds the cover/uncover masks from `MemcInterpolator::buildOcclusionMasks()`,
+         * one byte per block, sampled at the same coordinate as the field. Where a field folds
+         * the content behind it is being covered up, so that side hands over to the other side's
+         * warp; if both are covered the pair collapses to a plain crossfade. The `occ == 0`
+         * branch is the overwhelmingly common one and reproduces `mix(ca, cb, t)` exactly, so an
+         * unoccluded frame costs two texture fetches more than it did before the masks existed.
          */
         private const val WARP_FRAGMENT_SHADER = """
             #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -101,6 +108,7 @@ class GlOutputRenderer {
             uniform sampler2D uFrame0;
             uniform sampler2D uFrame1;
             uniform sampler2D uMotion;
+            uniform sampler2D uMask;
             uniform vec2 uTargetSize;
             uniform vec2 uMotionGrid;
             uniform float uTimestep;
@@ -114,7 +122,23 @@ class GlOutputRenderer {
                 vec2 pb = p - mvb * (1.0 - uTimestep);
                 vec3 ca = texture2D(uFrame0, (pa + 0.5) / uTargetSize).rgb;
                 vec3 cb = texture2D(uFrame1, (pb + 0.5) / uTargetSize).rgb;
-                gl_FragColor = vec4(mix(ca, cb, uTimestep), 1.0);
+                vec2 occ = texture2D(uMask, g).rg;
+                vec3 termF = ca;
+                vec3 termB = cb;
+                if (occ.r > 0.0 || occ.g > 0.0) {
+                    vec2 raw = (p + 0.5) / uTargetSize;
+                    vec3 innerF = ca;
+                    if (occ.r > 0.0) {
+                        innerF = mix(ca, texture2D(uFrame1, raw).rgb, occ.r);
+                    }
+                    vec3 innerB = cb;
+                    if (occ.g > 0.0) {
+                        innerB = mix(cb, texture2D(uFrame0, raw).rgb, occ.g);
+                    }
+                    termF = mix(ca, innerB, occ.r);
+                    termB = mix(cb, innerF, occ.g);
+                }
+                gl_FragColor = vec4(mix(termF, termB, uTimestep), 1.0);
             }
         """
 
@@ -158,12 +182,14 @@ class GlOutputRenderer {
     private var warpUFrame0 = -1
     private var warpUFrame1 = -1
     private var warpUMotion = -1
+    private var warpUMask = -1
     private var warpUTargetSize = -1
     private var warpUMotionGrid = -1
     private var warpUTimestep = -1
     private var warpTex0 = 0
     private var warpTex1 = 0
     private var warpMotionTex = 0
+    private var warpMaskTex = 0
     private var warpTex0W = 0
     private var warpTex0H = 0
     private var warpTex1W = 0
@@ -326,12 +352,13 @@ class GlOutputRenderer {
         warpUFrame0 = GLES20.glGetUniformLocation(newProgram, "uFrame0")
         warpUFrame1 = GLES20.glGetUniformLocation(newProgram, "uFrame1")
         warpUMotion = GLES20.glGetUniformLocation(newProgram, "uMotion")
+        warpUMask = GLES20.glGetUniformLocation(newProgram, "uMask")
         warpUTargetSize = GLES20.glGetUniformLocation(newProgram, "uTargetSize")
         warpUMotionGrid = GLES20.glGetUniformLocation(newProgram, "uMotionGrid")
         warpUTimestep = GLES20.glGetUniformLocation(newProgram, "uTimestep")
 
         if (warpAPosition < 0 || warpATexCoord < 0 || warpUContentScale < 0 ||
-            warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 ||
+            warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 || warpUMask < 0 ||
             warpUTargetSize < 0 || warpUMotionGrid < 0 || warpUTimestep < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
@@ -343,6 +370,7 @@ class GlOutputRenderer {
         warpTex0 = createWarpTexture()
         warpTex1 = createWarpTexture()
         warpMotionTex = createWarpTexture()
+        warpMaskTex = createWarpTexture()
         Log.i(TAG, "warp program ready")
     }
 
@@ -601,11 +629,12 @@ class GlOutputRenderer {
      * presents it. Buffer layout and calling-thread contract match [render].
      *
      * [frame0] and [frame1] are the raw source frames at [srcWidth] x [srcHeight]. [motion] holds
-     * `ceil(targetWidth/16) * ceil(targetHeight/16) * 4` bytes from
-     * `NativeEngine.computeMotionField`, laid out as forward x, forward y, backward x, backward y,
-     * each a whole-pixel vector biased by +128. The expensive part of interpolation - the
-     * per-pixel 4-tap resample of both frames - then happens once per output fragment in the
-     * shader instead of once per output pixel on the CPU.
+     * `ceil(targetWidth/16) * ceil(targetHeight/16) * 8` bytes from
+     * `NativeEngine.computeMotionField`: a first half of forward x, forward y, backward x,
+     * backward y as whole-pixel vectors biased by +128, then a second half of forward and
+     * backward cover/uncover masks. The expensive part of interpolation - the per-pixel 4-tap
+     * resample of both frames - then happens once per output fragment in the shader instead of
+     * once per output pixel on the CPU.
      *
      * Returns false when the warp program is unavailable or a size is unserviceable, in which case
      * the caller must fall back to `NativeEngine.interpolateFrameBuffers()`.
@@ -648,7 +677,11 @@ class GlOutputRenderer {
         tPhase = System.nanoTime()
         if (!uploadRgba(warpTex0, frame0, srcWidth, srcHeight, warpTex0W, warpTex0H) ||
             !uploadRgba(warpTex1, frame1, srcWidth, srcHeight, warpTex1W, warpTex1H) ||
-            !uploadRgba(warpMotionTex, motion, gridW, gridH, warpGridW, warpGridH)
+            !uploadRgba(warpMotionTex, motion, gridW, gridH, warpGridW, warpGridH) ||
+            !uploadRgba(
+                warpMaskTex, motion, gridW, gridH, warpGridW, warpGridH,
+                gridW * gridH * 4
+            )
         ) {
             return false
         }
@@ -673,6 +706,9 @@ class GlOutputRenderer {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMotionTex)
         GLES20.glUniform1i(warpUMotion, 2)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE3)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMaskTex)
+        GLES20.glUniform1i(warpUMask, 3)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
 
         GLES20.glUniform2f(warpUTargetSize, targetWidth.toFloat(), targetHeight.toFloat())
@@ -733,15 +769,25 @@ class GlOutputRenderer {
         width: Int,
         height: Int,
         curWidth: Int,
-        curHeight: Int
+        curHeight: Int,
+        byteOffset: Int = 0
     ): Boolean {
         val bytes = width.toLong() * height.toLong() * 4L
         if (bytes > Int.MAX_VALUE) {
             Log.e(TAG, "uploadRgba: dimensions ${width}x$height overflow Int")
             return false
         }
-        buffer.position(0)
-        buffer.limit(bytes.toInt())
+        if (byteOffset < 0 || byteOffset.toLong() + bytes > buffer.capacity().toLong()) {
+            Log.e(
+                TAG,
+                "uploadRgba: $byteOffset + $bytes exceeds buffer capacity ${buffer.capacity()}"
+            )
+            return false
+        }
+        // The packed field is two RGBA halves in one buffer (vectors, then occlusion masks), so
+        // the second upload starts at the half boundary rather than at position 0.
+        buffer.position(byteOffset)
+        buffer.limit(byteOffset + bytes.toInt())
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
         if (curWidth != width || curHeight != height) {
             GLES20.glTexImage2D(
@@ -864,11 +910,12 @@ class GlOutputRenderer {
         textureHeight = 0
         if (warpProgram != 0) {
             GLES20.glDeleteTextures(
-                3, intArrayOf(warpTex0, warpTex1, warpMotionTex), 0
+                4, intArrayOf(warpTex0, warpTex1, warpMotionTex, warpMaskTex), 0
             )
             warpTex0 = 0
             warpTex1 = 0
             warpMotionTex = 0
+            warpMaskTex = 0
             warpTex0W = 0
             warpTex0H = 0
             warpTex1W = 0
@@ -884,6 +931,7 @@ class GlOutputRenderer {
         warpUFrame0 = -1
         warpUFrame1 = -1
         warpUMotion = -1
+        warpUMask = -1
         warpUTargetSize = -1
         warpUMotionGrid = -1
         warpUTimestep = -1
