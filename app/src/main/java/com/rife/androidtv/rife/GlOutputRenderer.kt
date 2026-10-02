@@ -44,9 +44,10 @@ class GlOutputRenderer {
         private const val VERTEX_SHADER = """
             attribute vec4 aPosition;
             attribute vec4 aTextureCoord;
+            uniform vec2 uContentScale;
             varying vec2 vTextureCoord;
             void main() {
-                gl_Position = aPosition;
+                gl_Position = vec4(aPosition.xy * uContentScale, aPosition.z, aPosition.w);
                 vTextureCoord = aTextureCoord.xy;
             }
         """
@@ -85,7 +86,15 @@ class GlOutputRenderer {
     private var aPositionHandle = -1
     private var aTextureCoordHandle = -1
     private var uTextureHandle = -1
+    private var uContentScaleHandle = -1
     private var textureId = 0
+
+    /**
+     * Clip-space scale that letterboxes the frame into the surface. Seeded to 0 so the very first
+     * [updateContentScale] always reports a change and the uniform (defaulting to 0) gets set.
+     */
+    private var contentScaleX = 0.0f
+    private var contentScaleY = 0.0f
 
     private var display: EGLDisplay? = null
     private var context: EGLContext? = null
@@ -150,8 +159,11 @@ class GlOutputRenderer {
         aPositionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         aTextureCoordHandle = GLES20.glGetAttribLocation(program, "aTextureCoord")
         uTextureHandle = GLES20.glGetUniformLocation(program, "uTexture")
+        uContentScaleHandle = GLES20.glGetUniformLocation(program, "uContentScale")
 
-        if (aPositionHandle < 0 || aTextureCoordHandle < 0 || uTextureHandle < 0) {
+        if (aPositionHandle < 0 || aTextureCoordHandle < 0 || uTextureHandle < 0 ||
+            uContentScaleHandle < 0
+        ) {
             release()
             throw IllegalStateException("Output blit program is missing expected attributes")
         }
@@ -281,6 +293,15 @@ class GlOutputRenderer {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glUniform1i(uTextureHandle, 0)
 
+        if (updateContentScale(width, height, surfaceWidth, surfaceHeight)) {
+            GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
+        }
+
+        // The quad no longer covers the whole surface whenever the aspect ratios differ, so the
+        // bars are painted black instead of leaving the previous frame's contents on screen.
+        GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+
         val requiredBytes = width.toLong() * height.toLong() * 4L
         if (requiredBytes > Int.MAX_VALUE) {
             Log.e(TAG, "render: dimensions ${width}x$height overflow Int")
@@ -352,6 +373,41 @@ class GlOutputRenderer {
         buffer.position(originalPosition)
         buffer.limit(originalLimit)
         return sum
+    }
+
+    /**
+     * Recomputes [contentScaleX]/[contentScaleY] so a [srcWidth] x [srcHeight] frame fits a
+     * [surfWidth] x [surfHeight] surface undistorted: the tighter of the two aspect ratios
+     * governs, the surplus axis is shrunk and the freed margin is pillar- or letterboxed.
+     *
+     * Returns true only when the value changed, so the uniform upload can be skipped.
+     */
+    private fun updateContentScale(
+        srcWidth: Int,
+        srcHeight: Int,
+        surfWidth: Int,
+        surfHeight: Int
+    ): Boolean {
+        if (srcWidth <= 0 || srcHeight <= 0 || surfWidth <= 0 || surfHeight <= 0) {
+            return false
+        }
+        val srcAspect = srcWidth.toFloat() / srcHeight.toFloat()
+        val surfAspect = surfWidth.toFloat() / surfHeight.toFloat()
+        val scaleX: Float
+        val scaleY: Float
+        if (srcAspect > surfAspect) {
+            scaleX = 1.0f
+            scaleY = surfAspect / srcAspect
+        } else {
+            scaleX = srcAspect / surfAspect
+            scaleY = 1.0f
+        }
+        if (scaleX == contentScaleX && scaleY == contentScaleY) {
+            return false
+        }
+        contentScaleX = scaleX
+        contentScaleY = scaleY
+        return true
     }
 
     private fun updateSurfaceSize() {
