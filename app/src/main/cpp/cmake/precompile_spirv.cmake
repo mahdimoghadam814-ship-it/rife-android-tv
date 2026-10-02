@@ -33,7 +33,10 @@ endif()
 
 # Determine if this is a known optional shader that cannot be precompiled
 # warp_pack8 uses afpvec8 which is not defined in current ncnn_glsl_ext
-set(SHADER_OPTIONAL OFF)
+# Callers may also pass -DSHADER_OPTIONAL=ON for include-only shader libraries.
+if(NOT DEFINED SHADER_OPTIONAL)
+    set(SHADER_OPTIONAL OFF)
+endif()
 if(SHADER_SRC_NAME_WE STREQUAL "warp_pack8")
     set(SHADER_OPTIONAL ON)
     message(STATUS "Shader ${SHADER_SRC_NAME_WE} is marked as optional (afpvec8 not available)")
@@ -77,22 +80,44 @@ else()
         "#define ncnn_shaderInt16 1\n"
         "#define ncnn_shaderInt64 1\n"
         "#define ncnn_enable_validation_layer 0\n"
+        "#define NCNN_shader_local_memory 1\n"
+        "#define ncnn_VK_KHR_cooperative_matrix 1\n"
+    )
+
+    # GLSL extensions mirroring ncnn runtime compilation (gpu.cpp compile_spirv_module).
+    # Without these the assembled shader does not parse: sfpvec4 expands to f16vec4
+    # (GL_EXT_shader_16bit_storage) and i8buffer_* uses 8-bit storage paths.
+    string(CONCAT RIFE_VULKAN_EXTS
+        "#extension GL_EXT_shader_16bit_storage: require\n"
+        "#extension GL_EXT_shader_8bit_storage: require\n"
     )
 
     # ============================================================
-    # CORRECT SHADER ASSEMBLY ORDER (per GLSL spec):
+    # CORRECT SHADER ASSEMBLY ORDER (per GLSL spec, matches ncnn runtime):
     # 1. #version directive (MUST be first non-comment line)
-    # 2. RIFE-required macros (NCNN_* macros that ncnn_glsl_ext and shader depend on)
-    # 3. ncnn_glsl_ext.comp content (defines sfp, afp, buffer_* macros using NCNN_*)
-    # 4. Shader body (contains #if NCNN_* #extension blocks and uses sfp, afp, etc.)
+    # 2. GLSL #extension directives (must precede any non-preprocessor token)
+    # 3. RIFE-required macros (NCNN_* macros that ncnn_glsl_ext and shader depend on)
+    # 4. ncnn_glsl_ext.comp content (defines sfp, afp, buffer_* macros using NCNN_*)
+    # 5. Shader body (contains #if NCNN_* #extension blocks and uses sfp, afp, etc.)
     # ============================================================
 
-    # Step 1: Extract #version line from shader source (must be first non-comment line)
-    # Handle optional leading comments and whitespace
-    # First, strip leading comment lines and empty lines to find the #version directive
-    string(REGEX MATCH "^(//[^\n]*\n)*[ \t]*\n*[ \t]*#[ \t]*version[^\n]*\n" version_line "${shader_source}")
+    # Step 1: Extract #version line from shader source.
+    # Leading lines may be an arbitrary mix of // comments and blank lines.
+    string(REGEX MATCH "^((//[^\n]*\n)|([ \t]*\n))*[ \t]*#[ \t]*version[^\n]*\n" version_line "${shader_source}")
     if(NOT version_line)
-        message(FATAL_ERROR "Shader ${SHADER_SRC} missing required #version directive at start of file")
+        if(SHADER_REQUIRED AND NOT SHADER_OPTIONAL)
+            message(FATAL_ERROR "Shader ${SHADER_SRC} missing required #version directive at start of file")
+        endif()
+        # Optional include-only shader library (e.g. vulkan_activation.comp,
+        # ncnn_glsl_ext.comp): it is #include'd by other shaders and is never
+        # compiled as a shader module, so an empty SPIR-V fallback is correct.
+        message(STATUS "Shader ${SHADER_SRC} has no #version directive (include-only library). Generating empty SPIR-V fallback.")
+        file(WRITE ${SHADER_SPV_HEADER}
+            "// include-only shader library - no standalone SPIR-V module\n"
+            "static const uint32_t ${SHADER_SRC_NAME_WE}_spv_data[] = { 0 };\n"
+            "static const size_t ${SHADER_SRC_NAME_WE}_spv_data_size = 0;\n"
+        )
+        return()
     endif()
 
     # Remove the version line from shader source to get the body
@@ -113,19 +138,24 @@ else()
     # Step 3: Remove any leading whitespace-only lines from shader_body
     string(REGEX REPLACE "^[ \t]*\n" "" shader_body "${shader_body}")
 
-    # Step 4: Assemble in correct order: #version + MACROS + ncnn_ext + shader_body
-    set(shader_source_with_macros "${version_line}${RIFE_VULKAN_MACROS}${ncnn_glsl_ext_content}${shader_body}")
+    # Step 4: Assemble in correct order: #version + EXTENSIONS + MACROS + ncnn_ext + shader_body
+    set(shader_source_with_macros "${version_line}${RIFE_VULKAN_EXTS}${RIFE_VULKAN_MACROS}${ncnn_glsl_ext_content}${shader_body}")
 
     set(TEMP_GLSL ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}_with_macros.comp)
     set(TEMP_SPV ${CMAKE_CURRENT_BINARY_DIR}/${SHADER_SRC_NAME_WE}.spv)
 
     file(WRITE ${TEMP_GLSL} "${shader_source_with_macros}")
 
-    # Compile to SPIR-V
+    # Shaders may #include "vulkan_activation.comp"; resolve it from the source directory.
+    get_filename_component(SHADER_SRC_DIR ${SHADER_SRC} DIRECTORY)
+
+    # Compile to SPIR-V (vulkan1.1 => SPIR-V 1.3, required for ncnn subgroup ops
+    # shaders, matching ncnn runtime when use_subgroup_ops is enabled)
     execute_process(
         COMMAND ${GLSLANG_VALIDATOR}
             -V
-            --target-env vulkan1.0
+            --target-env vulkan1.1
+            -I${SHADER_SRC_DIR}
             --entry-point main
             -o ${TEMP_SPV}
             ${TEMP_GLSL}

@@ -16,15 +16,17 @@ set(NCNN_DISABLE_EXCEPTION OFF CACHE BOOL "" FORCE)
 get_filename_component(NCNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../../third_party/ncnn" ABSOLUTE)
 
 if (EXISTS "${NCNN_DIR}/CMakeLists.txt")
-    # Check if ncnn already contains the interp SPIR-V precompilation changes.
-    # The fix commit (56772c65) adds interp shaders to the precompilation list in src/CMakeLists.txt.
-    # We check for the presence of interp.comp in the ncnn shader list to avoid re-applying the patch.
+    # Check if ncnn already contains the precompiled SPIR-V registry changes.
+    # The ncnn_interp_spirv.patch stores precompiled SPIR-V in the shader
+    # registry, so src/gpu.cpp switches the registry entry fields to
+    # "const uint32_t* spv_data; int spv_data_size;" (size in bytes).
+    # Detect that marker so a second configure does not re-apply the patch.
     set(NCNN_ALREADY_PATCHED FALSE)
-    if(EXISTS "${NCNN_DIR}/src/CMakeLists.txt")
-        file(READ "${NCNN_DIR}/src/CMakeLists.txt" ncnn_cmake_content)
-        if(ncnn_cmake_content MATCHES "interp\\.comp")
+    if(EXISTS "${NCNN_DIR}/src/gpu.cpp")
+        file(READ "${NCNN_DIR}/src/gpu.cpp" ncnn_gpu_content)
+        if(ncnn_gpu_content MATCHES "spv_data_size; // in bytes")
             set(NCNN_ALREADY_PATCHED TRUE)
-            message(STATUS "ncnn already contains interp SPIR-V precompilation changes (commit 56772c65 or later). Skipping patch.")
+            message(STATUS "ncnn already contains precompiled SPIR-V registry changes. Skipping patch.")
         endif()
     endif()
 
@@ -55,7 +57,7 @@ if (EXISTS "${NCNN_DIR}/CMakeLists.txt")
             endif()
             message(STATUS "Applied ncnn interp SPIR-V patch successfully.")
         else()
-            message(FATAL_ERROR "ncnn interp SPIR-V patch does not apply cleanly and ncnn is not pre-patched. Build cannot continue without guaranteed SPIR-V precompilation for interp shaders. Ensure ncnn submodule is at commit 56772c65 or later, or that the patch applies to the current ncnn revision.")
+            message(FATAL_ERROR "ncnn_interp_spirv.patch does not apply cleanly to the current ncnn revision. Build cannot continue without guaranteed SPIR-V precompilation. Ensure the ncnn submodule is at the pinned commit with a clean working tree.")
         endif()
     endif()
     
