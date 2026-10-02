@@ -272,6 +272,13 @@ class VideoFrameProcessor(
     private var autoCaptureH = 0
 
     /**
+     * Set once the motion-aligned denoiser fails for a stream, so the reason is logged a single
+     * time instead of every cycle. The failure is usually permanent for that stream - RIFE cannot
+     * supply a field at all - and a per-frame warning at 24 fps is worse than no warning.
+     */
+    private var denoiseUnavailableLogged = false
+
+    /**
      * Source frame interval in nanoseconds, taken from the decoder timestamps of the pair being
      * processed. This is the budget the AUTO policy has to fit inside to hold the native frame
      * rate, and it is measured rather than configured because the source is what defines it. Zero
@@ -813,6 +820,10 @@ class VideoFrameProcessor(
 
         // Temporal history of the FastDVDnet scaffold must not survive a pipeline boundary either.
         fastDvdNetEngine.reset()
+        // ...and neither may the motion-aligned denoiser's: the frame after a seek is not adjacent
+        // to anything it has merged, so continuing the recursion would smear across the cut.
+        outputRenderer?.resetDenoise()
+        denoiseUnavailableLogged = false
 
         cachedIn0Buf = null
         cachedIn1Buf = null
@@ -1371,9 +1382,33 @@ class VideoFrameProcessor(
         val startTime = SystemClock.elapsedRealtime()
 
         if (!isRifeEnabled) {
-            // State 2: FastDVDnet-only. The current frame is pre-processed and rendered as-is; no
+            // State 2: denoise-only. The current frame is cleaned and rendered as-is; no
             // interpolation is attempted and no extra frame is invented.
             if (fastDvdNetEngine.isEnabled) {
+                // With MEMC off nothing else asks for the field, but the denoiser's whole premise
+                // is that it samples the history where this pair's content moved to, so it computes
+                // one here. computeMotionField() refuses under any algorithm that is not MEMC, so
+                // this fails for a RIFE run and the stage's own implementation takes over.
+                val motionBuf = cachedMotionBuf
+                val presented = motionBuf != null &&
+                    outputRenderer?.isDenoiseInitialized == true &&
+                    NativeEngine.computeMotionField(
+                        in0Buf, in1Buf,
+                        rifeInputW, rifeInputH,
+                        rifeInputW, rifeInputH,
+                        motionBuf
+                    ) &&
+                    outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
+                    outputRenderer?.presentDenoised(rifeInputW, rifeInputH) == true
+                if (presented) {
+                    lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
+                    frameCountOutput++
+                    releaseFrameBuffer(prev.pixels)
+                    previousFrame = nextFrame
+                    updateStats()
+                    return
+                }
+                noteDenoiseUnavailable()
                 val denoised = fastDvdNetEngine.denoiseFrameBuffer(
                     nextFrame.pixels,
                     rifeInputW,
@@ -1403,9 +1438,17 @@ class VideoFrameProcessor(
 
         // State 3 and 4: the FastDVDnet scaffold is optional pre-processing in front of RIFE. When
         // it is off the captured buffers are handed to JNI directly, so no extra copy is made.
+        //
+        // Both implementations are this same stage, so only one runs. The motion-aligned pass is
+        // preferred - it needs the field anyway, and its history is what makes it a real denoiser
+        // rather than a per-frame filter - and is picked here on shader availability alone. If it
+        // turns out below that no field can be had, this path is still there rather than the frame
+        // silently going out undenoised.
         var src0Buf = in0Buf
         var src1Buf = in1Buf
-        if (fastDvdNetEngine.isEnabled) {
+        val gpuDenoiseWanted = fastDvdNetEngine.isEnabled &&
+            outputRenderer?.isDenoiseInitialized == true
+        if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted) {
             val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(
                 in0Buf,
                 rifeInputW,
@@ -1494,18 +1537,53 @@ class VideoFrameProcessor(
             // first frame), so we only render the interpolated frame and the next frame.
             // Sequence: A, M(A,B), B, M(B,C), C — correct 2x interpolation without duplication.
             val tRenderStart = System.nanoTime()
+
+            // One denoiser pass per pair, before either present. It writes into a framebuffer
+            // rather than to the surface, so it costs no swap; the warp or the plain present picks
+            // the result up from the texture. It sits inside the render window deliberately: the
+            // upload and the draw both land in the renderer's own breakdown, so its cost shows up
+            // under render= instead of vanishing between the JNI and render counters. The input is
+            // the raw capture, because aligning against already-filtered frames would make the flow
+            // describe the filter's output, and running the stage's own pass on top would denoise
+            // the same frame twice.
+            var denoiseReady = false
+            if (gpuDenoiseWanted) {
+                denoiseReady = motionReady && motionBuf != null &&
+                    outputRenderer?.renderDenoise(
+                        src1Buf, motionBuf, rifeInputW, rifeInputH
+                    ) == true
+                if (!denoiseReady) {
+                    noteDenoiseUnavailable()
+                }
+            }
+
             var presented = false
             if (motionReady && motionBuf != null) {
-                presented = outputRenderer?.renderWarp(
-                    src0Buf,
-                    src1Buf,
-                    motionBuf,
-                    rifeInputW,
-                    rifeInputH,
-                    rifeOutputW,
-                    rifeOutputH,
-                    0.5f
-                ) == true
+                // From the denoised pair when there is one. The first cycle after a reset has no
+                // denoised history to warp from, so it blends the raw pair, and the present below
+                // supplies the cleaned current frame - which for that first cycle is the raw frame
+                // anyway, so the two halves of the output still agree.
+                presented = if (denoiseReady && outputRenderer?.hasDenoisePair == true) {
+                    outputRenderer?.renderWarpFromDen(
+                        motionBuf,
+                        rifeInputW,
+                        rifeInputH,
+                        rifeOutputW,
+                        rifeOutputH,
+                        0.5f
+                    ) == true
+                } else {
+                    outputRenderer?.renderWarp(
+                        src0Buf,
+                        src1Buf,
+                        motionBuf,
+                        rifeInputW,
+                        rifeInputH,
+                        rifeOutputW,
+                        rifeOutputH,
+                        0.5f
+                    ) == true
+                }
             }
             if (!presented) {
                 // The shader refused the frame, or the CPU path ran. Redo it on the CPU so the
@@ -1537,7 +1615,9 @@ class VideoFrameProcessor(
 
                 renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
             }
-            renderFrameToOutput(nextFrame)
+            if (!denoiseReady || outputRenderer?.presentDenoised(rifeInputW, rifeInputH) != true) {
+                renderFrameToOutput(nextFrame)
+            }
             nsRender += System.nanoTime() - tRenderStart
             frameCountOutput += 2
         } else {
@@ -1664,9 +1744,9 @@ class VideoFrameProcessor(
         val requiredBytesInt = requiredBytes.toInt()
         val gridW = (inputWidth + 15) / 16
         val gridH = (inputHeight + 15) / 16
-        // Eight bytes per block: four for the vectors, four for the cover/uncover masks. Mirrors
-        // MemcInterpolator::motionFieldBytes(), which the JNI side re-checks against the buffer
-        // capacity before it writes anything.
+        // Eight bytes per block: four for the vectors, then two cover/uncover masks, the denoiser's
+        // blend weight and its noise floor. Mirrors MemcInterpolator::motionFieldBytes(), which the
+        // JNI side re-checks against the buffer capacity before it writes anything.
         val motionBytes = gridW.toLong() * gridH.toLong() * 8L
         if (motionBytes > Int.MAX_VALUE) {
             Log.e(TAG, "ensureCachedBuffers: motion field $motionBytes overflows Int")
@@ -1753,6 +1833,24 @@ class VideoFrameProcessor(
         buffer.position(originalPosition)
         buffer.limit(originalLimit)
         return sum
+    }
+
+    /**
+     * Logs, once per stream, that the motion-aligned denoiser could not run and the stage's own
+     * implementation is doing the work instead. Called from both branches so the reason is visible
+     * whether MEMC is on (no field) or off (no GL denoise program).
+     */
+    private fun noteDenoiseUnavailable() {
+        if (denoiseUnavailableLogged || !fastDvdNetEngine.isEnabled) {
+            return
+        }
+        denoiseUnavailableLogged = true
+        Log.w(
+            TAG,
+            "motion-aligned denoiser not running for this stream " +
+                "(renderer=${outputRenderer?.isDenoiseInitialized}); " +
+                "the stage's own implementation is used"
+        )
     }
 
     private fun renderFrameToOutput(frame: FrameData) {

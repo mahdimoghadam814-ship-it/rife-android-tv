@@ -142,6 +142,64 @@ class GlOutputRenderer {
             }
         """
 
+        /**
+         * Temporal denoiser: merge the frame being decoded into the history the previous call
+         * produced, sampled where the motion field says that content has moved to.
+         *
+         * This is the recursion the motion-aligned denoiser is - `mix(current, warp(history), w)`
+         * with `w` from `MemcInterpolator::packMotionField()` - so it cannot live inside
+         * [WARP_FRAGMENT_SHADER]. Merging the two sides there, before the timestep blend, collapses
+         * `mix(mix(a, b, t), ...)` onto a plain crossfade, which is the quality problem this
+         * pipeline exists to fix; the warp runs on the denoised textures instead, at the price of
+         * one extra pass for the current frame.
+         *
+         * The per-pixel gate is what stops it ghosting. A block straddles a motion boundary, so its
+         * vector is wrong for part of that block and the sample lands somewhere unrelated; the gate
+         * asks whether the two frames would have shown this difference anyway and shuts the merge as
+         * soon as they would not. It compares the mean over the three channels rather than
+         * luminance alone - a sample can match in brightness and be entirely wrong in colour - and
+         * `uMask.a` is already published in those units, so the two agree without the shader
+         * knowing anything about luma. `uMask.b` has been folded with the forward cover/uncover
+         * mask on the native side, so a covered sample is rejected here too.
+         *
+         * `highp` matters for the same reason it does in the warp: the field is biased by 128, and
+         * a mediump `mvf` would quantise to about a quarter of a pixel.
+         */
+        private const val DENOISE_FRAGMENT_SHADER = """
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
+            precision mediump float;
+            #endif
+            varying vec2 vTextureCoord;
+            uniform sampler2D uCurrent;
+            uniform sampler2D uHistory;
+            uniform sampler2D uMotion;
+            uniform sampler2D uMask;
+            uniform vec2 uTargetSize;
+            uniform vec2 uMotionGrid;
+            uniform float uHasHistory;
+            void main() {
+                vec2 p = vTextureCoord * uTargetSize - 0.5;
+                vec3 cur = texture2D(uCurrent, vTextureCoord).rgb;
+                vec3 merged = cur;
+                if (uHasHistory > 0.5) {
+                    vec2 g = p / uMotionGrid;
+                    vec2 mvf = texture2D(uMotion, g).rg * 255.0 - 128.0;
+                    vec4 aux = texture2D(uMask, g);
+                    float w = aux.b * (255.0 - aux.r) / (255.0 * 255.0);
+                    if (w > 0.0) {
+                        vec3 his = texture2D(uHistory, (p - mvf + 0.5) / uTargetSize).rgb;
+                        float f = max(aux.a, 1.0);
+                        float d = (abs(cur.r - his.r) + abs(cur.g - his.g) + abs(cur.b - his.b)) / 3.0;
+                        float gate = 1.0 - clamp((d - 2.0 * f) / (3.0 * f), 0.0, 1.0);
+                        merged = mix(cur, his, w * gate);
+                    }
+                }
+                gl_FragColor = vec4(merged, 1.0);
+            }
+        """
+
         /** Clip-space positions of a full-screen triangle strip. */
         private val FULL_QUAD_VERTICES = floatArrayOf(
             -1.0f, -1.0f, 0.0f,
@@ -197,6 +255,44 @@ class GlOutputRenderer {
     private var warpGridW = 0
     private var warpGridH = 0
     private var warpDrawCalls = 0L
+
+    // ---- Temporal denoiser (see DENOISE_FRAGMENT_SHADER) ----
+    private var denoiseProgram = 0
+    private var denDPosition = -1
+    private var denDTexCoord = -1
+    private var denUContentScale = -1
+    private var denUCurrent = -1
+    private var denUHistory = -1
+    private var denUMotion = -1
+    private var denUMask = -1
+    private var denUTargetSize = -1
+    private var denUMotionGrid = -1
+    private var denUHasHistory = -1
+
+    /** The frame being denoised, uploaded once per call. Kept separate from the warp's pair. */
+    private var denCurrentTex = 0
+    private var denCurrentW = 0
+    private var denCurrentH = 0
+
+    /** Ping-pong history: one holds the previous call's output, the other receives the new one. */
+    private var denTexA = 0
+    private var denTexB = 0
+    private var denFbo = 0
+    private var denTexW = 0
+    private var denTexH = 0
+
+    /** History the next call merges into; 0 while there is none (first frame, or after a reset). */
+    private var denHistoryTex = 0
+
+    /**
+     * The pair the last [renderDenoise] produced: [denPair0] the history it read, [denPair1] the
+     * frame it wrote. The warp blends these two instead of the raw sources. [denPair0] is 0 on the
+     * first call after a reset, which is the one cycle where there is no previous denoised frame
+     * to warp from and the caller has to keep the raw one.
+     */
+    private var denPair0 = 0
+    private var denPair1 = 0
+    private var denoiseDrawCalls = 0L
 
     /**
      * Clip-space scale that letterboxes the frame into the surface. Seeded to 0 so the very first
@@ -385,6 +481,67 @@ class GlOutputRenderer {
         warpMotionTex = createWarpTexture()
         warpMaskTex = createWarpTexture()
         Log.i(TAG, "warp program ready")
+
+        initDenoise()
+    }
+
+    /**
+     * Compiles the denoiser and creates its ping-pong targets. Best-effort, like the warp program:
+     * a driver that will not compile it costs the denoising stage only, so [VideoFrameProcessor]
+     * falls back to the stage's own implementation rather than to no picture at all.
+     */
+    private fun initDenoise() {
+        if (denoiseProgram != 0) {
+            return
+        }
+        val fs = tryCompileShader(GLES20.GL_FRAGMENT_SHADER, DENOISE_FRAGMENT_SHADER)
+        if (fs == 0) {
+            return
+        }
+        val vs = tryCompileShader(GLES20.GL_VERTEX_SHADER, WARP_VERTEX_SHADER)
+        if (vs == 0) {
+            GLES20.glDeleteShader(fs)
+            return
+        }
+        val newProgram = GLES20.glCreateProgram()
+        if (newProgram == 0) {
+            GLES20.glDeleteShader(fs)
+            GLES20.glDeleteShader(vs)
+            return
+        }
+        GLES20.glAttachShader(newProgram, vs)
+        GLES20.glAttachShader(newProgram, fs)
+        GLES20.glLinkProgram(newProgram)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(newProgram, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        val programLog = GLES20.glGetProgramInfoLog(newProgram)
+        GLES20.glDeleteShader(vs)
+        GLES20.glDeleteShader(fs)
+        if (linkStatus[0] != GLES20.GL_TRUE) {
+            GLES20.glDeleteProgram(newProgram)
+            Log.w(TAG, "denoise program did not link; $programLog")
+            return
+        }
+        denDPosition = GLES20.glGetAttribLocation(newProgram, "aPosition")
+        denDTexCoord = GLES20.glGetAttribLocation(newProgram, "aTextureCoord")
+        denUContentScale = GLES20.glGetUniformLocation(newProgram, "uContentScale")
+        denUCurrent = GLES20.glGetUniformLocation(newProgram, "uCurrent")
+        denUHistory = GLES20.glGetUniformLocation(newProgram, "uHistory")
+        denUMotion = GLES20.glGetUniformLocation(newProgram, "uMotion")
+        denUMask = GLES20.glGetUniformLocation(newProgram, "uMask")
+        denUTargetSize = GLES20.glGetUniformLocation(newProgram, "uTargetSize")
+        denUMotionGrid = GLES20.glGetUniformLocation(newProgram, "uMotionGrid")
+        denUHasHistory = GLES20.glGetUniformLocation(newProgram, "uHasHistory")
+        if (denDPosition < 0 || denDTexCoord < 0 || denUContentScale < 0 ||
+            denUCurrent < 0 || denUHistory < 0 || denUMotion < 0 || denUMask < 0 ||
+            denUTargetSize < 0 || denUMotionGrid < 0 || denUHasHistory < 0
+        ) {
+            GLES20.glDeleteProgram(newProgram)
+            Log.w(TAG, "denoise program is missing a location; the stage keeps its own path")
+            return
+        }
+        denoiseProgram = newProgram
+        Log.i(TAG, "denoise program ready")
     }
 
     private fun createWarpTexture(): Int {
@@ -555,9 +712,12 @@ class GlOutputRenderer {
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
         GLES20.glUniform1i(uTextureHandle, 0)
 
-        if (updateContentScale(width, height, surfaceWidth, surfaceHeight)) {
-            GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
-        }
+        // Pushed unconditionally rather than on change: contentScaleX/Y are shared with the warp
+        // and the denoised present, so "unchanged since the last call" says nothing about whether
+        // THIS program's uniform location holds the current value. After a surface resize that
+        // difference is a stretched or invisible frame, and one glUniform2f is not worth it.
+        updateContentScale(width, height, surfaceWidth, surfaceHeight)
+        GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
 
         // The quad no longer covers the whole surface whenever the aspect ratios differ, so the
         // bars are painted black instead of leaving the previous frame's contents on screen.
@@ -706,15 +866,370 @@ class GlOutputRenderer {
         warpGridH = gridH
         nsUpload += System.nanoTime() - tPhase
 
+        return drawWarp(
+            eglDisplay, eglSurface, warpTex0, warpTex1, srcWidth, srcHeight,
+            targetWidth, targetHeight, gridW, gridH, timestep
+        )
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Temporal denoiser
+    // ---------------------------------------------------------------------------------------------
+
+    /** True when [renderDenoise] compiled; false means [VideoFrameProcessor] keeps its own stage. */
+    val isDenoiseInitialized: Boolean
+        get() = denoiseProgram != 0
+
+    /**
+     * True when [denPair0] holds a real previous denoised frame, so [renderWarpFromDen] has both
+     * sides of the pair. False on the first call after [resetDenoise] or a size change.
+     */
+    val hasDenoisePair: Boolean
+        get() = denPair0 != 0 && denPair1 != 0
+
+    /**
+     * Forgets the history. Called on seek and on pipeline reset, where the frame that follows is
+     * not temporally adjacent to anything the denoiser has already merged - continuing the
+     * recursion across the cut is what turns a seek into a smear.
+     */
+    fun resetDenoise() {
+        denHistoryTex = 0
+        denPair0 = 0
+        denPair1 = 0
+    }
+
+    /**
+     * (Re)creates the two history targets and their framebuffer at [width] x [height]. A size
+     * change invalidates the history, because the stored frames are the previous size.
+     */
+    private fun ensureDenoiseTarget(width: Int, height: Int): Boolean {
+        if (denTexA == 0) {
+            denCurrentTex = createWarpTexture()
+            denTexA = createWarpTexture()
+            denTexB = createWarpTexture()
+            val ids = IntArray(1)
+            GLES20.glGenFramebuffers(1, ids, 0)
+            denFbo = ids[0]
+            if (denCurrentTex == 0 || denTexA == 0 || denTexB == 0 || denFbo == 0) {
+                return false
+            }
+        }
+        if (denTexW != width || denTexH != height) {
+            for (tex in intArrayOf(denTexA, denTexB)) {
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+                GLES20.glTexImage2D(
+                    GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, width, height, 0,
+                    GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, null as ByteBuffer?
+                )
+            }
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            denTexW = width
+            denTexH = height
+            resetDenoise()
+        }
+        return true
+    }
+
+    /**
+     * Merges [current] into the history from the previous call, using the flow in [motion], and
+     * leaves the result ready for [presentDenoised] or [renderWarpFromDen]. Nothing is presented:
+     * this pass writes to a framebuffer, so it costs no swap and can be followed by either.
+     *
+     * [current] is exactly [width] x [height] RGBA, top row first. [motion] is the packed field
+     * from `NativeEngine.computeMotionField()` at `ceil(width/16) x ceil(height/16)`, laid out as
+     * `renderWarp` documents: vectors in the first half, then the mask the denoiser reads from the
+     * second half as (cover mask, unused, blend weight, noise floor).
+     *
+     * Returns false when the program, the EGL surface or the framebuffer is unusable, or the byte
+     * counts overflow, in which case [hasDenoisePair] is left false and the caller must not warp
+     * from these textures.
+     */
+    fun renderDenoise(current: ByteBuffer, motion: ByteBuffer, width: Int, height: Int): Boolean {
+        val eglDisplay = display
+        val eglContext = context
+        val eglSurface = windowSurface
+        denPair0 = 0
+        denPair1 = 0
+        if (denoiseProgram == 0 || eglDisplay == null || eglContext == null || eglSurface == null) {
+            return false
+        }
+        if (width <= 0 || height <= 0) {
+            return false
+        }
+        if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            return false
+        }
+        val gridW = (width + 15) / 16
+        val gridH = (height + 15) / 16
+        if (!ensureDenoiseTarget(width, height)) {
+            return false
+        }
+
+        var tPhase = System.nanoTime()
+        if (!uploadRgba(denCurrentTex, current, width, height, denCurrentW, denCurrentH) ||
+            !uploadRgba(warpMotionTex, motion, gridW, gridH, warpGridW, warpGridH) ||
+            !uploadRgba(
+                warpMaskTex, motion, gridW, gridH, warpGridW, warpGridH,
+                gridW * gridH * 4
+            )
+        ) {
+            return false
+        }
+        denCurrentW = width
+        denCurrentH = height
+        warpGridW = gridW
+        warpGridH = gridH
+        nsUpload += System.nanoTime() - tPhase
+
+        // The history read and the history written are never the same texture, so there is no
+        // feedback loop; on the first call there is no history at all and the current frame stands
+        // in as the sampler, which the uHasHistory branch never reads.
+        val dst = if (denHistoryTex == denTexA) denTexB else denTexA
+        val src = denHistoryTex
+
         tPhase = System.nanoTime()
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, denFbo)
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0, GLES20.GL_TEXTURE_2D, dst, 0
+        )
+        if (GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) !=
+            GLES20.GL_FRAMEBUFFER_COMPLETE
+        ) {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            Log.e(TAG, "denoise framebuffer incomplete")
+            return false
+        }
+
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glUseProgram(denoiseProgram)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, denCurrentTex)
+        GLES20.glUniform1i(denUCurrent, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, if (src != 0) src else denCurrentTex)
+        GLES20.glUniform1i(denUHistory, 1)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMotionTex)
+        GLES20.glUniform1i(denUMotion, 2)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE3)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMaskTex)
+        GLES20.glUniform1i(denUMask, 3)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+
+        GLES20.glUniform2f(denUTargetSize, width.toFloat(), height.toFloat())
+        GLES20.glUniform2f(denUMotionGrid, (gridW * 16).toFloat(), (gridH * 16).toFloat())
+        GLES20.glUniform1f(denUHasHistory, if (src != 0) 1.0f else 0.0f)
+        // Always full frame: this pass writes a texture, it does not letterbox into a surface, so
+        // it must not touch contentScaleX/Y - the present that follows shares those two.
+        GLES20.glUniform2f(denUContentScale, 1.0f, 1.0f)
+
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(denDPosition)
+        GLES20.glVertexAttribPointer(denDPosition, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(denDTexCoord)
+        GLES20.glVertexAttribPointer(denDTexCoord, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(denDPosition)
+        GLES20.glDisableVertexAttribArray(denDTexCoord)
+
+        val error = GLES20.glGetError()
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        nsDraw += System.nanoTime() - tPhase
+        denoiseDrawCalls++
+
+        if (error != GLES20.GL_NO_ERROR) {
+            Log.e(TAG, "denoise pass failed with GL error 0x${error.toString(16)}")
+            return false
+        }
+
+        denPair0 = src
+        denPair1 = dst
+        denHistoryTex = dst
+        return true
+    }
+
+    /**
+     * Same blend as [renderWarp], but from the two textures [renderDenoise] produced instead of
+     * from ByteBuffers, so the denoised pair does not have to round-trip through memory to reach
+     * the surface. The frame upload is the part that disappears; the field is re-uploaded, since
+     * it is a few kilobytes and keeping this function self-contained is worth more than saving it.
+     *
+     * Only valid after a [renderDenoise] that reported [hasDenoisePair]; on the first cycle after a
+     * reset there is no denoised history and the caller must use [renderWarp] with the raw frames.
+     * Returns false otherwise, so a wrong call degrades to the CPU warp rather than to a black
+     * frame.
+     */
+    fun renderWarpFromDen(
+        motion: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        timestep: Float
+    ): Boolean {
+        val frame0 = denPair0
+        val frame1 = denPair1
+        if (frame0 == 0 || frame1 == 0 || denTexW != srcWidth || denTexH != srcHeight) {
+            return false
+        }
+        return renderWarpWithTextures(
+            frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight, timestep
+        )
+    }
+
+    /** Shared body of [renderWarp] and [renderWarpFromDen]; see [renderWarp] for the contract. */
+    private fun renderWarpWithTextures(
+        frame0: Int,
+        frame1: Int,
+        motion: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        timestep: Float
+    ): Boolean {
+        val eglDisplay = display
+        val eglContext = context
+        val eglSurface = windowSurface
+        if (warpProgram == 0 || eglDisplay == null || eglContext == null || eglSurface == null) {
+            return false
+        }
+        if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+            return false
+        }
+        if (timestep < 0.0f || timestep > 1.0f) {
+            return false
+        }
+        val gridW = (targetWidth + 15) / 16
+        val gridH = (targetHeight + 15) / 16
+
+        if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            return false
+        }
+
+        var tPhase = System.nanoTime()
+        if (surfaceWidth != targetWidth || surfaceHeight != targetHeight) {
+            updateSurfaceSize()
+        }
+        nsCurrent += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        if (!uploadRgba(warpMotionTex, motion, gridW, gridH, warpGridW, warpGridH) ||
+            !uploadRgba(
+                warpMaskTex, motion, gridW, gridH, warpGridW, warpGridH,
+                gridW * gridH * 4
+            )
+        ) {
+            return false
+        }
+        warpGridW = gridW
+        warpGridH = gridH
+        nsUpload += System.nanoTime() - tPhase
+
+        return drawWarp(
+            eglDisplay, eglSurface, frame0, frame1, srcWidth, srcHeight,
+            targetWidth, targetHeight, gridW, gridH, timestep
+        )
+    }
+
+    /**
+     * Presents the history [renderDenoise] last wrote, scaled into the surface exactly as
+     * [render] scales the frame it was handed. Exists so the denoise-only path can present without
+     * a readback: the frame is already a texture.
+     */
+    fun presentDenoised(width: Int, height: Int): Boolean {
+        val eglDisplay = display
+        val eglContext = context
+        val eglSurface = windowSurface
+        if (program == 0 || denPair1 == 0 || eglDisplay == null ||
+            eglContext == null || eglSurface == null
+        ) {
+            return false
+        }
+        if (width <= 0 || height <= 0) {
+            return false
+        }
+        if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            return false
+        }
+
+        var tPhase = System.nanoTime()
+        if (surfaceWidth != width || surfaceHeight != height) {
+            updateSurfaceSize()
+        }
+        nsCurrent += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
+        GLES20.glUseProgram(program)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, denPair1)
+        GLES20.glUniform1i(uTextureHandle, 0)
+
+        updateContentScale(width, height, surfaceWidth, surfaceHeight)
+        GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
+
+        GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        nsSetup += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPositionHandle)
+        GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aTextureCoordHandle)
+        GLES20.glVertexAttribPointer(
+            aTextureCoordHandle, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer
+        )
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        GLES20.glDisableVertexAttribArray(aPositionHandle)
+        GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        nsDraw += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        val swapError = EGL14.eglGetError()
+        nsSwap += System.nanoTime() - tPhase
+        renderCalls++
+        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
+            Log.d(TAG, "eglSwapBuffers (denoised): result=$swapResult error=0x${swapError.toString(16)}")
+        }
+        return true
+    }
+
+    /**
+     * The half of [renderWarp] that both callers share: bind the two frame textures, push the
+     * field, blend at [timestep], present. Assumes the window surface is already current and the
+     * textures have been uploaded, so it does no allocation and no readback.
+     */
+    private fun drawWarp(
+        eglDisplay: EGLDisplay,
+        eglSurface: EGLSurface,
+        frame0: Int,
+        frame1: Int,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        gridW: Int,
+        gridH: Int,
+        timestep: Float
+    ): Boolean {
+        var tPhase = System.nanoTime()
         GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
         GLES20.glUseProgram(warpProgram)
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpTex0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frame0)
         GLES20.glUniform1i(warpUFrame0, 0)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpTex1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frame1)
         GLES20.glUniform1i(warpUFrame1, 1)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMotionTex)
@@ -938,6 +1453,38 @@ class GlOutputRenderer {
             GLES20.glDeleteProgram(warpProgram)
             warpProgram = 0
         }
+        if (denoiseProgram != 0) {
+            if (denFbo != 0) {
+                GLES20.glDeleteFramebuffers(1, intArrayOf(denFbo), 0)
+                denFbo = 0
+            }
+            if (denCurrentTex != 0) {
+                GLES20.glDeleteTextures(1, intArrayOf(denCurrentTex), 0)
+                denCurrentTex = 0
+            }
+            denCurrentW = 0
+            denCurrentH = 0
+            if (denTexA != 0) {
+                GLES20.glDeleteTextures(2, intArrayOf(denTexA, denTexB), 0)
+                denTexA = 0
+                denTexB = 0
+            }
+            denTexW = 0
+            denTexH = 0
+            resetDenoise()
+            GLES20.glDeleteProgram(denoiseProgram)
+            denoiseProgram = 0
+        }
+        denDPosition = -1
+        denDTexCoord = -1
+        denUContentScale = -1
+        denUCurrent = -1
+        denUHistory = -1
+        denUMotion = -1
+        denUMask = -1
+        denUTargetSize = -1
+        denUMotionGrid = -1
+        denUHasHistory = -1
         warpAPosition = -1
         warpATexCoord = -1
         warpUContentScale = -1

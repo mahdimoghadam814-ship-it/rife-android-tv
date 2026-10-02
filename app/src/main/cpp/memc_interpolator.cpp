@@ -57,6 +57,7 @@ static inline int sad8x8(const uint8_t* a, const uint8_t* b, int stride) {
     return static_cast<int>(vget_lane_u32(q, 0));
 }
 
+
 // MV coherence penalties, in SAD counts per full-resolution pixel of deviation. These are the
 // block-matching counterpart of SVP's penalty.* settings and they are what keeps a per-block
 // search from producing a field that is locally plausible but globally speckled:
@@ -78,6 +79,23 @@ static constexpr int kPenaltyNeighbour = 96;
 
 static inline int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// 8x8 SAD between plane `a` at (ax, ay) and plane `b` at (bx, by). Both window origins are
+// clamped inside the plane, so a motion vector that runs off the picture compares against the
+// border instead of reading past it. Returns the sum on the 0..255-per-pixel scale; callers
+// divide by 64 for the mean.
+static inline int sadAt(const uint8_t* a, const uint8_t* b, int stride, int w, int h,
+                        int ax, int ay, int bx, int by) {
+    if (w < 8 || h < 8) return 0;
+    const int maxX = w - 8;
+    const int maxY = h - 8;
+    ax = clampi(ax, 0, maxX);
+    ay = clampi(ay, 0, maxY);
+    bx = clampi(bx, 0, maxX);
+    by = clampi(by, 0, maxY);
+    return sad8x8(a + static_cast<size_t>(ay) * stride + ax,
+                  b + static_cast<size_t>(by) * stride + bx, stride);
 }
 
 // Floor of v/256 for a signed 1/256-pixel coordinate. Written out rather than left to >>,
@@ -938,6 +956,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     microBench();  // one-shot; logs raw NEON and sad16x16 throughput
 
     const auto tSetup0 = std::chrono::steady_clock::now();
+    sceneCut_ = false;
     if (dirty_.exchange(false, std::memory_order_acq_rel)) {
         // A seek / stream change happened while the previous frame was in flight.
         work_w_ = 0;
@@ -1030,6 +1049,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
         const double meanFwd = static_cast<double>(sadFwd) * scale;
         const double meanBwd = static_cast<double>(sadBwd) * scale;
         if (meanFwd > kSceneCutMeanSad && meanBwd > kSceneCutMeanSad) {
+            sceneCut_ = true;
             std::fill(mvf_x_.begin(), mvf_x_.end(), 0);
             std::fill(mvf_y_.begin(), mvf_y_.end(), 0);
             std::fill(mvb_x_.begin(), mvb_x_.end(), 0);
@@ -1099,6 +1119,81 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
         return static_cast<uint8_t>(b < 0 ? 0 : (b > 255 ? 255 : b));
     };
     uint8_t* outMask = outMv + blocks * 4;
+
+    // Residual scores for the non-local-mean blend weights, one per block per direction: how
+    // well each vector explains its own frame against the other one, measured as an 8x8 SAD of
+    // luma at the motion-compensated position. Where the vector is right the residual is just
+    // the noise the two frames do not share; where it is wrong the residual is the misalignment
+    // on top. Serial over a few thousand blocks - two clamped SADs each is tens of microseconds,
+    // and the histogram that follows is one 256-bin sweep - so it stays inside packMotionField's
+    // existing serial section rather than buying a parallel region for microseconds.
+    nlmScore_.assign(blocks * 2, 0);
+    int hist[256];
+    memset(hist, 0, sizeof(hist));
+    if (w >= 8 && h >= 8) {
+        for (int r = 0; r < bwy; r++) {
+            const size_t row = static_cast<size_t>(r) * bwx;
+            const int cy = r * kBlock + kBlock / 2;
+            for (int c = 0; c < bwx; c++) {
+                const size_t i = row + c;
+                const int cx = c * kBlock + kBlock / 2;
+                // `p - mv` at t = 1, the same position the warp shader samples the partner at.
+                const int sadF = sadAt(luma1_.data(), luma0_.data(), w, w, h,
+                                       cx, cy, cx - mvf_x_[i], cy - mvf_y_[i]);
+                const int sadB = sadAt(luma0_.data(), luma1_.data(), w, w, h,
+                                       cx, cy, cx - mvb_x_[i], cy - mvb_y_[i]);
+                const int sf = clampi(sadF / 64, 0, 255);
+                const int sb = clampi(sadB / 64, 0, 255);
+                nlmScore_[i * 2] = static_cast<uint8_t>(sf);
+                nlmScore_[i * 2 + 1] = static_cast<uint8_t>(sb);
+                hist[sf]++;
+                hist[sb]++;
+            }
+        }
+    }
+
+    // The noise floor: the score the easiest fifth of the blocks sit at. Matching is easiest in
+    // the flat majority of any real frame, so a low percentile lands on the noise itself without
+    // anyone having to decide which blocks are flat. A cut is handled before this by zeroing the
+    // field, which would otherwise make the whole histogram large and the floor claim that two
+    // unrelated pictures were one noisy one.
+    const long long samples = static_cast<long long>(blocks) * 2;
+    long long target = samples * kNlmFloorPercentile / 100;
+    if (target < 1) target = 1;
+    long long acc = 0;
+    int floorBin = 255;
+    for (int i = 0; i < 256; i++) {
+        acc += hist[i];
+        if (acc >= target) {
+            floorBin = i;
+            break;
+        }
+    }
+    float floorVal;
+    if (sceneCut_ || samples == 0) {
+        floorVal = 0.0f;
+    } else if (floorBin < static_cast<int>(kNlmFloorMin)) {
+        floorVal = kNlmFloorMin;
+    } else if (floorBin > static_cast<int>(kNlmFloorMax)) {
+        floorVal = kNlmFloorMax;
+    } else {
+        floorVal = static_cast<float>(floorBin);
+    }
+    const float invFloor = floorVal > 0.0f ? 1.0f / floorVal : 0.0f;
+    // Published in mean-per-channel difference units, the metric the shader's per-pixel gate
+    // uses, so the two are comparable without the shader knowing anything about luma.
+    const int floorByte = clampi(
+        static_cast<int>(floorVal * kNlmChannelScale + 0.5f), 0, 255);
+
+    auto blendWeight = [invFloor](int score) -> uint8_t {
+        if (invFloor <= 0.0f) return 0;
+        const float r = static_cast<float>(score) * invFloor;
+        const float e = -kNlmExponent * r * r;
+        if (e < -20.0f) return 0;
+        const float v = 255.0f * std::exp(e);
+        return static_cast<uint8_t>(v < 0.0f ? 0.0f : (v > 255.0f ? 255.0f : v + 0.5f));
+    };
+
     for (int r = 0; r < bwy; r++) {
         const size_t row = static_cast<size_t>(r) * bwx;
         for (int c = 0; c < bwx; c++) {
@@ -1111,8 +1206,17 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
             uint8_t* m = outMask + i * 4;
             m[0] = maskf_[i];
             m[1] = maskb_[i];
-            m[2] = 0;
-            m[3] = 0;
+            // The cover/uncover mask is folded in on top of the similarity weight: a sample the
+            // warp rejects as covered is not fit to be averaged in either. Both terms are
+            // 0..255, so the product scaled back to a byte is exact enough for a blend factor.
+            //
+            // Only the forward weight is published: the denoiser walks forward through the
+            // stream and merges the history into the new frame, which is the forward direction.
+            // Byte 7 carries the floor instead, replicated so the shader reads the same value
+            // from every texel of the block grid it already samples.
+            const int wf = blendWeight(nlmScore_[i * 2]);
+            m[2] = static_cast<uint8_t>((wf * (255 - maskf_[i]) + 127) / 255);
+            m[3] = static_cast<uint8_t>(floorByte);
         }
     }
 }

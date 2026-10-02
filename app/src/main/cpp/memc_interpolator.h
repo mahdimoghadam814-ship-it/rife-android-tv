@@ -59,7 +59,39 @@ public:
     //
     //   [0..4)   forward x, forward y, backward x, backward y - whole-pixel vectors biased by +128
     //   [4..6)   forward and backward occlusion mask, 0 = fully trusted, 255 = covered up
-    //   [6..8)   reserved, written as 0
+    //   [6..7)   forward non-local-mean blend weight, 0 = do not merge this sample
+    //   [7..8)   noise floor the weight was measured against, replicated for every block so the
+    //            shader can read it out of the texture it is already sampling
+    //
+    // The weight is what makes the packed field serve a denoiser as well as the interpolator.
+    // For every block both directions are scored with an 8x8 SAD against their own frame at the
+    // motion-compensated position, so the residual is what alignment failed to explain - pure
+    // noise where the vector is right, misalignment where it is wrong. The noise floor is read
+    // off the 20th percentile of those scores (the flat blocks, which is where matching is
+    // easiest and therefore where the residual is the sensor/compression noise itself) and the
+    // weight is exp(-0.6 * (sad/floor)^2) against it. That ratio is the whole denoiser: a block
+    // that matches to within its own noise floor merges with the other frame at ~0.55, a block
+    // two floors out merges at ~0.09, three floors at ~0.005, and a scene cut - where every
+    // field is zeroed before this runs - gets a floor of zero and therefore no weight at all.
+    // The cover/uncover mask is folded in on top, so a sample the interpolation would have
+    // rejected as covered is rejected here too.
+    //
+    // The scores are measured in luma, because that is the plane the search already has and one
+    // byte per pixel instead of four. The shader gates per pixel on the mean absolute difference
+    // across all three colour channels instead, which is strictly more sensitive - a sample can
+    // match in luminance and be completely wrong in colour - so the published floor is scaled by
+    // kNlmChannelScale to bring it into the units the gate compares against. For independent
+    // equal-variance channel noise that ratio is (1.128*s*sqrt(2)) / (1.128*0.669*s*sqrt(2))
+    // = 1/0.669 = 1.49, and 1.5 is the rounded value.
+    //
+    // The weight is a statement about a *block*, and blocks straddle motion boundaries. Between
+    // two block centres the field is interpolated, so a pixel inside a moving object close to its
+    // own edge gets a half-way vector and therefore samples the wrong part of the previous frame,
+    // while its weight is averaged with that of a neighbour that matched perfectly. The block
+    // weight alone would merge at full strength on exactly the pixels that are misaligned - which
+    // is why the noise floor is published alongside it, so the shader can run a per-pixel
+    // similarity gate on top and drop the sample the moment the two frames disagree by more than
+    // their own noise does.
     //
     // outMv must have at least motionFieldBytes(targetWidth, targetHeight) bytes of capacity.
     //
@@ -102,6 +134,28 @@ private:
     // *motion-compensated* pair. Consecutive frames of one shot land in single digits; an
     // unrelated pair lands near 30-60 no matter how good the search was.
     static constexpr int kSceneCutMeanSad = 30;
+    // Non-local-mean weight shaping. kNlmFloorMin/Max bound the noise floor read off the
+    // histogram: below the minimum a perfectly clean static frame would blend against a floor
+    // of nothing, above the maximum a cut or a failed search would claim to be noise and blend
+    // two unrelated pictures. kNlmExponent decides how sharply the weight falls away from the
+    // floor. The weight is the history term of a recursive filter y = (1-w)*x + w*y_prev, whose
+    // fixed-point variance is sigma^2 * (1-w)/(1+w), so w = 0.55 at the floor buys 3.4x noise
+    // variance reduction (1.85x in sigma) once the window has filled, while the same exponent
+    // puts a block two floors out at 0.09 (1.2x) and three floors at 0.005 (no-op) - the
+    // adaptive part, since a block that is only as different as its own noise still merges and
+    // a block that is differently wrong does not.
+    static constexpr float kNlmChannelScale = 1.5f;
+    static constexpr float kNlmFloorMin = 1.5f;
+    static constexpr float kNlmFloorMax = 12.0f;
+    // 0.45 puts a block at its own floor on 0.64 and one that is twice as different on 0.17.
+    // The block weight is allowed to be generous because the per-pixel gate in the shader is
+    // what actually protects a motion boundary: the block only has to say the match is
+    // plausible, the pixel decides whether this sample still agrees with it.
+    static constexpr float kNlmExponent = 0.45f;
+    // Fraction of the direction scores used to place the noise floor. The flat blocks of a real
+    // frame are always the majority, so a low percentile lands on them without needing to know
+    // which blocks are flat.
+    static constexpr int kNlmFloorPercentile = 20;
 
     void ensureCapacity(int w, int h);
     // One-shot micro-benchmark logged on the first frame: raw NEON streaming throughput and
@@ -200,6 +254,12 @@ private:
     std::vector<int32_t> tmpx_, tmpy_;
     // Cover/uncover masks, one byte per block, derived from the two fields above.
     std::vector<uint8_t> maskf_, maskb_;
+    // Set by prepare() when the scene-change gate fires, so packMotionField() can suppress the
+    // blend weights it is about to derive from a field that was deliberately zeroed.
+    bool sceneCut_ = false;
+    // Per-block residual scores feeding the noise-floor histogram: one entry per block per
+    // direction, so a frame is a few thousand entries and the scratch is reused every time.
+    std::vector<uint8_t> nlmScore_;
 };
 
 }  // namespace rife
