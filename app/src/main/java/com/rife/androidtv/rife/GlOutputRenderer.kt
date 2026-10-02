@@ -180,8 +180,17 @@ class GlOutputRenderer {
             uniform vec2 uMotionGrid;
             uniform float uHasHistory;
             void main() {
-                vec2 p = vTextureCoord * uTargetSize - 0.5;
-                vec3 cur = texture2D(uCurrent, vTextureCoord).rgb;
+                // The quad's V runs opposite to framebuffer row order: the vertex at the top of the
+                // viewport carries v = 0 but lands in framebuffer row height-1. Sampling at
+                // vTextureCoord directly would therefore store image row h-1-R into row R, and
+                // everything downstream - the present, and the warp that reads this as if it were
+                // a raw frame - would show the picture upside down, with the history mirrored
+                // against the current frame so the gate rejected every merge. Inverting v makes the
+                // pass orientation-neutral: row R receives image row R, which is the same layout a
+                // frame straight out of the readback has.
+                vec2 uv = vec2(vTextureCoord.x, 1.0 - vTextureCoord.y);
+                vec2 p = uv * uTargetSize - 0.5;
+                vec3 cur = texture2D(uCurrent, uv).rgb;
                 vec3 merged = cur;
                 if (uHasHistory > 0.5) {
                     vec2 g = p / uMotionGrid;

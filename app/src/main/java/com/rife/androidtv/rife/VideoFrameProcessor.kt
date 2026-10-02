@@ -1415,22 +1415,32 @@ class VideoFrameProcessor(
                 // one here. computeMotionField() refuses under any algorithm that is not MEMC, so
                 // this fails for a RIFE run and the stage's own implementation takes over.
                 val motionBuf = cachedMotionBuf
-                val presented = motionBuf != null &&
-                    outputRenderer?.isDenoiseInitialized == true &&
-                    NativeEngine.computeMotionField(
+                var presented = false
+                if (motionBuf != null && outputRenderer?.isDenoiseInitialized == true) {
+                    val tFieldStart = System.nanoTime()
+                    val fieldReady = NativeEngine.computeMotionField(
                         in0Buf, in1Buf,
                         rifeInputW, rifeInputH,
                         rifeInputW, rifeInputH,
                         motionBuf
-                    ) &&
-                    outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
-                    outputRenderer?.presentDenoised(rifeInputW, rifeInputH) == true
+                    )
+                    nsJni += System.nanoTime() - tFieldStart
+                    if (fieldReady) {
+                        val tRenderStart = System.nanoTime()
+                        presented = outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
+                            outputRenderer?.presentDenoised(rifeInputW, rifeInputH) == true
+                        nsRender += System.nanoTime() - tRenderStart
+                    }
+                }
                 if (presented) {
                     lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
                     frameCountOutput++
                     releaseFrameBuffer(prev.pixels)
                     previousFrame = nextFrame
                     updateStats()
+                    // The report is reached only through the RIFE branch below; without a call
+                    // here this state never emits PIPELINE TIMING and its cost stays invisible.
+                    reportStageTiming()
                     return
                 }
                 noteDenoiseUnavailable()
@@ -1458,6 +1468,7 @@ class VideoFrameProcessor(
             releaseFrameBuffer(prev.pixels)
             previousFrame = nextFrame
             updateStats()
+            reportStageTiming()
             return
         }
 
