@@ -96,7 +96,7 @@ class RifeEngineController(
 
     @Volatile
     private var interpolationAlgorithm: FeatureInterpolationAlgorithm =
-        FeatureInterpolationAlgorithm.RIFE
+        FeatureInterpolationAlgorithm.MEMC
 
     /**
      * Starts the processor's worker thread. Called once when the player screen is created.
@@ -148,6 +148,25 @@ class RifeEngineController(
     }
 
     /**
+     * Sets the interpolation ratio: how many output frames are synthesised per source frame. The
+     * value is read by the processor on every cycle, so the next pair already emits at the new
+     * cadence.
+     */
+    override fun setMemcLevel(multiplier: Float) {
+        processor.setMemcLevel(multiplier)
+        Log.i(TAG_LIFECYCLE, "MEMC level: ${multiplier}x")
+    }
+
+    /**
+     * Sets the denoiser strength. It reaches the renderer as a shader uniform, so it applies to
+     * the next frame rather than to the next pipeline reset.
+     */
+    override fun setDenoiseLevel(strength: Float) {
+        processor.setDenoiseLevel(strength)
+        Log.i(TAG_LIFECYCLE, "Denoise level: $strength")
+    }
+
+    /**
      * Enables or disables the FastDVDnet pre-processing stage (scaffold: frames pass through).
      * FastDVDnet does NOT initialize the RIFE engine - it runs independently.
      */
@@ -179,6 +198,10 @@ class RifeEngineController(
      */
     override fun setOutputSurfaceInfo(outputSurfaceInfo: SurfaceInfo?) {
         processor.setOutputSurfaceInfo(outputSurfaceInfo)
+    }
+
+    override fun setOutputDataSpace(dataSpace: Int) {
+        processor.setOutputDataSpace(dataSpace)
     }
 
     override fun onInputSurfaceAttached() {

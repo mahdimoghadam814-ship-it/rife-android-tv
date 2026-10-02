@@ -19,7 +19,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.anilbeesetti.nextplayer.core.model.DenoiseLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
+import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.ui.R
 import dev.anilbeesetti.nextplayer.core.ui.components.ClickablePreferenceItem
@@ -32,6 +34,7 @@ import dev.anilbeesetti.nextplayer.core.ui.components.tvListFocus
 import dev.anilbeesetti.nextplayer.core.ui.components.rememberTvListFocusRequester
 import dev.anilbeesetti.nextplayer.core.ui.designsystem.NextIcons
 import dev.anilbeesetti.nextplayer.settings.composables.OptionsDialog
+import dev.anilbeesetti.nextplayer.settings.extensions.description
 import dev.anilbeesetti.nextplayer.settings.extensions.name
 import androidx.compose.foundation.lazy.items
 
@@ -87,7 +90,9 @@ private fun VideoProcessingPreferencesScreenContent(
             ) {
                 PreferenceSwitch(
                     title = stringResource(id = R.string.rife),
-                    description = stringResource(id = R.string.rife_description),
+                    // The backend is chosen below, so the wording has to follow the selection
+                    // instead of naming one algorithm for both.
+                    description = state.preferences.interpolationAlgorithm.description(),
                     icon = NextIcons.Speed,
                     isChecked = state.preferences.rifeEnabled,
                     onClick = { onAction(VideoProcessingPreferencesUiEvent.ToggleRife) },
@@ -109,12 +114,28 @@ private fun VideoProcessingPreferencesScreenContent(
                         onAction(VideoProcessingPreferencesUiEvent.ShowDialog(VideoProcessingDialog.InterpolationAlgorithmDialog))
                     },
                 )
+                ClickablePreferenceItem(
+                    title = stringResource(id = R.string.memc_level),
+                    description = state.preferences.memcLevel.name(),
+                    icon = NextIcons.Speed,
+                    onClick = {
+                        onAction(VideoProcessingPreferencesUiEvent.ShowDialog(VideoProcessingDialog.MemcLevelDialog))
+                    },
+                )
                 PreferenceSwitch(
                     title = stringResource(id = R.string.fastdvdnet),
                     description = stringResource(id = R.string.fastdvdnet_description),
                     icon = NextIcons.Player,
                     isChecked = state.preferences.fastDvdNetEnabled,
                     onClick = { onAction(VideoProcessingPreferencesUiEvent.ToggleFastDvdNet) },
+                )
+                ClickablePreferenceItem(
+                    title = stringResource(id = R.string.denoise_level),
+                    description = state.preferences.denoiseLevel.name(),
+                    icon = NextIcons.Movie,
+                    onClick = {
+                        onAction(VideoProcessingPreferencesUiEvent.ShowDialog(VideoProcessingDialog.DenoiseLevelDialog))
+                    },
                     isLastItem = true,
                 )
             }
@@ -149,6 +170,40 @@ private fun VideoProcessingPreferencesScreenContent(
                             selected = it == state.preferences.interpolationAlgorithm,
                             onClick = {
                                 onAction(VideoProcessingPreferencesUiEvent.UpdateInterpolationAlgorithm(it))
+                                onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null))
+                            },
+                        )
+                    }
+                }
+            }
+            VideoProcessingDialog.MemcLevelDialog -> {
+                OptionsDialog(
+                    text = stringResource(id = R.string.memc_level),
+                    onDismissClick = { onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null)) },
+                ) {
+                    items(MemcLevelSetting.entries.toTypedArray()) {
+                        RadioTextButton(
+                            text = it.name(),
+                            selected = it == state.preferences.memcLevel,
+                            onClick = {
+                                onAction(VideoProcessingPreferencesUiEvent.UpdateMemcLevel(it))
+                                onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null))
+                            },
+                        )
+                    }
+                }
+            }
+            VideoProcessingDialog.DenoiseLevelDialog -> {
+                OptionsDialog(
+                    text = stringResource(id = R.string.denoise_level),
+                    onDismissClick = { onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null)) },
+                ) {
+                    items(DenoiseLevelSetting.entries.toTypedArray()) {
+                        RadioTextButton(
+                            text = it.name(),
+                            selected = it == state.preferences.denoiseLevel,
+                            onClick = {
+                                onAction(VideoProcessingPreferencesUiEvent.UpdateDenoiseLevel(it))
                                 onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null))
                             },
                         )

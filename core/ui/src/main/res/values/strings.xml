@@ -522,12 +522,13 @@
     <string name="chapter_number">Chapter %1$d</string>
     <string name="show_chapters">Show chapters</string>
     <string name="video_processing">Video Processing</string>
-    <string name="video_processing_description">RIFE frame interpolation and pre-processing</string>
-    <string name="rife">RIFE Frame Interpolation</string>
-    <string name="rife_description">Interpolate real frames with the RIFE neural engine</string>
+    <string name="video_processing_description">Frame interpolation, processing resolution and denoising</string>
+    <string name="rife">Interpolation</string>
+    <string name="interpolation_description_rife">Generate in-between frames with the RIFE neural network</string>
+    <string name="interpolation_description_memc">Generate in-between frames by matching motion blocks in the source frames</string>
     <string name="processing_resolution">Processing Resolution</string>
-    <string name="fastdvdnet">FastDVDnet</string>
-    <string name="fastdvdnet_description">Pre-processing stage (scaffold: frames pass through)</string>
+    <string name="fastdvdnet">Motion-Aligned Denoiser</string>
+    <string name="fastdvdnet_description">Merges each frame into a motion-compensated history to remove noise, on its own or alongside interpolation</string>
     <string name="rife_resolution_auto">Auto (engine decides)</string>
     <string name="rife_resolution_original">Original</string>
     <string name="rife_resolution_1080p">1080p</string>
@@ -537,4 +538,13 @@
     <string name="interpolation_algorithm_description">Choose the frame interpolation backend</string>
     <string name="interpolation_algorithm_rife">RIFE neural network (GPU, high quality)</string>
     <string name="interpolation_algorithm_memc">MEMC block matching (CPU, lightweight)</string>
+    <string name="memc_level">MEMC Level</string>
+    <string name="memc_level_description">How many output frames are synthesised per source frame</string>
+    <string name="memc_level_2x">2x</string>
+    <string name="memc_level_3x">3x</string>
+    <string name="denoise_level">Denoise Level</string>
+    <string name="denoise_level_description">How much of the motion-compensated history each pixel may be replaced with</string>
+    <string name="denoise_level_light">Light</string>
+    <string name="denoise_level_balanced">Balanced</string>
+    <string name="denoise_level_strong">Strong</string>
 </resources>

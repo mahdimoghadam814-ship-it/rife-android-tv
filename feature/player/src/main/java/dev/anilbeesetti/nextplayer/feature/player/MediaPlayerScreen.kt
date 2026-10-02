@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.ui.Alignment
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
@@ -23,7 +24,10 @@ import androidx.compose.ui.tooling.preview.PreviewScreenSizes
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.media3.common.C
+import androidx.media3.common.ColorInfo
 import androidx.media3.common.Player
+import androidx.media3.common.Tracks
 import androidx.media3.common.util.UnstableApi
 import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
@@ -176,11 +180,33 @@ internal fun MediaPlayerContent(
     val rifeController: RifeController = koinInject()
     val rifeProcessingEnabled by rifeController.processingEnabled.collectAsStateWithLifecycle()
     val rifeStats by rifeController.stats.collectAsStateWithLifecycle()
+
+    // The bypass path lets MediaCodec write the colour volume onto the buffers itself. Once a
+    // stage is on, frames come back through our own RGBA8888 window, which the display stack
+    // reads as SDR - so PQ/HLG code values are shown through an sRGB curve and the picture comes
+    // out flat and milky. Read the source's transfer characteristic and tag the output with the
+    // matching dataspace so the panel decodes it as HDR again.
+    var outputDataSpace by remember { mutableIntStateOf(0) }
+    DisposableEffect(player) {
+        val listener = object : Player.Listener {
+            override fun onTracksChanged(tracks: Tracks) {
+                outputDataSpace = tracks.outputDataSpace()
+            }
+        }
+        player.addListener(listener)
+        outputDataSpace = player.currentTracks.outputDataSpace()
+        onDispose { player.removeListener(listener) }
+    }
+    LaunchedEffect(outputDataSpace) {
+        rifeController.setOutputDataSpace(outputDataSpace)
+    }
     LaunchedEffect(
         playerPreferences.rifeEnabled,
         playerPreferences.fastDvdNetEnabled,
         playerPreferences.rifeResolution,
         playerPreferences.interpolationAlgorithm,
+        playerPreferences.memcLevel,
+        playerPreferences.denoiseLevel,
     ) {
         // Order matters: the algorithm has to be known before setRifeEnabled decides whether
         // the RIFE model is worth loading at all.
@@ -190,6 +216,8 @@ internal fun MediaPlayerContent(
         rifeController.setRifeEnabled(playerPreferences.rifeEnabled)
         rifeController.setFastDvdNetEnabled(playerPreferences.fastDvdNetEnabled)
         rifeController.setResolution(playerPreferences.rifeResolution.toRifeResolution())
+        rifeController.setMemcLevel(playerPreferences.memcLevel.multiplier)
+        rifeController.setDenoiseLevel(playerPreferences.denoiseLevel.strength)
         // The settings entry wants the engine status to be visible immediately after a change,
         // even when the controls are already visible.
         rifeStatusTrigger++
@@ -202,7 +230,9 @@ internal fun MediaPlayerContent(
     LaunchedEffect(rifeStatusTrigger) {
         if (rifeStatusTrigger > 0) {
             rifeStatusVisible = true
-            delay(5000)
+            // One second shorter than before: the status is read at a glance, and it should not
+            // outlive the controls that brought it up by much.
+            delay(4000)
             rifeStatusVisible = false
         }
     }
@@ -259,6 +289,16 @@ internal fun MediaPlayerContent(
                     }
                 }
             },
+            engineStatusOverlay = {
+                RifeStatusOverlay(
+                    visible = rifeStatusVisible,
+                    stats = rifeStats,
+                    rifeEnabled = playerPreferences.rifeEnabled,
+                    fastDvdNetEnabled = playerPreferences.fastDvdNetEnabled,
+                    resolution = playerPreferences.rifeResolution.toRifeResolution(),
+                    algorithm = playerPreferences.interpolationAlgorithm.toInterpolationAlgorithm(),
+                )
+            },
         )
         if (volumeAndBrightnessGestureState != null && volumeState != null && brightnessState != null) {
             PlayerVerticalGestureIndicators(
@@ -268,17 +308,6 @@ internal fun MediaPlayerContent(
                 brightnessPercentage = brightnessState.brightnessPercentage,
             )
         }
-
-        // The only custom on-video overlay: temporary engine status, top-start, ~5s.
-        RifeStatusOverlay(
-            visible = rifeStatusVisible,
-            videoTitle = player.currentMediaItem?.mediaMetadata?.title?.toString().orEmpty(),
-            stats = rifeStats,
-            rifeEnabled = playerPreferences.rifeEnabled,
-            fastDvdNetEnabled = playerPreferences.fastDvdNetEnabled,
-            resolution = playerPreferences.rifeResolution.toRifeResolution(),
-            modifier = Modifier.align(Alignment.TopStart),
-        )
     }
 
     PlayerErrorDialogs(
@@ -318,6 +347,27 @@ private fun RifeResolutionSetting.toRifeResolution(): RifeResolution = when (thi
     RifeResolutionSetting.RES_1080P -> RifeResolution.RES_1080P
     RifeResolutionSetting.RES_720P -> RifeResolution.RES_720P
     RifeResolutionSetting.RES_480P -> RifeResolution.RES_480P
+}
+
+/**
+ * Dataspace the processed output must carry for this track list: BT.2020 PQ for an HDR10 source,
+ * BT.2020 HLG for an HLG one, and `0` (UNKNOWN) for SDR so the platform default is left alone.
+ *
+ * The two numbers are `android.hardware.DataSpace.DATASPACE_BT2020_HLG/PQ` written out rather
+ * than referenced, so nothing depends on that class being present at runtime below API 34.
+ */
+private fun Tracks.outputDataSpace(): Int {
+    for (group in groups) {
+        for (index in 0 until group.length) {
+            val colorInfo = group.getTrackFormat(index).colorInfo ?: continue
+            if (!ColorInfo.isTransferHdr(colorInfo)) continue
+            return when (colorInfo.colorTransfer) {
+                C.COLOR_TRANSFER_HLG -> 168165376 // DataSpace.DATASPACE_BT2020_HLG
+                else -> 163971072 // DataSpace.DATASPACE_BT2020_PQ
+            }
+        }
+    }
+    return 0 // DataSpace.DATASPACE_UNKNOWN
 }
 
 private fun InterpolationAlgorithmSetting.toInterpolationAlgorithm(): InterpolationAlgorithm =

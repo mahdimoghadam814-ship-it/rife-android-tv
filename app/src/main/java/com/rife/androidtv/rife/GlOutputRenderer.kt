@@ -179,6 +179,12 @@ class GlOutputRenderer {
             uniform vec2 uTargetSize;
             uniform vec2 uMotionGrid;
             uniform float uHasHistory;
+            // Multiplier on the history blend, from the denoise level. It scales how strongly a
+            // pixel may be replaced by its own motion-compensated counterpart - the similarity
+            // gate below still rejects the moment the two frames disagree by more than their own
+            // noise does, so turning it up merges more of what agrees and does not soften what
+            // does not.
+            uniform float uStrength;
             void main() {
                 // The quad's V runs opposite to framebuffer row order: the vertex at the top of the
                 // viewport carries v = 0 but lands in framebuffer row height-1. Sampling at
@@ -202,7 +208,7 @@ class GlOutputRenderer {
                         float f = max(aux.a, 1.0);
                         float d = (abs(cur.r - his.r) + abs(cur.g - his.g) + abs(cur.b - his.b)) / 3.0;
                         float gate = 1.0 - clamp((d - 2.0 * f) / (3.0 * f), 0.0, 1.0);
-                        merged = mix(cur, his, w * gate);
+                        merged = mix(cur, his, clamp(w * gate * uStrength, 0.0, 1.0));
                     }
                 }
                 gl_FragColor = vec4(merged, 1.0);
@@ -269,6 +275,15 @@ class GlOutputRenderer {
     private var denoiseProgram = 0
     private var denDPosition = -1
     private var denDTexCoord = -1
+    /**
+     * Strength of the history blend, from the denoise level: one is the balanced default and the
+     * value the stage shipped with, above one merges more of what the similarity gate has already
+     * accepted, below one less. It is a shader uniform rather than a recompiled program, so a
+     * change takes effect on the next pass.
+     */
+    @Volatile
+    var denoiseStrength = 1f
+
     private var denUContentScale = -1
     private var denUCurrent = -1
     private var denUHistory = -1
@@ -277,6 +292,7 @@ class GlOutputRenderer {
     private var denUTargetSize = -1
     private var denUMotionGrid = -1
     private var denUHasHistory = -1
+    private var denUStrength = -1
 
     /** The frame being denoised, uploaded once per call. Kept separate from the warp's pair. */
     private var denCurrentTex = 0
@@ -541,9 +557,11 @@ class GlOutputRenderer {
         denUTargetSize = GLES20.glGetUniformLocation(newProgram, "uTargetSize")
         denUMotionGrid = GLES20.glGetUniformLocation(newProgram, "uMotionGrid")
         denUHasHistory = GLES20.glGetUniformLocation(newProgram, "uHasHistory")
+        denUStrength = GLES20.glGetUniformLocation(newProgram, "uStrength")
         if (denDPosition < 0 || denDTexCoord < 0 || denUContentScale < 0 ||
             denUCurrent < 0 || denUHistory < 0 || denUMotion < 0 || denUMask < 0 ||
-            denUTargetSize < 0 || denUMotionGrid < 0 || denUHasHistory < 0
+            denUTargetSize < 0 || denUMotionGrid < 0 || denUHasHistory < 0 ||
+            denUStrength < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
             Log.w(TAG, "denoise program is missing a location; the stage keeps its own path")
@@ -830,7 +848,30 @@ class GlOutputRenderer {
         targetWidth: Int,
         targetHeight: Int,
         timestep: Float
+    ): Boolean = renderWarp(
+        frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight,
+        floatArrayOf(timestep)
+    )
+
+    /**
+     * Presents every timestep in [timesteps] in order from a single upload of the pair. A level
+     * above 2x needs several interpolations of the same two frames, and re-uploading them per
+     * timestep would pay the readback-sized transfer again for data that has not changed; only
+     * the draw - one uniform and one swap per timestep - is repeated.
+     */
+    fun renderWarp(
+        frame0: ByteBuffer,
+        frame1: ByteBuffer,
+        motion: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        timesteps: FloatArray
     ): Boolean {
+        if (timesteps.isEmpty()) {
+            return false
+        }
         val eglDisplay = display
         val eglContext = context
         val eglSurface = windowSurface
@@ -838,9 +879,6 @@ class GlOutputRenderer {
             return false
         }
         if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
-            return false
-        }
-        if (timestep < 0.0f || timestep > 1.0f) {
             return false
         }
         val gridW = (targetWidth + 15) / 16
@@ -875,9 +913,9 @@ class GlOutputRenderer {
         warpGridH = gridH
         nsUpload += System.nanoTime() - tPhase
 
-        return drawWarp(
+        return drawWarps(
             eglDisplay, eglSurface, warpTex0, warpTex1, srcWidth, srcHeight,
-            targetWidth, targetHeight, gridW, gridH, timestep
+            targetWidth, targetHeight, gridW, gridH, timesteps
         )
     }
 
@@ -1029,6 +1067,7 @@ class GlOutputRenderer {
         GLES20.glUniform2f(denUTargetSize, width.toFloat(), height.toFloat())
         GLES20.glUniform2f(denUMotionGrid, (gridW * 16).toFloat(), (gridH * 16).toFloat())
         GLES20.glUniform1f(denUHasHistory, if (src != 0) 1.0f else 0.0f)
+        GLES20.glUniform1f(denUStrength, denoiseStrength)
         // Always full frame: this pass writes a texture, it does not letterbox into a surface, so
         // it must not touch contentScaleX/Y - the present that follows shares those two.
         GLES20.glUniform2f(denUContentScale, 1.0f, 1.0f)
@@ -1078,6 +1117,18 @@ class GlOutputRenderer {
         targetWidth: Int,
         targetHeight: Int,
         timestep: Float
+    ): Boolean = renderWarpFromDen(
+        motion, srcWidth, srcHeight, targetWidth, targetHeight, floatArrayOf(timestep)
+    )
+
+    /** See [renderWarp]; the denoised pair is uploaded once and drawn once per timestep. */
+    fun renderWarpFromDen(
+        motion: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        timesteps: FloatArray
     ): Boolean {
         val frame0 = denPair0
         val frame1 = denPair1
@@ -1085,7 +1136,7 @@ class GlOutputRenderer {
             return false
         }
         return renderWarpWithTextures(
-            frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight, timestep
+            frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight, timesteps
         )
     }
 
@@ -1098,8 +1149,11 @@ class GlOutputRenderer {
         srcHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-        timestep: Float
+        timesteps: FloatArray
     ): Boolean {
+        if (timesteps.isEmpty()) {
+            return false
+        }
         val eglDisplay = display
         val eglContext = context
         val eglSurface = windowSurface
@@ -1107,9 +1161,6 @@ class GlOutputRenderer {
             return false
         }
         if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
-            return false
-        }
-        if (timestep < 0.0f || timestep > 1.0f) {
             return false
         }
         val gridW = (targetWidth + 15) / 16
@@ -1138,10 +1189,42 @@ class GlOutputRenderer {
         warpGridH = gridH
         nsUpload += System.nanoTime() - tPhase
 
-        return drawWarp(
+        return drawWarps(
             eglDisplay, eglSurface, frame0, frame1, srcWidth, srcHeight,
-            targetWidth, targetHeight, gridW, gridH, timestep
+            targetWidth, targetHeight, gridW, gridH, timesteps
         )
+    }
+
+    /**
+     * Draws the pair once per timestep in [timesteps]. Each draw pushes its own uniform and swaps,
+     * so the surface sees them in order; the textures are already bound from the upload.
+     */
+    private fun drawWarps(
+        eglDisplay: EGLDisplay,
+        eglSurface: EGLSurface,
+        frame0: Int,
+        frame1: Int,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        gridW: Int,
+        gridH: Int,
+        timesteps: FloatArray
+    ): Boolean {
+        for (timestep in timesteps) {
+            if (timestep < 0.0f || timestep > 1.0f) {
+                return false
+            }
+            val ok = drawWarp(
+                eglDisplay, eglSurface, frame0, frame1, srcWidth, srcHeight,
+                targetWidth, targetHeight, gridW, gridH, timestep
+            )
+            if (!ok) {
+                return false
+            }
+        }
+        return true
     }
 
     /**
@@ -1494,6 +1577,7 @@ class GlOutputRenderer {
         denUTargetSize = -1
         denUMotionGrid = -1
         denUHasHistory = -1
+        denUStrength = -1
         warpAPosition = -1
         warpATexCoord = -1
         warpUContentScale = -1

@@ -6,7 +6,11 @@ import androidx.lifecycle.viewModelScope
 import dev.anilbeesetti.nextplayer.core.data.repository.MediaRepository
 import dev.anilbeesetti.nextplayer.core.data.repository.PreferencesRepository
 import dev.anilbeesetti.nextplayer.core.domain.GetSortedPlaylistUseCase
+import dev.anilbeesetti.nextplayer.core.model.DenoiseLevelSetting
+import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
+import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.LoopMode
+import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
 import dev.anilbeesetti.nextplayer.core.model.Video
 import dev.anilbeesetti.nextplayer.core.model.VideoContentScale
@@ -69,6 +73,12 @@ class PlayerViewModel(
             is PlayerAction.UpdatePlayWhenReady -> stateInternal.update { it.copy(playWhenReady = action.playWhenReady) }
             is PlayerAction.UpdatePlayerBrightness -> updatePlayerBrightness(action.value)
             is PlayerAction.SetLoopMode -> setLoopMode(action.loopMode)
+            is PlayerAction.ToggleInterpolation -> toggleInterpolation()
+            is PlayerAction.ToggleDenoise -> toggleDenoise()
+            is PlayerAction.SetProcessingResolution -> updateProcessingResolution(action.resolution)
+            is PlayerAction.SetInterpolationAlgorithm -> updateInterpolationAlgorithm(action.algorithm)
+            is PlayerAction.SetMemcLevel -> updateMemcLevel(action.level)
+            is PlayerAction.SetDenoiseLevel -> updateDenoiseLevel(action.level)
             is PlayerAction.ToggleTimeDisplay -> toggleTimeDisplay()
             is PlayerAction.OnVideoZoomEvent -> onVideoZoomEvent(action.event)
             is PlayerAction.OnSubtitleOptionEvent -> onSubtitleOptionEvent(action.event)
@@ -100,6 +110,42 @@ class PlayerViewModel(
     private fun setLoopMode(loopMode: LoopMode) {
         viewModelScope.launch {
             preferencesRepository.updatePlayerPreferences { it.copy(loopMode = loopMode) }
+        }
+    }
+
+    private fun toggleInterpolation() {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences { it.copy(rifeEnabled = !it.rifeEnabled) }
+        }
+    }
+
+    private fun toggleDenoise() {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences { it.copy(fastDvdNetEnabled = !it.fastDvdNetEnabled) }
+        }
+    }
+
+    private fun updateProcessingResolution(resolution: RifeResolutionSetting) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences { it.copy(rifeResolution = resolution) }
+        }
+    }
+
+    private fun updateInterpolationAlgorithm(algorithm: InterpolationAlgorithmSetting) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences { it.copy(interpolationAlgorithm = algorithm) }
+        }
+    }
+
+    private fun updateMemcLevel(level: MemcLevelSetting) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences { it.copy(memcLevel = level) }
+        }
+    }
+
+    private fun updateDenoiseLevel(level: DenoiseLevelSetting) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences { it.copy(denoiseLevel = level) }
         }
     }
 
@@ -163,6 +209,12 @@ sealed interface PlayerAction {
     data class UpdatePlayWhenReady(val playWhenReady: Boolean) : PlayerAction
     data class UpdatePlayerBrightness(val value: Float) : PlayerAction
     data class SetLoopMode(val loopMode: LoopMode) : PlayerAction
+    data object ToggleInterpolation : PlayerAction
+    data object ToggleDenoise : PlayerAction
+    data class SetProcessingResolution(val resolution: RifeResolutionSetting) : PlayerAction
+    data class SetInterpolationAlgorithm(val algorithm: InterpolationAlgorithmSetting) : PlayerAction
+    data class SetMemcLevel(val level: MemcLevelSetting) : PlayerAction
+    data class SetDenoiseLevel(val level: DenoiseLevelSetting) : PlayerAction
     data object ToggleTimeDisplay : PlayerAction
     data class OnVideoZoomEvent(val event: VideoZoomEvent) : PlayerAction
     data class OnSubtitleOptionEvent(val event: SubtitleOptionsEvent) : PlayerAction

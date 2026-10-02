@@ -3,7 +3,9 @@ package dev.anilbeesetti.nextplayer.settings.screens.videoprocessing
 import androidx.compose.runtime.Stable
 import androidx.lifecycle.viewModelScope
 import dev.anilbeesetti.nextplayer.core.data.repository.PreferencesRepository
+import dev.anilbeesetti.nextplayer.core.model.DenoiseLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
+import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.ui.base.MviViewModel
@@ -48,6 +50,8 @@ class VideoProcessingPreferencesViewModel(
             is VideoProcessingPreferencesUiEvent.ToggleFastDvdNet -> toggleFastDvdNet()
             is VideoProcessingPreferencesUiEvent.UpdateRifeResolution -> updateRifeResolution(action.value)
             is VideoProcessingPreferencesUiEvent.UpdateInterpolationAlgorithm -> updateInterpolationAlgorithm(action.value)
+            is VideoProcessingPreferencesUiEvent.UpdateMemcLevel -> updateMemcLevel(action.value)
+            is VideoProcessingPreferencesUiEvent.UpdateDenoiseLevel -> updateDenoiseLevel(action.value)
         }
     }
 
@@ -88,6 +92,22 @@ class VideoProcessingPreferencesViewModel(
             }
         }
     }
+
+    private fun updateMemcLevel(value: MemcLevelSetting) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences {
+                it.copy(memcLevel = value)
+            }
+        }
+    }
+
+    private fun updateDenoiseLevel(value: DenoiseLevelSetting) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences {
+                it.copy(denoiseLevel = value)
+            }
+        }
+    }
 }
 
 @Stable
@@ -99,6 +119,8 @@ data class VideoProcessingPreferencesUiState(
 sealed interface VideoProcessingDialog {
     data object RifeResolutionDialog : VideoProcessingDialog
     data object InterpolationAlgorithmDialog : VideoProcessingDialog
+    data object MemcLevelDialog : VideoProcessingDialog
+    data object DenoiseLevelDialog : VideoProcessingDialog
 }
 
 sealed interface VideoProcessingPreferencesUiEvent {
@@ -108,4 +130,6 @@ sealed interface VideoProcessingPreferencesUiEvent {
     data object ToggleFastDvdNet : VideoProcessingPreferencesUiEvent
     data class UpdateRifeResolution(val value: RifeResolutionSetting) : VideoProcessingPreferencesUiEvent
     data class UpdateInterpolationAlgorithm(val value: InterpolationAlgorithmSetting) : VideoProcessingPreferencesUiEvent
+    data class UpdateMemcLevel(val value: MemcLevelSetting) : VideoProcessingPreferencesUiEvent
+    data class UpdateDenoiseLevel(val value: DenoiseLevelSetting) : VideoProcessingPreferencesUiEvent
 }

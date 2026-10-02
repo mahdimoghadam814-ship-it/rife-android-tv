@@ -1,6 +1,7 @@
 package com.rife.androidtv
 
 import android.content.res.AssetManager
+import android.view.Surface
 import java.nio.ByteBuffer
 
 object NativeEngine {
@@ -52,6 +53,18 @@ object NativeEngine {
         targetHeight: Int,
         mvBuffer: ByteBuffer
     ): Boolean
+
+    /**
+     * Tags the buffers queued for [surface] with an `android.hardware.DataSpace` so the display
+     * stack decodes them as HDR instead of as plain sRGB. The processed frames are blitted into a
+     * plain RGBA8888 window, so unlike the bypass path - where MediaCodec writes the dataspace
+     * itself - nothing carries that information for us.
+     *
+     * Returns the platform result: 0 on success, negative when the surface is unusable or the
+     * device predates the API.
+     */
+    @JvmStatic
+    external fun setOutputDataSpace(surface: Surface, dataSpace: Int): Int
 
     @JvmStatic
     external fun runRifeTest(width: Int, height: Int): Boolean

@@ -82,6 +82,22 @@ interface RifeController {
      */
     fun setInterpolationAlgorithm(algorithm: InterpolationAlgorithm)
 
+    /**
+     * How many output frames are synthesised per source frame. 2f is one interpolated frame
+     * between each pair, 3f is two, and so on. Only the interpolation ratio changes: the source
+     * cadence, the resolution policy and the denoiser are untouched.
+     */
+    fun setMemcLevel(multiplier: Float)
+
+    /**
+     * Strength of the motion-aligned denoiser, from [strength] on the settings' own scale (1f is
+     * the balanced default). It scales the history blend in the shader; the per-pixel similarity
+     * gate still rejects any sample that disagrees with its own motion-compensated counterpart by
+     * more than the frame's own noise does, so a higher level removes more noise without turning
+     * into a blur.
+     */
+    fun setDenoiseLevel(strength: Float)
+
     /** Records the decoded frame size reported by `Player.Listener.onVideoSizeChanged`. */
     fun setInputFrameSize(width: Int, height: Int)
 
@@ -93,6 +109,13 @@ interface RifeController {
      * `null` releases it immediately.
      */
     fun setOutputSurfaceInfo(outputSurfaceInfo: SurfaceInfo?)
+
+    /**
+     * Tags the output buffers with [dataSpace] (`0` for the platform default) so HDR sources are
+     * shown through the right transfer curve. The processing path blits into a plain 8-bit window
+     * and therefore gets no dataspace from the platform, unlike the bypass path.
+     */
+    fun setOutputDataSpace(dataSpace: Int)
 
     /** Returns and clears the last pipeline error, if any. */
     fun consumeError(): String?

@@ -14,3 +14,13 @@ fun InterpolationAlgorithmSetting.name(): String {
 
     return stringResource(stringRes)
 }
+
+@Composable
+fun InterpolationAlgorithmSetting.description(): String {
+    val stringRes = when (this) {
+        InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_description_rife
+        InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_description_memc
+    }
+
+    return stringResource(stringRes)
+}

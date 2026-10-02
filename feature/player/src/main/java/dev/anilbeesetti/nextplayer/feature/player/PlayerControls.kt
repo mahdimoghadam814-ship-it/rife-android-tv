@@ -51,6 +51,7 @@ fun PlayerControls(
     onPictureInPictureClick: () -> Unit,
     modifier: Modifier = Modifier,
     middleControlsModifier: Modifier = Modifier,
+    engineStatusOverlay: @Composable () -> Unit = {},
 ) {
     Box(
         modifier = modifier.fillMaxSize(),
@@ -71,6 +72,15 @@ fun PlayerControls(
                     onPlaylistClick = { onShowOverlay(OverlayView.PLAYLIST) },
                     onBackClick = onBackClick,
                 )
+            }
+            // Engine status sits directly under the title row so the two read as one block, and
+            // follows the controls it belongs to instead of floating over the video on its own.
+            AnimatedVisibility(
+                visible = controlsVisibilityState.controlsVisible,
+                enter = fadeIn(),
+                exit = fadeOut(),
+            ) {
+                engineStatusOverlay()
             }
             Spacer(modifier = Modifier.weight(1f))
             AnimatedVisibility(
@@ -105,6 +115,7 @@ fun PlayerControls(
                     },
                     onVideoContentScaleLongClick = { onShowOverlay(OverlayView.VIDEO_CONTENT_SCALE) },
                     onPictureInPictureClick = onPictureInPictureClick,
+                    onProcessingSettingsClick = { onShowOverlay(OverlayView.PROCESSING_SETTINGS) },
                 )
             }
         }

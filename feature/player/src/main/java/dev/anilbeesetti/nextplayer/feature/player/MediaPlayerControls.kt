@@ -60,6 +60,7 @@ internal fun MediaPlayerControls(
     videoZoomAndContentScaleState: VideoZoomAndContentScaleState,
     isPipSupported: Boolean,
     onPictureInPictureClick: () -> Unit,
+    engineStatusOverlay: @Composable () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val playerPreferences = state.playerPreferences
@@ -167,6 +168,7 @@ internal fun MediaPlayerControls(
                     onPlayInBackgroundClick = { onAction(PlayerAction.PlayInBackground) },
                     onToggleTimeDisplay = { onAction(PlayerAction.ToggleTimeDisplay) },
                     onPictureInPictureClick = onPictureInPictureClick,
+                    engineStatusOverlay = engineStatusOverlay,
                     middleControlsModifier = Modifier.thenIf(isTv) {
                         focusRequester(middleControlsFocusRequester)
                             .onFocusChanged { isMiddleControlsFocused = it.hasFocus }
@@ -196,6 +198,13 @@ internal fun MediaPlayerControls(
                 onSelectAudioClick = { onAction(PlayerAction.SelectAudio) },
                 onSubtitleOptionEvent = { onAction(PlayerAction.OnSubtitleOptionEvent(it)) },
                 onVideoContentScaleChanged = videoZoomAndContentScaleState::onVideoContentScaleChanged,
+                processingPreferences = playerPreferences,
+                onToggleInterpolation = { onAction(PlayerAction.ToggleInterpolation) },
+                onToggleDenoise = { onAction(PlayerAction.ToggleDenoise) },
+                onResolutionSelected = { onAction(PlayerAction.SetProcessingResolution(it)) },
+                onAlgorithmSelected = { onAction(PlayerAction.SetInterpolationAlgorithm(it)) },
+                onMemcLevelSelected = { onAction(PlayerAction.SetMemcLevel(it)) },
+                onDenoiseLevelSelected = { onAction(PlayerAction.SetDenoiseLevel(it)) },
             )
         }
     }

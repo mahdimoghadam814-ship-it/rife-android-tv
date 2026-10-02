@@ -112,6 +112,29 @@ class VideoFrameProcessor(
         private const val TIMING_WINDOW_FRAMES = 30
 
         /**
+         * Bounds the frame-pair interval the MEMC level divides. The same [1ms, 1s] window the
+         * AUTO policy already accepts, so a seek or a bogus timestamp cannot produce a step of
+         * zero or a backlog of frames.
+         */
+        private const val MIN_PAIR_INTERVAL_US = 1_000L
+        private const val MAX_PAIR_INTERVAL_US = 1_000_000L
+
+        /** The supported interpolation ratios, matching the clamp in setMemcLevel(). */
+        private const val MIN_MEMC_RATIO = 2.0
+        private const val MAX_MEMC_RATIO = 4.0
+
+        /** Hard stop on one pair's emission list, so a bad timestamp cannot loop forever. */
+        private const val MAX_OUTPUTS_PER_PAIR = 8
+
+        /**
+         * How close the last point of a pair has to be to the end of that pair before it counts as
+         * the pair's own frame. An eighth of the pair is far tighter than the rounding of the step
+         * can ever be for a whole-number ratio, and far looser than a genuinely interpolated point
+         * (which for a ratio above two sits a whole step back).
+         */
+        private const val OWN_FRAME_SNAP = 8f
+
+        /**
          * Verbose per-frame diagnostics: checksums, EGL state dumps and dimension traces. They were
          * useful while bringing the pipeline up but cost several whole-buffer passes per frame and
          * drown the timing signal, so they are off by default.
@@ -286,6 +309,34 @@ class VideoFrameProcessor(
      */
     private var sourceIntervalNs = 0L
 
+    /**
+     * Interpolation ratio: how many output frames are synthesised per source frame. Two is one
+     * interpolated frame between each pair, which is what the pipeline did before the level was
+     * configurable, so two is the default and the pre-existing cadence is unchanged.
+     *
+     * Written from the controller thread and read on the worker, hence @Volatile: a level change
+     * only has to take effect on the next cycle, so a lock is not worth the contention.
+     */
+    @Volatile
+    private var memcLevelMultiplier = 2f
+
+    /**
+     * Strength of the motion-aligned denoiser's history blend, on the settings' own scale (one is
+     * the balanced default). Handed to the renderer as a shader uniform, so it is only ever a
+     * field on the renderer - this copy exists so a renderer created after the setting changed
+     * still comes up with the value the user picked.
+     */
+    private var denoiseStrength = 1f
+
+    /**
+     * Absolute source timestamp of the next output frame to present, in microseconds. The phase
+     * is carried from one pair to the next so a ratio that does not divide the source cadence
+     * evenly still averages out instead of wobbling, and it is re-anchored whenever a pair turns
+     * up that it does not fall inside: a seek, a stream change or a dropped pair has to restart
+     * it rather than let a backlog of frames fire in one burst.
+     */
+    private var nextOutputUs = Long.MIN_VALUE
+
     /** Dimensions and mode of the last RES POLICY breadcrumb, so it is written on change only. */
     private var lastCaptureLogSrcW = -1
     private var lastCaptureLogSrcH = -1
@@ -301,6 +352,13 @@ class VideoFrameProcessor(
     private var outputRenderer: GlOutputRenderer? = null
 
     private var pendingOutputSurfaceInfo: SurfaceInfo? = null
+
+    /**
+     * Dataspace the output buffers are tagged with. `0` (UNKNOWN) leaves the platform default,
+     * which is what SDR content wants; HDR sources get BT.2020 PQ/HLG so the panel applies the
+     * matching transfer curve. Read on the worker thread only.
+     */
+    private var outputDataSpace: Int = 0
 
     @Volatile
     private var inputWidth = 0
@@ -663,7 +721,57 @@ class VideoFrameProcessor(
                         "(orientationDegrees=${outputSurfaceInfo.orientationDegrees})"
                 )
                 outputRenderer?.setOutputSurface(display, outputSurfaceInfo.surface)
+                applyOutputDataSpace()
             }
+        }
+    }
+
+    fun setOutputDataSpace(dataSpace: Int) {
+        runOnWorker("setOutputDataSpace()") {
+            if (outputDataSpace == dataSpace) return@runOnWorker
+            outputDataSpace = dataSpace
+            applyOutputDataSpace()
+        }
+    }
+
+    /**
+     * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
+     * next pair already emits at the new cadence; the emission phase is re-anchored from that
+     * pair's own timestamps rather than carried over from the old ratio.
+     */
+    fun setMemcLevel(multiplier: Float) {
+        val clamped = multiplier.coerceIn(2f, 4f)
+        if (memcLevelMultiplier == clamped) return
+        memcLevelMultiplier = clamped
+        runOnWorker("setMemcLevel()") {
+            nextOutputUs = Long.MIN_VALUE
+        }
+        Log.i(TAG, "MEMC level: ${clamped}x")
+    }
+
+    /**
+     * Sets the strength of the motion-aligned denoiser's history blend. It is a shader uniform,
+     * so it applies to the next frame rendered rather than to the next pipeline reset.
+     */
+    fun setDenoiseLevel(strength: Float) {
+        val clamped = strength.coerceIn(0.1f, 2f)
+        denoiseStrength = clamped
+        runOnWorker("setDenoiseLevel()") {
+            outputRenderer?.denoiseStrength = clamped
+        }
+    }
+
+    /**
+     * Re-tags the current output window. Called whenever the surface or the colour volume of the
+     * source changes; a no-op without a live surface, since the next one is tagged on creation.
+     * Only valid on the worker thread.
+     */
+    private fun applyOutputDataSpace() {
+        val surface = pendingOutputSurfaceInfo?.surface
+        if (surface == null || !surface.isValid) return
+        val rc = NativeEngine.setOutputDataSpace(surface, outputDataSpace)
+        if (rc != 0) {
+            Log.w(TAG, "setOutputDataSpace($outputDataSpace) failed: rc=$rc")
         }
     }
 
@@ -1017,6 +1125,9 @@ class VideoFrameProcessor(
             outputRenderer = null
             val renderer = GlOutputRenderer()
             renderer.init(context)
+            // A renderer recreated for a new surface has to come up with the level the user
+            // picked, not with the shader's own default.
+            renderer.denoiseStrength = denoiseStrength
             outputRenderer = renderer
 
             // The replaced EGL/SurfaceTexture state has to outlive the handover, so it is retired
@@ -1570,11 +1681,15 @@ class VideoFrameProcessor(
 
         if (success) {
             // Temporal order: previous frame was already rendered when it was captured (or as the
-            // first frame), so we only render the interpolated frame and the next frame.
-            // Sequence: A, M(A,B), B, M(B,C), C — correct 2x interpolation without duplication.
+            // first frame), so this pair only has to emit the moments that fall inside it. At the
+            // default 2x level that is the midpoint and the pair's own frame - A, M(A,B), B,
+            // M(B,C), C - which is exactly the cadence the pipeline had before the level became a
+            // setting. 3x asks for a third point as well, and the phase carried from one pair to
+            // the next keeps a ratio that does not divide the source cadence evenly from drifting
+            // or from firing a burst of frames at once.
             val tRenderStart = System.nanoTime()
 
-            // One denoiser pass per pair, before either present. It writes into a framebuffer
+            // One denoiser pass per pair, before any present. It writes into a framebuffer
             // rather than to the surface, so it costs no swap; the warp or the plain present picks
             // the result up from the texture. It sits inside the render window deliberately: the
             // upload and the draw both land in the renderer's own breakdown, so its cost shows up
@@ -1593,8 +1708,20 @@ class VideoFrameProcessor(
                 }
             }
 
-            var presented = false
-            if (motionReady && motionBuf != null) {
+            val times = outputTimesFor(prev.timestampUs, nextFrame.timestampUs)
+
+            // Everything before the pair's own frame is an interpolation. They share one upload of
+            // the pair and of the field - only the uniform and the swap repeat - because at a level
+            // above 2x the same two frames are being resampled several times over.
+            val ownFrame = times.isNotEmpty() && times[times.lastIndex] >= 1f
+            val intermediate = if (ownFrame) {
+                times.copyOfRange(0, times.size - 1)
+            } else {
+                times
+            }
+
+            var presented = intermediate.isEmpty()
+            if (!presented && motionReady && motionBuf != null) {
                 // From the denoised pair when there is one. The first cycle after a reset has no
                 // denoised history to warp from, so it blends the raw pair, and the present below
                 // supplies the cleaned current frame - which for that first cycle is the raw frame
@@ -1606,7 +1733,7 @@ class VideoFrameProcessor(
                         rifeInputH,
                         rifeOutputW,
                         rifeOutputH,
-                        0.5f
+                        intermediate
                     ) == true
                 } else {
                     outputRenderer?.renderWarp(
@@ -1617,14 +1744,17 @@ class VideoFrameProcessor(
                         rifeInputH,
                         rifeOutputW,
                         rifeOutputH,
-                        0.5f
+                        intermediate
                     ) == true
                 }
             }
             if (!presented) {
                 // The shader refused the frame, or the CPU path ran. Redo it on the CPU so the
                 // pair still produces a picture: a failure here costs time, never a frame.
-                if (motionReady) {
+                // Every point gets its own CPU interpolation: `success` only ever filled outBuf
+                // for the one timestep the GPU path was asked about, so reusing it would put the
+                // same midpoint on screen more than once at a level above 2x.
+                for (t in intermediate) {
                     NativeEngine.interpolateFrameBuffers(
                         src0Buf,
                         src1Buf,
@@ -1632,30 +1762,40 @@ class VideoFrameProcessor(
                         rifeInputH,
                         rifeOutputW,
                         rifeOutputH,
-                        0.5f,
+                        t,
                         outBuf
                     )
-                }
-                // Native wrote requiredOutputBytes of RGBA through the direct address without
-                // touching the Java position, so the readable range is established here rather
-                // than with flip(): position 0, limit = requiredOutputBytes.
-                outBuf.position(0)
-                outBuf.limit(requiredOutputBytes.toInt())
+                    // Native wrote requiredOutputBytes of RGBA through the direct address without
+                    // touching the Java position, so the readable range is established here rather
+                    // than with flip(): position 0, limit = requiredOutputBytes.
+                    outBuf.position(0)
+                    outBuf.limit(requiredOutputBytes.toInt())
 
-                if (VERBOSE_DIAGNOSTICS) {
-                    val tChecksumStart = System.nanoTime()
-                    val rifeOutputChecksum = calculateChecksum(outBuf, rifeOutputW, rifeOutputH)
-                    nsChecksum += System.nanoTime() - tChecksumStart
-                    Log.d(TAG, "PIPELINE CHECKSUM: after interpolation ${rifeOutputW}x$rifeOutputH checksum=$rifeOutputChecksum")
-                }
+                    if (VERBOSE_DIAGNOSTICS) {
+                        val tChecksumStart = System.nanoTime()
+                        val rifeOutputChecksum = calculateChecksum(outBuf, rifeOutputW, rifeOutputH)
+                        nsChecksum += System.nanoTime() - tChecksumStart
+                        Log.d(TAG, "PIPELINE CHECKSUM: after interpolation ${rifeOutputW}x$rifeOutputH checksum=$rifeOutputChecksum")
+                    }
 
-                renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
+                    renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
+                }
             }
-            if (!denoiseReady || outputRenderer?.presentDenoised(rifeInputW, rifeInputH) != true) {
-                renderFrameToOutput(nextFrame)
+
+            // The pair's own frame is the point of the sequence, so it leaves through the plain
+            // present - the denoised one when there is a denoised pair, otherwise the raw capture
+            // - rather than paying for a warp that would only resample it onto itself.
+            if (ownFrame) {
+                if (denoiseReady &&
+                    outputRenderer?.presentDenoised(rifeInputW, rifeInputH) == true
+                ) {
+                    // already on the surface
+                } else {
+                    renderFrameToOutput(nextFrame)
+                }
             }
             nsRender += System.nanoTime() - tRenderStart
-            frameCountOutput += 2
+            frameCountOutput += times.size
         } else {
             val status = NativeEngine.getRifeStatus()
             reportError(
@@ -1684,6 +1824,76 @@ class VideoFrameProcessor(
      * the input copies, the optional checksum passes, the JNI interpolation and both output
      * uploads/swaps, so `total` is directly comparable to the frame interval the decoder sees.
      */
+    /**
+     * The moments inside one frame pair that the current MEMC level asks the pipeline to emit,
+     * expressed as a timestep in [0, 1] where 0 is the previous frame and 1 is this one.
+     *
+     * The step is the pair's own timestamp interval divided by the multiplier, so the cadence
+     * follows the source rather than a nominal frame rate, and the phase is carried in absolute
+     * source time from one call to the next. Carrying it is what makes a ratio that does not
+     * divide the cadence evenly average out over time instead of wobbling; re-anchoring it to the
+     * pair being looked at whenever it does not fall inside that pair is what stops a seek, a
+     * stream change or a burst of skipped pairs from firing a backlog of frames in one go.
+     *
+     * The range is open at the previous frame, because that frame was already presented - either
+     * as the first frame of the stream or as the last point of the pair before this one - so the
+     * sequence never repeats a frame.
+     */
+    private fun outputTimesFor(prevUs: Long, nextUs: Long): FloatArray {
+        val realGapUs = nextUs - prevUs
+        val intervalUs = realGapUs.coerceIn(MIN_PAIR_INTERVAL_US, MAX_PAIR_INTERVAL_US)
+        // A gap that had to be clamped is a discontinuity rather than a frame pair: a stall, a
+        // backwards timestamp or a jump. Replaying the whole gap would fire a burst of frames in
+        // one go, so the cadence restarts from the end of it and the window is measured from
+        // there instead of from the frame on the far side of the jump.
+        val discontinuity = realGapUs != intervalUs
+        val baseUs = if (discontinuity) nextUs - intervalUs else prevUs
+        val ratio = memcLevelMultiplier.toDouble().coerceIn(MIN_MEMC_RATIO, MAX_MEMC_RATIO)
+        val stepUs = maxOf(1L, (intervalUs / ratio).toLong())
+
+        // Re-anchor when the pair is not a pair, when there is no phase yet, or when the phase has
+        // run more than the widest supported multiplier away from where it should be.
+        if (discontinuity ||
+            nextOutputUs == Long.MIN_VALUE ||
+            nextOutputUs <= baseUs ||
+            nextOutputUs > baseUs + (MAX_MEMC_RATIO * intervalUs).toLong()
+        ) {
+            nextOutputUs = baseUs + stepUs
+        }
+
+        var count = 0
+        var cursor = nextOutputUs
+        while (cursor <= nextUs && count < MAX_OUTPUTS_PER_PAIR) {
+            count++
+            cursor += stepUs
+        }
+        if (count == 0) {
+            // Nothing fits inside the pair, so the phase is past it. Present the pair's own frame
+            // rather than dropping the picture for a cycle.
+            nextOutputUs = nextUs
+            return floatArrayOf(1f)
+        }
+        val times = FloatArray(count)
+        cursor = nextOutputUs
+        for (i in 0 until count) {
+            var t = ((cursor - baseUs).toDouble() / intervalUs.toDouble())
+                .toFloat()
+                .coerceIn(0f, 1f)
+            // The last point of a pair is the pair's own frame whenever it lands close enough to
+            // the end of the pair to be indistinguishable from it - which is always the case for
+            // a whole-number ratio, up to the rounding of the step. Snapping it to exactly one is
+            // what lets the present hand the real frame over instead of paying for a warp that
+            // would only resample it onto itself.
+            if (i == count - 1 && (nextUs - cursor).toFloat() * OWN_FRAME_SNAP <= intervalUs.toFloat()) {
+                t = 1f
+            }
+            times[i] = t
+            cursor += stepUs
+        }
+        nextOutputUs = cursor
+        return times
+    }
+
     private fun reportStageTiming() {
         if (timingStartNs == 0L) {
             return

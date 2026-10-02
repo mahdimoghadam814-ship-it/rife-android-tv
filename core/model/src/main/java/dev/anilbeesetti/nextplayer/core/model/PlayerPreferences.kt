@@ -47,11 +47,13 @@ data class PlayerPreferences(
     val showSystemVolumePanel: Boolean = true,
     val enableVolumeBoost: Boolean = false,
 
-    // Video Processing Preferences (RIFE interpolation + FastDVDnet pre-processing stage)
+    // Video Processing Preferences (frame interpolation + motion-aligned denoising)
     val rifeEnabled: Boolean = false,
     val rifeResolution: RifeResolutionSetting = RifeResolutionSetting.AUTO,
-    val interpolationAlgorithm: InterpolationAlgorithmSetting = InterpolationAlgorithmSetting.RIFE,
+    val interpolationAlgorithm: InterpolationAlgorithmSetting = InterpolationAlgorithmSetting.MEMC,
+    val memcLevel: MemcLevelSetting = MemcLevelSetting.TWO_X,
     val fastDvdNetEnabled: Boolean = false,
+    val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.BALANCED,
 
     // Subtitle Preferences
     val useSystemCaptionStyle: Boolean = false,

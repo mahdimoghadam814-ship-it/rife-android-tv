@@ -1,14 +1,17 @@
 #include <jni.h>
 #include <string>
 #include <atomic>
+#include <dlfcn.h>
 #include <android/asset_manager_jni.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
 #include "vulkan_diagnostic.h"
 #include "rife_engine.h"
 #include "memc_interpolator.h"
 
 static RifeEngine g_rife_engine;
 static rife::MemcInterpolator g_memc;
-static std::atomic<int> g_interp_algorithm{static_cast<int>(rife::InterpolationAlgorithm::RIFE)};
+static std::atomic<int> g_interp_algorithm{static_cast<int>(rife::InterpolationAlgorithm::MEMC)};
 
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_rife_androidtv_NativeEngine_runDiagnostics(JNIEnv* env, jclass clazz) {
@@ -96,6 +99,37 @@ Java_com_rife_androidtv_NativeEngine_resetMemcState(JNIEnv* env, jclass clazz) {
 extern "C" JNIEXPORT jdouble JNICALL
 Java_com_rife_androidtv_NativeEngine_getMemcLastDurationMs(JNIEnv* env, jclass clazz) {
     return static_cast<jdouble>(g_memc.lastDurationMs());
+}
+
+// The processed frames are blitted into a plain RGBA8888 window, which the display stack
+// otherwise treats as SDR no matter what the source was: PQ/HLG code values get shown through an
+// sRGB transfer curve and the picture comes out flat and milky. Tagging the buffers is what makes
+// the panel decode them as HDR again, and it is the one thing the bypass path gets for free from
+// the platform because MediaCodec writes the dataspace itself.
+//
+// ANativeWindow_setBuffersDataSpace() only exists from API 28 while minSdk is 24, so it is
+// resolved lazily instead of called directly: a direct reference would not link on the devices
+// the app still installs on, and a distinct return code when it is missing is more useful to the
+// caller than a silent no-op.
+static jint setBuffersDataSpaceCompat(ANativeWindow* window, int32_t dataSpace) {
+    using Setter = int32_t (*)(ANativeWindow*, int32_t);
+    static Setter setter = [] {
+        return reinterpret_cast<Setter>(
+            dlsym(RTLD_DEFAULT, "ANativeWindow_setBuffersDataSpace"));
+    }();
+    if (setter == nullptr) return -3;
+    return static_cast<jint>(setter(window, dataSpace));
+}
+
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rife_androidtv_NativeEngine_setOutputDataSpace(
+    JNIEnv* env, jclass clazz, jobject surface, jint dataSpace) {
+    if (surface == nullptr) return -1;
+    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    if (window == nullptr) return -2;
+    const jint rc = setBuffersDataSpaceCompat(window, static_cast<int32_t>(dataSpace));
+    ANativeWindow_release(window);
+    return rc;
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

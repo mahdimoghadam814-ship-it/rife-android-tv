@@ -34,6 +34,8 @@ import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
@@ -82,6 +84,7 @@ fun ControlsBottomView(
     onPictureInPictureClick: () -> Unit,
     onPlaybackSpeedClick: () -> Unit,
     onPlayInBackgroundClick: () -> Unit,
+    onProcessingSettingsClick: () -> Unit,
     onSeek: (Long) -> Unit,
     onSeekEnd: () -> Unit,
 ) {
@@ -179,6 +182,21 @@ fun ControlsBottomView(
                 if (!isTv) {
                     RotateButton()
                 }
+
+                // Deliberately in the one cluster whose alignment does not follow the
+                // controlButtonsPosition preference, so it is at the bottom-right either way.
+                val processingDescription = stringResource(R.string.video_processing)
+                PlayerButton(
+                    modifier = Modifier.semantics { contentDescription = processingDescription },
+                    onClick = onProcessingSettingsClick,
+                    containerColor = PlayerButtonBlackAlpha,
+                    contentPadding = PaddingValues(8.dp),
+                ) {
+                    Icon(
+                        painter = painterResource(R.drawable.ic_speed),
+                        contentDescription = null,
+                    )
+                }
             }
         }
         PlayerSeekbar(
@@ -254,6 +272,7 @@ private fun ControlsBottomViewPreview() {
                 onPictureInPictureClick = {},
                 onPlaybackSpeedClick = {},
                 onPlayInBackgroundClick = {},
+                onProcessingSettingsClick = {},
                 onSeek = {},
                 onSeekEnd = {},
             )

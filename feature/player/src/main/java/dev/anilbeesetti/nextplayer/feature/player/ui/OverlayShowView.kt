@@ -7,6 +7,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.media3.common.Player
 import androidx.media3.extractor.metadata.Chapter
+import dev.anilbeesetti.nextplayer.core.model.DenoiseLevelSetting
+import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
+import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
+import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
+import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.model.VideoContentScale
 import dev.anilbeesetti.nextplayer.feature.player.extensions.noRippleClickable
 import dev.anilbeesetti.nextplayer.feature.player.state.SubtitleOptionsEvent
@@ -29,6 +34,13 @@ fun BoxScope.OverlayShowView(
     onSelectAudioClick: () -> Unit = {},
     onSubtitleOptionEvent: (SubtitleOptionsEvent) -> Unit = {},
     onVideoContentScaleChanged: (VideoContentScale) -> Unit = {},
+    processingPreferences: PlayerPreferences = PlayerPreferences(),
+    onToggleInterpolation: () -> Unit = {},
+    onToggleDenoise: () -> Unit = {},
+    onResolutionSelected: (RifeResolutionSetting) -> Unit = {},
+    onAlgorithmSelected: (InterpolationAlgorithmSetting) -> Unit = {},
+    onMemcLevelSelected: (MemcLevelSetting) -> Unit = {},
+    onDenoiseLevelSelected: (DenoiseLevelSetting) -> Unit = {},
 ) {
     Box(
         modifier = Modifier
@@ -88,6 +100,17 @@ fun BoxScope.OverlayShowView(
         currentChapterIndex = currentChapterIndex,
         onChapterSelected = onChapterSelected,
     )
+
+    ProcessingSettingsView(
+        show = overlayView == OverlayView.PROCESSING_SETTINGS,
+        playerPreferences = processingPreferences,
+        onToggleInterpolation = onToggleInterpolation,
+        onToggleDenoise = onToggleDenoise,
+        onResolutionSelected = onResolutionSelected,
+        onAlgorithmSelected = onAlgorithmSelected,
+        onMemcLevelSelected = onMemcLevelSelected,
+        onDenoiseLevelSelected = onDenoiseLevelSelected,
+    )
 }
 
 val Configuration.isPortrait: Boolean
@@ -101,4 +124,5 @@ enum class OverlayView {
     VIDEO_CONTENT_SCALE,
     PLAYLIST,
     CHAPTERS,
+    PROCESSING_SETTINGS,
 }
