@@ -192,6 +192,7 @@ add_library(
     rife.cpp
     warp.cpp
     device_policy.cpp
+    memc_interpolator.cpp
 )
 
 add_dependencies(rife_native rife-spirv-pipeline)

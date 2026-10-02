@@ -12,6 +12,7 @@ import com.rife.androidtv.DeviceProfile
 import com.rife.androidtv.VulkanCapabilities
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
+import dev.anilbeesetti.nextplayer.feature.player.rife.InterpolationAlgorithm as FeatureInterpolationAlgorithm
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeStats
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -93,6 +94,10 @@ class RifeEngineController(
 
     private var initThread: HandlerThread? = null
 
+    @Volatile
+    private var interpolationAlgorithm: FeatureInterpolationAlgorithm =
+        FeatureInterpolationAlgorithm.RIFE
+
     /**
      * Starts the processor's worker thread. Called once when the player screen is created.
      */
@@ -116,11 +121,30 @@ class RifeEngineController(
      * can attach it to the player.
      */
     override fun setRifeEnabled(enabled: Boolean) {
-        if (enabled) {
+        if (enabled && interpolationAlgorithm == FeatureInterpolationAlgorithm.RIFE) {
+            // MEMC runs entirely in the native layer and never touches the RIFE model, so
+            // loading it (seconds + ~365 MB RSS) would be pure waste in that mode.
             ensureEngineInitialized()
         }
         processor.setRifeEnabled(enabled)
         _processingEnabled.value = processor.isProcessingEnabled
+    }
+
+    /**
+     * Selects the interpolation backend. The value reaches the native dispatcher immediately, so
+     * the next frame pair is already interpolated by the chosen algorithm.
+     */
+    override fun setInterpolationAlgorithm(algorithm: FeatureInterpolationAlgorithm) {
+        interpolationAlgorithm = algorithm
+        NativeEngine.setInterpolationAlgorithm(
+            if (algorithm == FeatureInterpolationAlgorithm.MEMC) 1 else 0,
+        )
+        if (algorithm == FeatureInterpolationAlgorithm.MEMC) {
+            // Measured optimum: the ME/MC loops are memory-bound, so going wider than 4 only
+            // adds contention (8 threads was ~2x slower than 4 on an 8-core big.LITTLE device).
+            NativeEngine.setMemcThreadCount(4)
+        }
+        Log.i(TAG_LIFECYCLE, "Interpolation algorithm: $algorithm")
     }
 
     /**
@@ -170,6 +194,8 @@ class RifeEngineController(
      */
     override fun resetForDiscontinuity(reason: String) {
         processor.resetForNewStream(reason)
+        // The block-matching pyramid holds state across frames; a seek/stream change invalidates it.
+        NativeEngine.resetMemcState()
     }
 
     /**

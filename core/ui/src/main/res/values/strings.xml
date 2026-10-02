@@ -532,4 +532,8 @@
     <string name="rife_resolution_1080p">1080p</string>
     <string name="rife_resolution_720p">720p</string>
     <string name="rife_resolution_480p">480p</string>
+    <string name="interpolation_algorithm">Interpolation Algorithm</string>
+    <string name="interpolation_algorithm_description">Choose the frame interpolation backend</string>
+    <string name="interpolation_algorithm_rife">RIFE neural network (GPU, high quality)</string>
+    <string name="interpolation_algorithm_memc">MEMC block matching (CPU, lightweight)</string>
 </resources>

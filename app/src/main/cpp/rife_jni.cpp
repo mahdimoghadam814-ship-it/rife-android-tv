@@ -1,10 +1,14 @@
 #include <jni.h>
 #include <string>
+#include <atomic>
 #include <android/asset_manager_jni.h>
 #include "vulkan_diagnostic.h"
 #include "rife_engine.h"
+#include "memc_interpolator.h"
 
 static RifeEngine g_rife_engine;
+static rife::MemcInterpolator g_memc;
+static std::atomic<int> g_interp_algorithm{static_cast<int>(rife::InterpolationAlgorithm::RIFE)};
 
 extern "C" JNIEXPORT jobject JNICALL
 Java_com_rife_androidtv_NativeEngine_runDiagnostics(JNIEnv* env, jclass clazz) {
@@ -70,6 +74,30 @@ Java_com_rife_androidtv_NativeEngine_loadRifeModel(
     return res;
 }
 
+extern "C" JNIEXPORT void JNICALL
+Java_com_rife_androidtv_NativeEngine_setInterpolationAlgorithm(
+    JNIEnv* env, jclass clazz, jint algorithm
+) {
+    g_interp_algorithm.store(static_cast<int>(algorithm), std::memory_order_relaxed);
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_rife_androidtv_NativeEngine_setMemcThreadCount(
+    JNIEnv* env, jclass clazz, jint threads
+) {
+    g_memc.setThreadCount(static_cast<int>(threads));
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_rife_androidtv_NativeEngine_resetMemcState(JNIEnv* env, jclass clazz) {
+    g_memc.reset();
+}
+
+extern "C" JNIEXPORT jdouble JNICALL
+Java_com_rife_androidtv_NativeEngine_getMemcLastDurationMs(JNIEnv* env, jclass clazz) {
+    return static_cast<jdouble>(g_memc.lastDurationMs());
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
     JNIEnv* env, jclass clazz,
@@ -102,6 +130,17 @@ Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
     if (static_cast<int64_t>(outCapacity) < requiredCapacity) {
         // Buffer too small for the requested output resolution
         return false;
+    }
+
+    if (g_interp_algorithm.load(std::memory_order_relaxed) ==
+        static_cast<int>(rife::InterpolationAlgorithm::MEMC)) {
+        return g_memc.interpolate(
+            in0Ptr, in1Ptr,
+            srcWidth, srcHeight,
+            targetWidth, targetHeight,
+            timestep,
+            outPtr
+        );
     }
 
     return g_rife_engine.processFrameBuffer(

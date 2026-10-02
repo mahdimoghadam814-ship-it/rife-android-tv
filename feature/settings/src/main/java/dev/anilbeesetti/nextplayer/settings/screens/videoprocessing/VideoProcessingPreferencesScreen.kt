@@ -19,6 +19,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.ui.R
 import dev.anilbeesetti.nextplayer.core.ui.components.ClickablePreferenceItem
@@ -100,6 +101,14 @@ private fun VideoProcessingPreferencesScreenContent(
                         onAction(VideoProcessingPreferencesUiEvent.ShowDialog(VideoProcessingDialog.RifeResolutionDialog))
                     },
                 )
+                ClickablePreferenceItem(
+                    title = stringResource(id = R.string.interpolation_algorithm),
+                    description = state.preferences.interpolationAlgorithm.name(),
+                    icon = NextIcons.Speed,
+                    onClick = {
+                        onAction(VideoProcessingPreferencesUiEvent.ShowDialog(VideoProcessingDialog.InterpolationAlgorithmDialog))
+                    },
+                )
                 PreferenceSwitch(
                     title = stringResource(id = R.string.fastdvdnet),
                     description = stringResource(id = R.string.fastdvdnet_description),
@@ -123,6 +132,23 @@ private fun VideoProcessingPreferencesScreenContent(
                             selected = it == state.preferences.rifeResolution,
                             onClick = {
                                 onAction(VideoProcessingPreferencesUiEvent.UpdateRifeResolution(it))
+                                onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null))
+                            },
+                        )
+                    }
+                }
+            }
+            VideoProcessingDialog.InterpolationAlgorithmDialog -> {
+                OptionsDialog(
+                    text = stringResource(id = R.string.interpolation_algorithm),
+                    onDismissClick = { onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null)) },
+                ) {
+                    items(InterpolationAlgorithmSetting.entries.toTypedArray()) {
+                        RadioTextButton(
+                            text = it.name(),
+                            selected = it == state.preferences.interpolationAlgorithm,
+                            onClick = {
+                                onAction(VideoProcessingPreferencesUiEvent.UpdateInterpolationAlgorithm(it))
                                 onAction(VideoProcessingPreferencesUiEvent.ShowDialog(null))
                             },
                         )

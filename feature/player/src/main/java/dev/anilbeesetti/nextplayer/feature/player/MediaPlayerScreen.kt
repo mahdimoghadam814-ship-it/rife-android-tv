@@ -25,9 +25,11 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.ui.R
 import dev.anilbeesetti.nextplayer.core.ui.theme.NextPlayerTheme
+import dev.anilbeesetti.nextplayer.feature.player.rife.InterpolationAlgorithm
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeOutputView
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution
@@ -178,7 +180,13 @@ internal fun MediaPlayerContent(
         playerPreferences.rifeEnabled,
         playerPreferences.fastDvdNetEnabled,
         playerPreferences.rifeResolution,
+        playerPreferences.interpolationAlgorithm,
     ) {
+        // Order matters: the algorithm has to be known before setRifeEnabled decides whether
+        // the RIFE model is worth loading at all.
+        rifeController.setInterpolationAlgorithm(
+            playerPreferences.interpolationAlgorithm.toInterpolationAlgorithm(),
+        )
         rifeController.setRifeEnabled(playerPreferences.rifeEnabled)
         rifeController.setFastDvdNetEnabled(playerPreferences.fastDvdNetEnabled)
         rifeController.setResolution(playerPreferences.rifeResolution.toRifeResolution())
@@ -310,3 +318,9 @@ private fun RifeResolutionSetting.toRifeResolution(): RifeResolution = when (thi
     RifeResolutionSetting.RES_720P -> RifeResolution.RES_720P
     RifeResolutionSetting.RES_480P -> RifeResolution.RES_480P
 }
+
+private fun InterpolationAlgorithmSetting.toInterpolationAlgorithm(): InterpolationAlgorithm =
+    when (this) {
+        InterpolationAlgorithmSetting.RIFE -> InterpolationAlgorithm.RIFE
+        InterpolationAlgorithmSetting.MEMC -> InterpolationAlgorithm.MEMC
+    }

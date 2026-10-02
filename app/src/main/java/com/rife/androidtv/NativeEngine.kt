@@ -33,5 +33,17 @@ object NativeEngine {
     external fun runRifeTest(width: Int, height: Int): Boolean
 
     @JvmStatic
+    external fun setInterpolationAlgorithm(algorithm: Int)
+
+    @JvmStatic
+    external fun setMemcThreadCount(threads: Int)
+
+    @JvmStatic
+    external fun resetMemcState()
+
+    @JvmStatic
+    external fun getMemcLastDurationMs(): Double
+
+    @JvmStatic
     external fun getRifeStatus(): RifeDiagnosticResult
 }

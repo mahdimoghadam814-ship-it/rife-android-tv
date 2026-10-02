@@ -15,6 +15,14 @@ enum class RifeResolution {
 }
 
 /**
+ * Interpolation backends offered by the Video Processing settings entry.
+ */
+enum class InterpolationAlgorithm {
+    RIFE,
+    MEMC,
+}
+
+/**
  * Snapshot of the processing pipeline statistics, refreshed about once per second.
  */
 data class RifeStats(
@@ -65,6 +73,13 @@ interface RifeController {
     fun setFastDvdNetEnabled(enabled: Boolean)
 
     fun setResolution(resolution: RifeResolution)
+
+    /**
+     * Selects the interpolation backend. Switching to [InterpolationAlgorithm.MEMC] does not
+     * require the RIFE model; switching to [InterpolationAlgorithm.RIFE] is handled lazily by
+     * [setRifeEnabled].
+     */
+    fun setInterpolationAlgorithm(algorithm: InterpolationAlgorithm)
 
     /** Records the decoded frame size reported by `Player.Listener.onVideoSizeChanged`. */
     fun setInputFrameSize(width: Int, height: Int)

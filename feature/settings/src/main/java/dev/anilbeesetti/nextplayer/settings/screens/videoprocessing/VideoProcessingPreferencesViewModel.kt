@@ -3,6 +3,7 @@ package dev.anilbeesetti.nextplayer.settings.screens.videoprocessing
 import androidx.compose.runtime.Stable
 import androidx.lifecycle.viewModelScope
 import dev.anilbeesetti.nextplayer.core.data.repository.PreferencesRepository
+import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.ui.base.MviViewModel
@@ -46,6 +47,7 @@ class VideoProcessingPreferencesViewModel(
             is VideoProcessingPreferencesUiEvent.ToggleRife -> toggleRife()
             is VideoProcessingPreferencesUiEvent.ToggleFastDvdNet -> toggleFastDvdNet()
             is VideoProcessingPreferencesUiEvent.UpdateRifeResolution -> updateRifeResolution(action.value)
+            is VideoProcessingPreferencesUiEvent.UpdateInterpolationAlgorithm -> updateInterpolationAlgorithm(action.value)
         }
     }
 
@@ -78,6 +80,14 @@ class VideoProcessingPreferencesViewModel(
             }
         }
     }
+
+    private fun updateInterpolationAlgorithm(value: InterpolationAlgorithmSetting) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences {
+                it.copy(interpolationAlgorithm = value)
+            }
+        }
+    }
 }
 
 @Stable
@@ -88,6 +98,7 @@ data class VideoProcessingPreferencesUiState(
 
 sealed interface VideoProcessingDialog {
     data object RifeResolutionDialog : VideoProcessingDialog
+    data object InterpolationAlgorithmDialog : VideoProcessingDialog
 }
 
 sealed interface VideoProcessingPreferencesUiEvent {
@@ -96,4 +107,5 @@ sealed interface VideoProcessingPreferencesUiEvent {
     data object ToggleRife : VideoProcessingPreferencesUiEvent
     data object ToggleFastDvdNet : VideoProcessingPreferencesUiEvent
     data class UpdateRifeResolution(val value: RifeResolutionSetting) : VideoProcessingPreferencesUiEvent
+    data class UpdateInterpolationAlgorithm(val value: InterpolationAlgorithmSetting) : VideoProcessingPreferencesUiEvent
 }
