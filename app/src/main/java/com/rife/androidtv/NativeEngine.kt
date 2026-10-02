@@ -29,6 +29,26 @@ object NativeEngine {
         outBuffer: ByteBuffer
     ): Boolean
 
+    /**
+     * Runs motion estimation only and packs the result instead of warping: four bytes per 16x16
+     * block (forward x, forward y, backward x, backward y), each a whole-pixel vector biased by
+     * +128, row-major. [mvBuffer] must hold at least
+     * `ceil(targetWidth/16) * ceil(targetHeight/16) * 4` bytes.
+     *
+     * The caller uploads the packed field as an RGBA texture and lets a fragment shader do the
+     * bilinear resample, which is what keeps the per-pixel warp off the CPU.
+     */
+    @JvmStatic
+    external fun computeMotionField(
+        in0Buffer: ByteBuffer,
+        in1Buffer: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        mvBuffer: ByteBuffer
+    ): Boolean
+
     @JvmStatic
     external fun runRifeTest(width: Int, height: Int): Boolean
 

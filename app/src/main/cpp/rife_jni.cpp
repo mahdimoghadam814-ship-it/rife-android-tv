@@ -99,6 +99,40 @@ Java_com_rife_androidtv_NativeEngine_getMemcLastDurationMs(JNIEnv* env, jclass c
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_rife_androidtv_NativeEngine_computeMotionField(
+    JNIEnv* env, jclass clazz,
+    jobject in0Buffer, jobject in1Buffer,
+    jint srcWidth, jint srcHeight,
+    jint targetWidth, jint targetHeight,
+    jobject mvBuffer
+) {
+    uint8_t* in0Ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(in0Buffer));
+    uint8_t* in1Ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(in1Buffer));
+    uint8_t* mvPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(mvBuffer));
+    if (!in0Ptr || !in1Ptr || !mvPtr) {
+        return false;
+    }
+    // The field only exists for the block-matching algorithm. In RIFE mode there is nothing to
+    // hand to the shader, so report failure and let the caller take its CPU path instead.
+    if (g_interp_algorithm.load(std::memory_order_relaxed) !=
+        static_cast<int>(rife::InterpolationAlgorithm::MEMC)) {
+        return false;
+    }
+    const jlong mvCapacity = env->GetDirectBufferCapacity(mvBuffer);
+    if (mvCapacity < 0) {
+        return false;
+    }
+    const size_t needed = rife::MemcInterpolator::motionFieldBytes(targetWidth, targetHeight);
+    if (static_cast<size_t>(mvCapacity) < needed) {
+        return false;
+    }
+    return g_memc.motionField(in0Ptr, in1Ptr,
+                              srcWidth, srcHeight,
+                              targetWidth, targetHeight,
+                              mvPtr, static_cast<size_t>(mvCapacity));
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
     JNIEnv* env, jclass clazz,
     jobject in0Buffer, jobject in1Buffer,

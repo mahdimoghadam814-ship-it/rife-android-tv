@@ -61,6 +61,63 @@ class GlOutputRenderer {
             }
         """
 
+        private const val WARP_VERTEX_SHADER = """
+            attribute vec4 aPosition;
+            attribute vec4 aTextureCoord;
+            uniform vec2 uContentScale;
+            varying vec2 vTextureCoord;
+            void main() {
+                gl_Position = vec4(aPosition.xy * uContentScale, aPosition.z, aPosition.w);
+                vTextureCoord = aTextureCoord.xy;
+            }
+        """
+
+        /**
+         * Motion-compensated blend of two frames, one fragment per output pixel.
+         *
+         * This is the CPU warp from `MemcInterpolator::motionCompensate()` re-expressed in GLSL.
+         * The three identities it relies on, all of which must keep matching the native code:
+         *
+         *  * `p` is the continuous processing-space position. The quad's texcoords run 0..1 over
+         *    the frame, so `p * uTargetSize - 0.5` lands on the pixel's integer index exactly
+         *    when mv == 0 and the whole expression collapses to the plain texcoord used by the
+         *    single-texture blit above - which is what guarantees the same orientation.
+         *  * `p / uMotionGrid` reproduces `mvGridAxis()`: a field of ceil(w/16) vectors anchored
+         *    at the block centres, so effective texel = p/16 - 1/2, and CLAMP_TO_EDGE is the
+         *    border clamp rather than an extrapolation.
+         *  * the two sample positions are the native `x - mv*t` and `x - mv*(1-t)`; adding the
+         *    half texel back converts pixel index to texture coordinate.
+         *
+         * `highp` is requested because the field is stored biased by 128: a mediump (fp16) `mv`
+         * would quantise to about a quarter of a pixel after `* 255.0 - 128.0`.
+         */
+        private const val WARP_FRAGMENT_SHADER = """
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
+            precision mediump float;
+            #endif
+            varying vec2 vTextureCoord;
+            uniform sampler2D uFrame0;
+            uniform sampler2D uFrame1;
+            uniform sampler2D uMotion;
+            uniform vec2 uTargetSize;
+            uniform vec2 uMotionGrid;
+            uniform float uTimestep;
+            void main() {
+                vec2 p = vTextureCoord * uTargetSize - 0.5;
+                vec2 g = p / uMotionGrid;
+                vec4 mv = texture2D(uMotion, g);
+                vec2 mvf = mv.rg * 255.0 - 128.0;
+                vec2 mvb = mv.ba * 255.0 - 128.0;
+                vec2 pa = p - mvf * uTimestep;
+                vec2 pb = p - mvb * (1.0 - uTimestep);
+                vec3 ca = texture2D(uFrame0, (pa + 0.5) / uTargetSize).rgb;
+                vec3 cb = texture2D(uFrame1, (pb + 0.5) / uTargetSize).rgb;
+                gl_FragColor = vec4(mix(ca, cb, uTimestep), 1.0);
+            }
+        """
+
         /** Clip-space positions of a full-screen triangle strip. */
         private val FULL_QUAD_VERTICES = floatArrayOf(
             -1.0f, -1.0f, 0.0f,
@@ -92,6 +149,28 @@ class GlOutputRenderer {
     /** Dimensions currently described by [textureId]; 0 until the first upload. */
     private var textureWidth = 0
     private var textureHeight = 0
+
+    // ---- GPU motion-compensation path (see WARP_FRAGMENT_SHADER) ----
+    private var warpProgram = 0
+    private var warpAPosition = -1
+    private var warpATexCoord = -1
+    private var warpUContentScale = -1
+    private var warpUFrame0 = -1
+    private var warpUFrame1 = -1
+    private var warpUMotion = -1
+    private var warpUTargetSize = -1
+    private var warpUMotionGrid = -1
+    private var warpUTimestep = -1
+    private var warpTex0 = 0
+    private var warpTex1 = 0
+    private var warpMotionTex = 0
+    private var warpTex0W = 0
+    private var warpTex0H = 0
+    private var warpTex1W = 0
+    private var warpTex1H = 0
+    private var warpGridW = 0
+    private var warpGridH = 0
+    private var warpDrawCalls = 0L
 
     /**
      * Clip-space scale that letterboxes the frame into the surface. Seeded to 0 so the very first
@@ -201,8 +280,87 @@ class GlOutputRenderer {
         GLES20.glDisable(GLES20.GL_BLEND)
         GLES20.glDisable(GLES20.GL_CULL_FACE)
 
-        Log.i(TAG, "Output blit program ready (textureId=$textureId)")
+        initWarp()
+
+        Log.i(TAG, "Output blit program ready (textureId=$textureId, warp=${if (warpProgram != 0) "on" else "off"})")
     }
+
+    /**
+     * Compiles the motion-compensation program. Failure is not fatal: [renderWarp] then reports
+     * false and the caller keeps using the CPU warp, so a driver that dislikes the shader costs
+     * performance rather than the frame.
+     */
+    private fun initWarp() {
+        if (warpProgram != 0) {
+            return
+        }
+        val newProgram = GLES20.glCreateProgram()
+        if (newProgram == 0) {
+            Log.w(TAG, "glCreateProgram failed for the warp program; CPU warp stays in use")
+            return
+        }
+        val vs = tryCompileShader(GLES20.GL_VERTEX_SHADER, WARP_VERTEX_SHADER)
+        val fs = tryCompileShader(GLES20.GL_FRAGMENT_SHADER, WARP_FRAGMENT_SHADER)
+        if (vs == 0 || fs == 0) {
+            GLES20.glDeleteProgram(newProgram)
+            return
+        }
+        GLES20.glAttachShader(newProgram, vs)
+        GLES20.glAttachShader(newProgram, fs)
+        GLES20.glLinkProgram(newProgram)
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(newProgram, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        val programLog = GLES20.glGetProgramInfoLog(newProgram)
+        GLES20.glDeleteShader(vs)
+        GLES20.glDeleteShader(fs)
+        if (linkStatus[0] != GLES20.GL_TRUE) {
+            GLES20.glDeleteProgram(newProgram)
+            Log.w(TAG, "warp program link failed: $programLog; CPU warp stays in use")
+            return
+        }
+
+        warpProgram = newProgram
+        warpAPosition = GLES20.glGetAttribLocation(newProgram, "aPosition")
+        warpATexCoord = GLES20.glGetAttribLocation(newProgram, "aTextureCoord")
+        warpUContentScale = GLES20.glGetUniformLocation(newProgram, "uContentScale")
+        warpUFrame0 = GLES20.glGetUniformLocation(newProgram, "uFrame0")
+        warpUFrame1 = GLES20.glGetUniformLocation(newProgram, "uFrame1")
+        warpUMotion = GLES20.glGetUniformLocation(newProgram, "uMotion")
+        warpUTargetSize = GLES20.glGetUniformLocation(newProgram, "uTargetSize")
+        warpUMotionGrid = GLES20.glGetUniformLocation(newProgram, "uMotionGrid")
+        warpUTimestep = GLES20.glGetUniformLocation(newProgram, "uTimestep")
+
+        if (warpAPosition < 0 || warpATexCoord < 0 || warpUContentScale < 0 ||
+            warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 ||
+            warpUTargetSize < 0 || warpUMotionGrid < 0 || warpUTimestep < 0
+        ) {
+            GLES20.glDeleteProgram(newProgram)
+            warpProgram = 0
+            Log.w(TAG, "warp program is missing expected uniforms; CPU warp stays in use")
+            return
+        }
+
+        warpTex0 = createWarpTexture()
+        warpTex1 = createWarpTexture()
+        warpMotionTex = createWarpTexture()
+        Log.i(TAG, "warp program ready")
+    }
+
+    private fun createWarpTexture(): Int {
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        return ids[0]
+    }
+
+    /** True when [renderWarp] can run; false means the caller must use the CPU warp. */
+    val isWarpInitialized: Boolean
+        get() = warpProgram != 0
 
     /**
      * (Re)creates the EGL window surface that processed frames are rendered to. Must be called with
@@ -273,6 +431,29 @@ class GlOutputRenderer {
     }
 
     /**
+     * Makes this renderer's window surface current, unless it already is.
+     *
+     * Two renders run back to back per interpolated pair and both start here, so the second call
+     * would otherwise re-bind a context/surface pair the first one just established. Asking EGL
+     * first is the same idiom [VideoFrameProcessor.ensureEglContextCurrent] uses, and it stays
+     * correct when the grabber has since bound its own surface because the query is live.
+     * Returns false when EGL refuses, after logging the error.
+     */
+    private fun bindWindow(eglDisplay: EGLDisplay, eglSurface: EGLSurface, eglContext: EGLContext): Boolean {
+        val tPhase = System.nanoTime()
+        val alreadyCurrent = EGL14.eglGetCurrentContext() == eglContext &&
+            EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW) == eglSurface
+        if (!alreadyCurrent &&
+            !EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        ) {
+            Log.e(TAG, "eglMakeCurrent failed: 0x${EGL14.eglGetError().toString(16)}")
+            return false
+        }
+        nsCurrent += System.nanoTime() - tPhase
+        return true
+    }
+
+    /**
      * Uploads [buffer] (exactly [width] x [height] RGBA bytes, top row first) and presents it.
      * Must be called with the worker's EGL context current.
      */
@@ -289,17 +470,7 @@ class GlOutputRenderer {
             return
         }
 
-        var tPhase = System.nanoTime()
-        // Two renders run back to back per interpolated pair, and eglMakeCurrent is the first
-        // thing each of them does. The second call re-binds a context/surface pair that the
-        // first one just established, so ask EGL rather than paying for the redundant rebind.
-        // ensureEglContextCurrent() in VideoFrameProcessor uses the same query idiom.
-        val alreadyCurrent = EGL14.eglGetCurrentContext() == eglContext &&
-            EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW) == eglSurface
-        if (!alreadyCurrent &&
-            !EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
-        ) {
-            Log.e(TAG, "eglMakeCurrent failed: 0x${EGL14.eglGetError().toString(16)}")
+        if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
             return
         }
 
@@ -311,6 +482,7 @@ class GlOutputRenderer {
             Log.d(TAG, "RENDER EGL STATE: display=$currentDisplay context=$currentContext surface=$currentSurface")
         }
 
+        var tPhase = System.nanoTime()
         if (surfaceWidth != width || surfaceHeight != height) {
             // The window surface keeps the size of the SurfaceView; the viewport is set from the
             // actual surface size so the frame is never stretched by a stale viewport.
@@ -425,6 +597,168 @@ class GlOutputRenderer {
     }
 
     /**
+     * Motion-compensated blend of [frame0] and [frame1] using the packed field in [motion], then
+     * presents it. Buffer layout and calling-thread contract match [render].
+     *
+     * [frame0] and [frame1] are the raw source frames at [srcWidth] x [srcHeight]. [motion] holds
+     * `ceil(targetWidth/16) * ceil(targetHeight/16) * 4` bytes from
+     * `NativeEngine.computeMotionField`, laid out as forward x, forward y, backward x, backward y,
+     * each a whole-pixel vector biased by +128. The expensive part of interpolation - the
+     * per-pixel 4-tap resample of both frames - then happens once per output fragment in the
+     * shader instead of once per output pixel on the CPU.
+     *
+     * Returns false when the warp program is unavailable or a size is unserviceable, in which case
+     * the caller must fall back to `NativeEngine.interpolateFrameBuffers()`.
+     */
+    fun renderWarp(
+        frame0: ByteBuffer,
+        frame1: ByteBuffer,
+        motion: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        timestep: Float
+    ): Boolean {
+        val eglDisplay = display
+        val eglContext = context
+        val eglSurface = windowSurface
+        if (warpProgram == 0 || eglDisplay == null || eglContext == null || eglSurface == null) {
+            return false
+        }
+        if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+            return false
+        }
+        if (timestep < 0.0f || timestep > 1.0f) {
+            return false
+        }
+        val gridW = (targetWidth + 15) / 16
+        val gridH = (targetHeight + 15) / 16
+
+        if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            return false
+        }
+
+        var tPhase = System.nanoTime()
+        if (surfaceWidth != targetWidth || surfaceHeight != targetHeight) {
+            updateSurfaceSize()
+        }
+        nsCurrent += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        if (!uploadRgba(warpTex0, frame0, srcWidth, srcHeight, warpTex0W, warpTex0H) ||
+            !uploadRgba(warpTex1, frame1, srcWidth, srcHeight, warpTex1W, warpTex1H) ||
+            !uploadRgba(warpMotionTex, motion, gridW, gridH, warpGridW, warpGridH)
+        ) {
+            return false
+        }
+        warpTex0W = srcWidth
+        warpTex0H = srcHeight
+        warpTex1W = srcWidth
+        warpTex1H = srcHeight
+        warpGridW = gridW
+        warpGridH = gridH
+        nsUpload += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
+        GLES20.glUseProgram(warpProgram)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpTex0)
+        GLES20.glUniform1i(warpUFrame0, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpTex1)
+        GLES20.glUniform1i(warpUFrame1, 1)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMotionTex)
+        GLES20.glUniform1i(warpUMotion, 2)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+
+        GLES20.glUniform2f(warpUTargetSize, targetWidth.toFloat(), targetHeight.toFloat())
+        // The field covers ceil(size/16) blocks, so the padded extent is what maps a processing
+        // pixel onto the vector that straddles it.
+        GLES20.glUniform2f(warpUMotionGrid, (gridW * 16).toFloat(), (gridH * 16).toFloat())
+        GLES20.glUniform1f(warpUTimestep, timestep)
+
+        // Always uploaded, never gated on updateContentScale(): each program has its own uniform
+        // location, so the warp program's copy starts at 0 and would collapse the quad to a point
+        // on its first frame if only "changed" values were pushed.
+        updateContentScale(targetWidth, targetHeight, surfaceWidth, surfaceHeight)
+        GLES20.glUniform2f(warpUContentScale, contentScaleX, contentScaleY)
+
+        GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        nsSetup += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(warpAPosition)
+        GLES20.glVertexAttribPointer(warpAPosition, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(warpATexCoord)
+        GLES20.glVertexAttribPointer(warpATexCoord, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+        val error = GLES20.glGetError()
+        if (error != GLES20.GL_NO_ERROR) {
+            Log.e(TAG, "Warp blit failed with GL error 0x${error.toString(16)}")
+        }
+        GLES20.glDisableVertexAttribArray(warpAPosition)
+        GLES20.glDisableVertexAttribArray(warpATexCoord)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        nsDraw += System.nanoTime() - tPhase
+
+        tPhase = System.nanoTime()
+        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        val swapError = EGL14.eglGetError()
+        nsSwap += System.nanoTime() - tPhase
+        renderCalls++
+        warpDrawCalls++
+        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
+            Log.d(TAG, "eglSwapBuffers (warp): result=$swapResult error=0x${swapError.toString(16)}")
+        }
+        return true
+    }
+
+    /**
+     * Uploads `width` x `height` RGBA from [buffer] into [tex], re-specifying the texture only
+     * when the shape changed; otherwise the storage that already exists is filled in place.
+     * Returns false only when the byte count cannot be expressed as an Int.
+     */
+    private fun uploadRgba(
+        tex: Int,
+        buffer: ByteBuffer,
+        width: Int,
+        height: Int,
+        curWidth: Int,
+        curHeight: Int
+    ): Boolean {
+        val bytes = width.toLong() * height.toLong() * 4L
+        if (bytes > Int.MAX_VALUE) {
+            Log.e(TAG, "uploadRgba: dimensions ${width}x$height overflow Int")
+            return false
+        }
+        buffer.position(0)
+        buffer.limit(bytes.toInt())
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        if (curWidth != width || curHeight != height) {
+            GLES20.glTexImage2D(
+                GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, width, height, 0,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer
+            )
+        } else {
+            GLES20.glTexSubImage2D(
+                GLES20.GL_TEXTURE_2D, 0, 0, 0, width, height,
+                GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, buffer
+            )
+        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        return true
+    }
+
+    /**
      * Calculates a cheap pixel checksum (sum of all RGBA values) to verify the buffer is not all-zero.
      * Does not modify the buffer position/limit.
      */
@@ -526,15 +860,48 @@ class GlOutputRenderer {
             GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)
             textureId = 0
         }
-        if (program != 0) {
-            GLES20.glDeleteProgram(program)
-            program = 0
+        textureWidth = 0
+        textureHeight = 0
+        if (warpProgram != 0) {
+            GLES20.glDeleteTextures(
+                3, intArrayOf(warpTex0, warpTex1, warpMotionTex), 0
+            )
+            warpTex0 = 0
+            warpTex1 = 0
+            warpMotionTex = 0
+            warpTex0W = 0
+            warpTex0H = 0
+            warpTex1W = 0
+            warpTex1H = 0
+            warpGridW = 0
+            warpGridH = 0
+            GLES20.glDeleteProgram(warpProgram)
+            warpProgram = 0
         }
+        warpAPosition = -1
+        warpATexCoord = -1
+        warpUContentScale = -1
+        warpUFrame0 = -1
+        warpUFrame1 = -1
+        warpUMotion = -1
+        warpUTargetSize = -1
+        warpUMotionGrid = -1
+        warpUTimestep = -1
         aPositionHandle = -1
         aTextureCoordHandle = -1
         uTextureHandle = -1
         display = null
         context = null
+    }
+
+    /** [compileShader] without the throw, for the optional warp program. Returns 0 on failure. */
+    private fun tryCompileShader(type: Int, source: String): Int {
+        return try {
+            compileShader(type, source)
+        } catch (t: Throwable) {
+            Log.w(TAG, "shader compile failed; the CPU warp stays in use", t)
+            0
+        }
     }
 
     private fun compileShader(type: Int, source: String): Int {

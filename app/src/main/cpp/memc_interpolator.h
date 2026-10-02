@@ -31,9 +31,11 @@ enum class InterpolationAlgorithm : int {
 // The output is written as tightly packed RGBA8888, top-down, targetW*targetH*4 bytes,
 // matching the contract of RifeEngine::processFrameBuffer().
 //
-// Quality note (v1): the warp samples nearest-neighbour and the motion field is
-// piecewise constant per 16x16 block. Overlapped blocks and bilinear sampling are the
-// natural follow-ups if blocking artefacts show up.
+// The warp interpolates the motion field bilinearly between block centres and resamples both
+// source frames with a 4-tap read, so the motion varies continuously across the frame instead
+// of stepping at block edges. interpolate() does that resample on the CPU with NEON;
+// motionField() hands the same field to the GPU so the shader can do it for free.
+
 class MemcInterpolator {
 public:
     MemcInterpolator();
@@ -50,6 +52,24 @@ public:
                      int targetWidth, int targetHeight,
                      float timestep,
                      uint8_t* out);
+
+    // Everything interpolate() does up to and including both motion estimates, then packs the
+    // field instead of warping it: four bytes per block - forward x, forward y, backward x,
+    // backward y - each a whole-pixel vector biased by +128, row-major over
+    // ceil(targetW/kBlock) x ceil(targetH/kBlock). outMv must have at least
+    // motionFieldBytes(targetWidth, targetHeight) bytes of capacity.
+    //
+    // This is the hand-off to the GPU warp: a fragment shader samples the two source frames with
+    // the same bilinear field the CPU path builds, so the per-pixel resample - by far the most
+    // expensive thing motionCompensate() does - costs a texture fetch instead of a NEON loop.
+    bool motionField(const uint8_t* src0, const uint8_t* src1,
+                     int srcW, int srcHeight,
+                     int targetWidth, int targetHeight,
+                     uint8_t* outMv, size_t outMvBytes);
+
+    // Exact byte count motionField() writes for a processing size. Also the size the caller must
+    // allocate for the packed field, which is a few kilobytes even at 1080p.
+    static size_t motionFieldBytes(int targetWidth, int targetHeight);
 
     void reset();
 
@@ -87,6 +107,20 @@ private:
                           const int32_t* mvf_x, const int32_t* mvf_y,
                           const int32_t* mvb_x, const int32_t* mvb_y,
                           uint8_t* out);
+
+    // Shared front half of interpolate() and motionField(): scratch sizing, the optional shrink to
+    // the processing size, RGBA->luma, the pyramid and both motion estimates. On success *aOut and
+    // *bOut (when non-null) point at the processing-sized frames - the inputs themselves when no
+    // resize was needed, otherwise resized0_/resized1_.
+    bool prepare(const uint8_t* src0, const uint8_t* src1,
+                 int srcW, int srcHeight,
+                 int targetWidth, int targetHeight,
+                 const uint8_t** aOut = nullptr,
+                 const uint8_t** bOut = nullptr);
+
+    // Serial: bwy*bwx is a few thousand bytes, so a parallel region would cost more in barrier
+    // time than the write itself.
+    void packMotionField(int w, int h, uint8_t* outMv);
 
     template <typename F>
     void parallelFor(int begin, int end, F&& fn);

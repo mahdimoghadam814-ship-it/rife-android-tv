@@ -694,15 +694,13 @@ void MemcInterpolator::microBench() {
     }
 }
 
-bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
-                                   int srcW, int srcHeight,
-                                   int targetWidth, int targetHeight,
-                                   float timestep,
-                                   uint8_t* out) {
-    if (!src0 || !src1 || !out) return false;
+bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
+                               int srcW, int srcHeight,
+                               int targetWidth, int targetHeight,
+                               const uint8_t** aOut, const uint8_t** bOut) {
+    if (!src0 || !src1) return false;
     if (srcW <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
     if (targetWidth > srcW || targetHeight > srcHeight) return false;
-    if (timestep < 0.0f || timestep > 1.0f) return false;
 
     microBench();  // one-shot; logs raw NEON and sad16x16 throughput
 
@@ -713,8 +711,6 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
         work_h_ = 0;
     }
     pool_->ensureCount(threads_.load(std::memory_order_relaxed));
-
-    const auto t0 = std::chrono::steady_clock::now();
 
     const bool sameSize = (targetWidth == srcW && targetHeight == srcHeight);
     const int w = targetWidth;
@@ -772,12 +768,90 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
     motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
     acc_bwd_ns_ += nsSince(tBwd);
 
+    if (aOut) *aOut = a;
+    if (bOut) *bOut = b;
+    return true;
+}
+
+bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
+                                   int srcW, int srcHeight,
+                                   int targetWidth, int targetHeight,
+                                   float timestep,
+                                   uint8_t* out) {
+    if (!out) return false;
+    if (timestep < 0.0f || timestep > 1.0f) return false;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint8_t* a = nullptr;
+    const uint8_t* b = nullptr;
+    if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight, &a, &b)) {
+        return false;
+    }
+
     const auto tWarp = std::chrono::steady_clock::now();
-    motionCompensate(a, b, w, h, timestep,
+    motionCompensate(a, b, targetWidth, targetHeight, timestep,
                      mvf_x_.data(), mvf_y_.data(),
                      mvb_x_.data(), mvb_y_.data(),
                      out);
     acc_warp_ns_ += nsSince(tWarp);
+
+    acc_total_ns_ += nsSince(t0);
+    acc_frames_ += 1;
+
+    last_ms_.store(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+    reportStagesIfDue();
+    return true;
+}
+
+size_t MemcInterpolator::motionFieldBytes(int targetWidth, int targetHeight) {
+    if (targetWidth <= 0 || targetHeight <= 0) return 0;
+    const size_t bwx = static_cast<size_t>((targetWidth + kBlock - 1) / kBlock);
+    const size_t bwy = static_cast<size_t>((targetHeight + kBlock - 1) / kBlock);
+    return bwx * bwy * 4;
+}
+
+void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
+    const int bwx = (w + kBlock - 1) / kBlock;
+    const int bwy = (h + kBlock - 1) / kBlock;
+    // The hierarchical search bounds the field well inside +-127 whole pixels (|mv| <= 38 at
+    // three levels with the ranges above), so the +128 bias always fits a byte. Clamp anyway: a
+    // future range change must degrade to a saturated vector, never a wrapped one.
+    auto bias = [](int32_t v) {
+        const int32_t b = v + 128;
+        return static_cast<uint8_t>(b < 0 ? 0 : (b > 255 ? 255 : b));
+    };
+    for (int r = 0; r < bwy; r++) {
+        const size_t row = static_cast<size_t>(r) * bwx;
+        uint8_t* o = outMv + row * 4;
+        for (int c = 0; c < bwx; c++, o += 4) {
+            const size_t i = row + c;
+            o[0] = bias(mvf_x_[i]);
+            o[1] = bias(mvf_y_[i]);
+            o[2] = bias(mvb_x_[i]);
+            o[3] = bias(mvb_y_[i]);
+        }
+    }
+}
+
+bool MemcInterpolator::motionField(const uint8_t* src0, const uint8_t* src1,
+                                   int srcW, int srcHeight,
+                                   int targetWidth, int targetHeight,
+                                   uint8_t* outMv, size_t outMvBytes) {
+    if (!outMv) return false;
+    if (outMvBytes < motionFieldBytes(targetWidth, targetHeight)) return false;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight)) {
+        return false;
+    }
+
+    // Packed in one serial pass: the GPU is about to read it, so a parallel region would only
+    // buy back the microseconds the barriers cost. The warp stage stays at ~0 here, which is the
+    // signal in the STAGES line that the shader - not motionCompensate() - is doing the resample.
+    const auto tPack = std::chrono::steady_clock::now();
+    packMotionField(targetWidth, targetHeight, outMv);
+    acc_warp_ns_ += nsSince(tPack);
 
     acc_total_ns_ += nsSince(t0);
     acc_frames_ += 1;

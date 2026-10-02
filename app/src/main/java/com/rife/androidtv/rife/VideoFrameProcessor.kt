@@ -246,6 +246,16 @@ class VideoFrameProcessor(
     private var cachedTargetSize = 0
 
     /**
+     * Packed motion field for the GPU warp: four bytes per 16x16 block, so a few kilobytes even
+     * at 1080p. Reallocated alongside the frame buffers because it tracks the processing size.
+     */
+    private var cachedMotionBuf: ByteBuffer? = null
+
+    /** Dimensions of the last per-frame-dimension breadcrumb, so it is written on change only. */
+    private var lastDimsLogW = 0
+    private var lastDimsLogH = 0
+
+    /**
      * GL blitter for the output surface. Replaces the previous `lockCanvas()` + `drawBitmap()`
      * path, which rasterised three full-screen bitmaps per interpolated pair on the CPU and was
      * one of the dominant costs on the TV box.
@@ -778,6 +788,7 @@ class VideoFrameProcessor(
         cachedDenoised0Buf = null
         cachedDenoised1Buf = null
         cachedOutBuf = null
+        cachedMotionBuf = null
         cachedTargetSize = 0
         readbackInProgress = false
 
@@ -1247,7 +1258,7 @@ class VideoFrameProcessor(
         // to guarantee that capacity itself.
         val requiredOutputBytes = rifeOutputW.toLong() * rifeOutputH.toLong() * 4L
 
-        if (!ensureCachedBuffers(requiredInputBytes, requiredOutputBytes)) {
+        if (!ensureCachedBuffers(requiredInputBytes, requiredOutputBytes, rifeInputW, rifeInputH)) {
             releaseFrameBuffer(prev.pixels)
             renderFrameToOutput(nextFrame)
             previousFrame = nextFrame
@@ -1356,21 +1367,43 @@ class VideoFrameProcessor(
             Log.d(TAG, "PIPELINE CHECKSUM: before RIFE src0 checksum=$src0Checksum src1 checksum=$src1Checksum")
         }
 
-        Log.i(
-            TAG,
-            "REAL RIFE EXECUTION LOG: preRifeDimensions=${rifeInputW}x$rifeInputH -> " +
-                "rifeInputDimensions=${rifeInputW}x$rifeInputH -> " +
-                "rifeOutputDimensions=${rifeOutputW}x$rifeOutputH -> " +
-                "renderingSurfaceDimensions=${displaySurfaceWidth}x$displaySurfaceHeight"
-        )
+        if (rifeInputW != lastDimsLogW || rifeInputH != lastDimsLogH) {
+            lastDimsLogW = rifeInputW
+            lastDimsLogH = rifeInputH
+            Log.i(
+                TAG,
+                "REAL RIFE EXECUTION LOG: preRifeDimensions=${rifeInputW}x$rifeInputH -> " +
+                    "rifeInputDimensions=${rifeInputW}x$rifeInputH -> " +
+                    "rifeOutputDimensions=${rifeOutputW}x$rifeOutputH -> " +
+                    "renderingSurfaceDimensions=${displaySurfaceWidth}x$displaySurfaceHeight"
+            )
+        }
 
         // The output buffer is deliberately NOT flipped here. NativeEngine.interpolateFrameBuffers()
         // reaches the memory through JNI GetDirectBufferAddress() and writes into it directly, so
         // the Java position stays at 0 and a flip() would only publish limit = 0.
         outBuf.clear()
 
+        // GPU warp: motion estimation still runs on the CPU, because that is what the luma pyramid
+        // and the SAD search are, but the per-pixel resample moves into the fragment shader. What
+        // crosses JNI is then the packed field - ceil(w/16) * ceil(h/16) * 4 bytes, a few kB -
+        // instead of a full RGBA frame. computeMotionField() reports false when the algorithm is
+        // not MEMC, so the RIFE path keeps working without this layer knowing about the switch.
+        val motionBuf = cachedMotionBuf
         val tJniStart = System.nanoTime()
-        val success = NativeEngine.interpolateFrameBuffers(
+        var motionReady = false
+        if (motionBuf != null && outputRenderer?.isWarpInitialized == true) {
+            motionReady = NativeEngine.computeMotionField(
+                src0Buf,
+                src1Buf,
+                rifeInputW,
+                rifeInputH,
+                rifeOutputW,
+                rifeOutputH,
+                motionBuf
+            )
+        }
+        val success = motionReady || NativeEngine.interpolateFrameBuffers(
             src0Buf,
             src1Buf,
             rifeInputW,
@@ -1385,25 +1418,53 @@ class VideoFrameProcessor(
         lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
 
         if (success) {
-            // The native code wrote requiredOutputBytes of RGBA through the direct address and never
-            // touched the Java ByteBuffer position, so the readable range is established here rather
-            // than with flip(): position 0, limit = requiredOutputBytes. That is exactly what
-            // renderBufferToOutput() -> GlOutputRenderer.render() needs.
-            outBuf.position(0)
-            outBuf.limit(requiredOutputBytes.toInt())
-
-            if (VERBOSE_DIAGNOSTICS) {
-                val tChecksumStart = System.nanoTime()
-                val rifeOutputChecksum = calculateChecksum(outBuf, rifeOutputW, rifeOutputH)
-                nsChecksum += System.nanoTime() - tChecksumStart
-                Log.d(TAG, "PIPELINE CHECKSUM: after RIFE ${rifeOutputW}x${rifeOutputH} checksum=$rifeOutputChecksum")
-            }
-
             // Temporal order: previous frame was already rendered when it was captured (or as the
             // first frame), so we only render the interpolated frame and the next frame.
             // Sequence: A, M(A,B), B, M(B,C), C — correct 2x interpolation without duplication.
             val tRenderStart = System.nanoTime()
-            renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
+            var presented = false
+            if (motionReady && motionBuf != null) {
+                presented = outputRenderer?.renderWarp(
+                    src0Buf,
+                    src1Buf,
+                    motionBuf,
+                    rifeInputW,
+                    rifeInputH,
+                    rifeOutputW,
+                    rifeOutputH,
+                    0.5f
+                ) == true
+            }
+            if (!presented) {
+                // The shader refused the frame, or the CPU path ran. Redo it on the CPU so the
+                // pair still produces a picture: a failure here costs time, never a frame.
+                if (motionReady) {
+                    NativeEngine.interpolateFrameBuffers(
+                        src0Buf,
+                        src1Buf,
+                        rifeInputW,
+                        rifeInputH,
+                        rifeOutputW,
+                        rifeOutputH,
+                        0.5f,
+                        outBuf
+                    )
+                }
+                // Native wrote requiredOutputBytes of RGBA through the direct address without
+                // touching the Java position, so the readable range is established here rather
+                // than with flip(): position 0, limit = requiredOutputBytes.
+                outBuf.position(0)
+                outBuf.limit(requiredOutputBytes.toInt())
+
+                if (VERBOSE_DIAGNOSTICS) {
+                    val tChecksumStart = System.nanoTime()
+                    val rifeOutputChecksum = calculateChecksum(outBuf, rifeOutputW, rifeOutputH)
+                    nsChecksum += System.nanoTime() - tChecksumStart
+                    Log.d(TAG, "PIPELINE CHECKSUM: after interpolation ${rifeOutputW}x$rifeOutputH checksum=$rifeOutputChecksum")
+                }
+
+                renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
+            }
             renderFrameToOutput(nextFrame)
             nsRender += System.nanoTime() - tRenderStart
             frameCountOutput += 2
@@ -1496,7 +1557,12 @@ class VideoFrameProcessor(
      * Allocates the reusable direct buffers used by the JNI stage, keeping one allocation per size
      * change instead of one per frame.
      */
-    private fun ensureCachedBuffers(requiredInputBytes: Long, requiredOutputBytes: Long): Boolean {
+    private fun ensureCachedBuffers(
+        requiredInputBytes: Long,
+        requiredOutputBytes: Long,
+        inputWidth: Int,
+        inputHeight: Int
+    ): Boolean {
         if (requiredInputBytes <= 0 || requiredOutputBytes <= 0) {
             return false
         }
@@ -1506,16 +1572,28 @@ class VideoFrameProcessor(
             return false
         }
         val requiredBytesInt = requiredBytes.toInt()
+        val gridW = (inputWidth + 15) / 16
+        val gridH = (inputHeight + 15) / 16
+        val motionBytes = gridW.toLong() * gridH.toLong() * 4L
+        if (motionBytes > Int.MAX_VALUE) {
+            Log.e(TAG, "ensureCachedBuffers: motion field $motionBytes overflows Int")
+            return false
+        }
         if (cachedIn0Buf == null || cachedIn1Buf == null || cachedDenoised0Buf == null ||
-            cachedDenoised1Buf == null || cachedOutBuf == null || cachedTargetSize != requiredBytesInt
+            cachedDenoised1Buf == null || cachedOutBuf == null || cachedMotionBuf == null ||
+            cachedTargetSize != requiredBytesInt
         ) {
             cachedIn0Buf = ByteBuffer.allocateDirect(requiredBytesInt)
             cachedIn1Buf = ByteBuffer.allocateDirect(requiredBytesInt)
             cachedDenoised0Buf = ByteBuffer.allocateDirect(requiredBytesInt)
             cachedDenoised1Buf = ByteBuffer.allocateDirect(requiredBytesInt)
             cachedOutBuf = ByteBuffer.allocateDirect(requiredBytesInt)
+            cachedMotionBuf = ByteBuffer.allocateDirect(motionBytes.toInt())
             cachedTargetSize = requiredBytesInt
-            Log.i(TAG, "Allocated RIFE buffers ($requiredBytesInt bytes each)")
+            Log.i(
+                TAG,
+                "Allocated RIFE buffers ($requiredBytesInt bytes each, motion field $motionBytes bytes)"
+            )
         }
         return true
     }
