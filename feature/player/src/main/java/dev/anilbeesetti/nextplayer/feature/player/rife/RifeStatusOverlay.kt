@@ -40,6 +40,7 @@ fun RifeStatusOverlay(
         modifier = modifier,
     ) {
         val resolutionName = when (resolution) {
+            RifeResolution.AUTO -> "Auto"
             RifeResolution.ORIGINAL -> "Original"
             RifeResolution.RES_1080P -> "1080p"
             RifeResolution.RES_720P -> "720p"

@@ -528,6 +528,7 @@
     <string name="processing_resolution">Processing Resolution</string>
     <string name="fastdvdnet">FastDVDnet</string>
     <string name="fastdvdnet_description">Pre-processing stage (scaffold: frames pass through)</string>
+    <string name="rife_resolution_auto">Auto (engine decides)</string>
     <string name="rife_resolution_original">Original</string>
     <string name="rife_resolution_1080p">1080p</string>
     <string name="rife_resolution_720p">720p</string>

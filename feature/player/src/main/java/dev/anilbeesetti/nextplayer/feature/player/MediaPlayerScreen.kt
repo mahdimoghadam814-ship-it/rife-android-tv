@@ -313,6 +313,7 @@ private fun MediaPlayerContentPreview() {
 }
 
 private fun RifeResolutionSetting.toRifeResolution(): RifeResolution = when (this) {
+    RifeResolutionSetting.AUTO -> RifeResolution.AUTO
     RifeResolutionSetting.ORIGINAL -> RifeResolution.ORIGINAL
     RifeResolutionSetting.RES_1080P -> RifeResolution.RES_1080P
     RifeResolutionSetting.RES_720P -> RifeResolution.RES_720P

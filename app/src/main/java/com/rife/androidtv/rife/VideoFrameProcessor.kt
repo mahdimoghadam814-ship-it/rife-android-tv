@@ -256,6 +256,37 @@ class VideoFrameProcessor(
     private var lastDimsLogH = 0
 
     /**
+     * Adaptive processing resolution (RifeResolution.AUTO).
+     *
+     * [autoDegradeLevel] indexes [autoDegradeLadder] and only ever moves down, so a source that
+     * cannot be held at native resolution settles instead of flapping between two sizes every
+     * reporting window. [autoDenoiseBranch] records which AUTO branch picked the current size: only
+     * the native-4K-denoiser branch is allowed to degrade, because the other two are fixed by
+     * policy and hiding their cost behind a downgrade would mask exactly the work needed to make
+     * them fit. [autoCaptureW]/[autoCaptureH] are the size that branch last asked for, so the
+     * downgrade is logged with what it cost.
+     */
+    private var autoDegradeLevel = 0
+    private var autoDenoiseBranch = false
+    private var autoCaptureW = 0
+    private var autoCaptureH = 0
+
+    /**
+     * Source frame interval in nanoseconds, taken from the decoder timestamps of the pair being
+     * processed. This is the budget the AUTO policy has to fit inside to hold the native frame
+     * rate, and it is measured rather than configured because the source is what defines it. Zero
+     * until the first pair, and rejected outside [1ms, 1s] so a seek cannot set a nonsense one.
+     */
+    private var sourceIntervalNs = 0L
+
+    /** Dimensions and mode of the last RES POLICY breadcrumb, so it is written on change only. */
+    private var lastCaptureLogSrcW = -1
+    private var lastCaptureLogSrcH = -1
+    private var lastCaptureLogW = 0
+    private var lastCaptureLogH = 0
+    private var lastCaptureLogRes: RifeResolution? = null
+
+    /**
      * GL blitter for the output surface. Replaces the previous `lockCanvas()` + `drawBitmap()`
      * path, which rasterised three full-screen bitmaps per interpolated pair on the CPU and was
      * one of the dominant costs on the TV box.
@@ -797,6 +828,18 @@ class VideoFrameProcessor(
         lastStatsResetTime = SystemClock.elapsedRealtime()
         lastProcTimeMs = 0L
 
+        // A new stream gets a fresh chance at its native AUTO resolution, and the capture breadcrumb
+        // is cleared so the RES POLICY line is printed again for the new source.
+        autoDegradeLevel = 0
+        autoDenoiseBranch = false
+        autoCaptureW = 0
+        autoCaptureH = 0
+        lastCaptureLogSrcW = -1
+        lastCaptureLogSrcH = -1
+        lastCaptureLogW = 0
+        lastCaptureLogH = 0
+        lastCaptureLogRes = null
+
         Log.i(TAG, "resetPipeline: reason=$reason discardedFrames=$discarded")
     }
 
@@ -1156,9 +1199,32 @@ class VideoFrameProcessor(
         }
 
         // The readback size is the source size scaled to the configured resolution; the aspect
-        // ratio of the source is preserved, so the frame is never stretched.
-        val (captureWidth, captureHeight) =
-            calculateTargetDimensions(sourceWidth, sourceHeight, resolution)
+        // ratio of the source is preserved, so the frame is never stretched. This is also where
+        // an AUTO source gets downgraded, and where any capture is clamped to the output surface.
+        val (captureWidth, captureHeight) = resolveCaptureDimensions(sourceWidth, sourceHeight)
+        autoCaptureW = captureWidth
+        autoCaptureH = captureHeight
+
+        if (sourceWidth != lastCaptureLogSrcW ||
+            sourceHeight != lastCaptureLogSrcH ||
+            captureWidth != lastCaptureLogW ||
+            captureHeight != lastCaptureLogH ||
+            resolution != lastCaptureLogRes
+        ) {
+            lastCaptureLogSrcW = sourceWidth
+            lastCaptureLogSrcH = sourceHeight
+            lastCaptureLogW = captureWidth
+            lastCaptureLogH = captureHeight
+            lastCaptureLogRes = resolution
+            Log.i(
+                TAG,
+                "RES POLICY: src=${sourceWidth}x$sourceHeight " +
+                    "surface=${outputRenderer?.outputSurfaceWidth ?: 0}x" +
+                    "${outputRenderer?.outputSurfaceHeight ?: 0} " +
+                    "res=$resolution memc=$isRifeEnabled denoise=$isDenoiseEnabled " +
+                    "-> capture=${captureWidth}x$captureHeight level=$autoDegradeLevel"
+            )
+        }
 
         if (VERBOSE_DIAGNOSTICS) {
             Log.d(
@@ -1243,6 +1309,12 @@ class VideoFrameProcessor(
             previousFrame = nextFrame
             updateStats()
             return
+        }
+
+        // Native-rate budget for the AUTO policy, straight from the source timestamps.
+        val srcIntervalUs = nextFrame.timestampUs - prev.timestampUs
+        if (srcIntervalUs in 1_000L..1_000_000L) {
+            sourceIntervalNs = srcIntervalUs * 1_000L
         }
 
         val rifeInputW = nextFrame.width
@@ -1518,6 +1590,24 @@ class VideoFrameProcessor(
         val renderCalls = renderBreakdown[5]
         val dropped = droppedFrameCount - droppedAtWindowStart
         val captured = frameCountInput - capturedAtWindowStart
+
+        // The AUTO policy's native-4K-denoiser branch only keeps its resolution while the native
+        // frame rate holds. One dropped frame in the window is the signal: step down once and log
+        // it, so playback recovers instead of stuttering for the rest of the stream.
+        if (autoDenoiseBranch && autoDegradeLevel < autoDegradeLadder.lastIndex) {
+            val cycleNs = nsPair / n
+            val overBudget = sourceIntervalNs > 0L && cycleNs > sourceIntervalNs.toDouble()
+            if (dropped > 0 || overBudget) {
+                autoDegradeLevel++
+                Log.w(
+                    TAG,
+                    "RES POLICY: ${autoCaptureW}x$autoCaptureH cannot hold the native rate " +
+                        "(cycle=${fmtMs(cycleNs)} ms, budget=${fmtMs(sourceIntervalNs.toDouble())} ms, " +
+                        "dropped=$dropped), degrading to ${autoDegradeLadder[autoDegradeLevel]}"
+                )
+            }
+        }
+
         Log.i(
             TAG,
             "PIPELINE TIMING: n=$timingCycles " +
@@ -1711,6 +1801,83 @@ class VideoFrameProcessor(
     }
 
     /**
+     * Longest source edge at or above which a frame counts as 4K for the AUTO policy. 3000 covers
+     * UHD (3840) and DCI 4K (4096) while staying clear of 1440p (2560).
+     */
+    private val auto4kMinDim = 3000
+
+    /** Ladder the AUTO policy steps down when its native-resolution branch drops frames. */
+    private val autoDegradeLadder = arrayOf(
+        RifeResolution.ORIGINAL,
+        RifeResolution.RES_1080P,
+        RifeResolution.RES_720P,
+        RifeResolution.RES_480P,
+    )
+
+    /** True when the denoiser stage is on, whichever implementation currently provides it. */
+    private val isDenoiseEnabled: Boolean
+        get() = fastDvdNetEngine.isEnabled
+
+    /**
+     * The processing resolution the engine picks for this source and toggle state (AUTO mode).
+     *
+     *  * below 4K -> the source resolution, untouched, whatever is enabled;
+     *  * 4K with MEMC on -> 1080p. The interpolation cycle has to fit a 41.6 ms budget and 4K is
+     *    four times the pixels; the result is scaled back up into the output surface by the
+     *    present, which is where that upscaling belongs.
+     *  * 4K with only the denoiser -> native 4K. This is the one branch allowed to run at source
+     *    resolution, and therefore the one that steps down [autoDegradeLadder] while frames are
+     *    dropped (see [reportStageTiming]).
+     */
+    private fun autoResolution(srcW: Int, srcH: Int): RifeResolution {
+        if (maxOf(srcW, srcH) < auto4kMinDim) return RifeResolution.ORIGINAL
+        if (isRifeEnabled) return RifeResolution.RES_1080P
+        if (!isDenoiseEnabled) return RifeResolution.ORIGINAL
+        return autoDegradeLadder[autoDegradeLevel.coerceIn(0, autoDegradeLadder.lastIndex)]
+    }
+
+    /**
+     * Capture - and therefore processing - size for a decoded frame: the effective resolution
+     * (explicit setting, or [autoResolution] under AUTO), aspect-preserved, then clamped to the
+     * output surface. The clamp matters because the present scales the result to fit that surface
+     * anyway, so capturing beyond it only buys pixels that get scaled straight back down.
+     */
+    private fun resolveCaptureDimensions(srcW: Int, srcH: Int): Pair<Int, Int> {
+        val effective = if (resolution == RifeResolution.AUTO) autoResolution(srcW, srcH) else resolution
+
+        // Whether this call is the AUTO branch that is allowed to degrade. Recomputed every frame
+        // from the toggles and the source, not from the size that was picked, so the ladder keeps
+        // stepping down after the first downgrade.
+        autoDenoiseBranch = resolution == RifeResolution.AUTO &&
+            !isRifeEnabled &&
+            isDenoiseEnabled &&
+            maxOf(srcW, srcH) >= auto4kMinDim
+
+        if (!autoDenoiseBranch && autoDegradeLevel != 0) {
+            // Left the native-4K-denoiser branch (toggle changed, source changed, mode set
+            // explicitly). The ladder belongs to that branch alone, so it starts over rather than
+            // inheriting a downgrade decided under different conditions.
+            autoDegradeLevel = 0
+        }
+
+        val (targetW, targetH) = calculateTargetDimensions(srcW, srcH, effective)
+        val surfaceW = outputRenderer?.outputSurfaceWidth ?: 0
+        val surfaceH = outputRenderer?.outputSurfaceHeight ?: 0
+        if (surfaceW <= 0 || surfaceH <= 0) return Pair(targetW, targetH)
+        return fitWithin(targetW, targetH, surfaceW, surfaceH)
+    }
+
+    /** Largest size with [w]x[h]'s aspect that fits inside maxW x maxH; unchanged if it already does. */
+    private fun fitWithin(w: Int, h: Int, maxW: Int, maxH: Int): Pair<Int, Int> {
+        if (w <= maxW && h <= maxH) return Pair(w, h)
+        if (w <= 0 || h <= 0) return Pair(w, h)
+        val scale = minOf(maxW.toDouble() / w, maxH.toDouble() / h)
+        val outW = ((w * scale).toLong()).coerceIn(1L, maxW.toLong()).toInt()
+        val outH = ((h * scale).toLong()).coerceIn(1L, maxH.toLong()).toInt()
+        return Pair(outW, outH)
+    }
+
+    /**
      * Maps a source size onto the processing size for [res]. Only the longest edge is clamped, so
      * the source aspect ratio is preserved and no fixed 1920x1080 processing size is imposed.
      */
@@ -1723,6 +1890,12 @@ class VideoFrameProcessor(
         val safeSrcH = srcH.coerceAtLeast(1)
 
         return when (res) {
+            // AUTO is resolved before this is reached (see resolveCaptureDimensions). Handle it
+            // here too so the mapping stays total when called directly; autoResolution() never
+            // returns AUTO, so this cannot recurse.
+            RifeResolution.AUTO ->
+                calculateTargetDimensions(safeSrcW, safeSrcH, autoResolution(safeSrcW, safeSrcH))
+
             RifeResolution.ORIGINAL ->
                 Pair(safeSrcW, safeSrcH)
 
@@ -1773,6 +1946,7 @@ class VideoFrameProcessor(
             val outFps = frameCountOutput / durationSec
 
             val resStr = when (resolution) {
+                RifeResolution.AUTO -> "Auto"
                 RifeResolution.ORIGINAL -> "Original"
                 RifeResolution.RES_1080P -> "1080p"
                 RifeResolution.RES_720P -> "720p"

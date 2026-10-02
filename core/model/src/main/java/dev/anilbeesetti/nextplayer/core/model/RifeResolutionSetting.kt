@@ -7,6 +7,7 @@ import kotlinx.serialization.Serializable
  */
 @Serializable
 enum class RifeResolutionSetting {
+    AUTO,
     ORIGINAL,
     RES_1080P,
     RES_720P,

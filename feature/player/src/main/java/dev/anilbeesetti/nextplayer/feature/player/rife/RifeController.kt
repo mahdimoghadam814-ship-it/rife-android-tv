@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.StateFlow
  * Processing resolutions offered by the Video Processing settings entry.
  */
 enum class RifeResolution {
+    AUTO,
     ORIGINAL,
     RES_1080P,
     RES_720P,

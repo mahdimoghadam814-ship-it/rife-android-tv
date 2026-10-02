@@ -213,6 +213,19 @@ class GlOutputRenderer {
     private var surfaceHeight = 0
 
     /**
+     * The window surface the final present draws into, in pixels. This is the hard ceiling on the
+     * processing resolution: capturing larger than this only buys pixels the present has to scale
+     * straight back down. Zero until the surface exists.
+     *
+     * Read by [VideoFrameProcessor] to clamp its capture size, so it must stay allocation-free.
+     */
+    val outputSurfaceWidth: Int
+        get() = surfaceWidth
+
+    val outputSurfaceHeight: Int
+        get() = surfaceHeight
+
+    /**
      * Accumulated nanoseconds per phase of [render], in order: eglMakeCurrent (+ surface resize),
      * state setup (viewport/uniforms/clear), glTexImage2D upload, attribute setup + glDrawArrays,
      * eglSwapBuffers. [VideoFrameProcessor] drains them into the PIPELINE TIMING line and resets
