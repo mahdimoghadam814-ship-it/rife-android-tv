@@ -45,11 +45,102 @@ static inline int clampi(int v, int lo, int hi) {
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Round half away from zero without pulling in lround() - the per-pixel MC loop
-// would otherwise make millions of libm calls per frame.
-static inline int roundScaled(int32_t mv, float scale) {
-    const float f = static_cast<float>(mv) * scale;
-    return static_cast<int>(f >= 0.0f ? f + 0.5f : f - 0.5f);
+// Floor of v/256 for a signed 1/256-pixel coordinate. Written out rather than left to >>,
+// which C++ leaves implementation-defined for negative operands.
+static inline int floorShift8(int32_t v) {
+    return v >= 0 ? (v >> 8) : -(((-v) + 255) >> 8);
+}
+
+// Round S/16 with round-half-away-from-zero. S is a vector-weighted sum whose denominator is
+// 256 (pitch * pitch), so /16 lands the whole-pixel average on the 1/16 px grid the warp needs.
+static inline int32_t div16r(int32_t v) {
+    return v >= 0 ? (v + 8) >> 4 : -(((-v) + 8) >> 4);
+}
+
+// Maps a pixel coordinate onto the motion-vector grid, which holds one vector per [pitch] pixels
+// anchored at the block centres. Returns the two bracketing grid indices and the weight of the
+// second in 1/pitch units. Within half a block of a frame border the weight is clamped instead
+// of extrapolated, so the outermost vector simply stretches to the edge.
+static inline void mvGridAxis(int pos, int blocks, int pitch, int* i0, int* i1, int* w1) {
+    if (blocks < 2) {
+        *i0 = 0;
+        *i1 = 0;
+        *w1 = 0;
+        return;
+    }
+    int g = (pos - pitch / 2) / pitch;  // truncates toward zero, which is what we want below 0
+    int frac = pos - (g * pitch + pitch / 2);
+    if (g < 0) { g = 0; frac = pos - pitch / 2; }
+    if (g > blocks - 2) g = blocks - 2;
+    if (frac < 0) frac = 0;
+    if (frac > pitch) frac = pitch;
+    *i0 = g;
+    *i1 = g + 1;
+    *w1 = frac;
+}
+
+// One RGBA pixel, zero-extended into the low four lanes of a vector.
+static inline uint8x8_t pixelVec(const uint8_t* p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return vreinterpret_u8_u32(vdup_n_u32(v));
+}
+
+// 4-tap bilinear read of one RGBA pixel at a 1/256-pixel coordinate, returned in the low four
+// lanes of a vector. Both taps clamp at the frame edge, so a sample that drifts outside the
+// picture reuses the border pixel.
+//
+// The horizontal stage is evaluated as  h = P00 * 256 + (P01 - P00) * fx  rather than as
+// P00 * (256 - fx) + P01 * fx, because (256 - fx) can be 256 and therefore does not fit the
+// 8-bit multiplier. Every intermediate of the rewritten form stays under 65536, so the whole
+// stage runs in 16-bit lanes.
+static inline uint8x8_t sampleBilinear(const uint8_t* img, int w, int h,
+                                       int32_t sx, int32_t sy) {
+    const int x0 = floorShift8(sx);
+    const int y0 = floorShift8(sy);
+    const int fx = sx - (x0 << 8);
+    const int fy = sy - (y0 << 8);
+    const int xa = clampi(x0, 0, w - 1);
+    const int xb = clampi(x0 + 1, 0, w - 1);
+    const int ya = clampi(y0, 0, h - 1);
+    const int yb = clampi(y0 + 1, 0, h - 1);
+
+    const uint8_t* rowA = img + (static_cast<size_t>(ya) * w) * 4;
+    const uint8_t* rowB = img + (static_cast<size_t>(yb) * w) * 4;
+
+    // Read each tap with memcpy rather than a uint32_t* cast: the frame is a byte buffer, so a
+    // wider-typed load would violate strict aliasing. Clang folds every call back to one load.
+    const uint8x8_t t0 = pixelVec(rowA + xa * 4);
+    const uint8x8_t t1 = pixelVec(rowA + xb * 4);
+    const uint8x8_t t2 = pixelVec(rowB + xa * 4);
+    const uint8x8_t t3 = pixelVec(rowB + xb * 4);
+
+    const uint16x8_t s0 = vmovl_u8(t0);
+    const uint16x8_t s1 = vmovl_u8(t1);
+    const uint16x8_t s2 = vmovl_u8(t2);
+    const uint16x8_t s3 = vmovl_u8(t3);
+    const uint16x8_t dfx = vdupq_n_u16(static_cast<uint16_t>(fx));
+
+    const uint16x8_t h0 = vaddq_u16(vshlq_n_u16(s0, 8), vmulq_u16(vsubq_u16(s1, s0), dfx));
+    const uint16x8_t h1 = vaddq_u16(vshlq_n_u16(s2, 8), vmulq_u16(vsubq_u16(s3, s2), dfx));
+
+    const uint32x4_t v = vaddq_u32(
+        vmulq_u32(vmovl_u16(vget_low_u16(h0)), vdupq_n_u32(256u - static_cast<uint32_t>(fy))),
+        vmulq_u32(vmovl_u16(vget_low_u16(h1)), vdupq_n_u32(static_cast<uint32_t>(fy))));
+    const uint32x4_t r = vshrq_n_u32(vaddq_u32(v, vdupq_n_u32(32768)), 16);
+
+    return vmovn_u16(vcombine_u16(vmovn_u32(r), vdup_n_u16(0)));
+}
+
+// out = (a * (256 - k) + b * k + 128) >> 8, written as  a * 256 + (b - a) * k + 128  for the
+// same reason as above: k can be 256. The exact result always fits 16 bits, so modular
+// arithmetic in the intermediates is safe.
+static inline uint8x8_t blend256(uint8x8_t a, uint8x8_t b, int k) {
+    const uint16x8_t ua = vmovl_u8(a);
+    const uint16x8_t d = vsubq_u16(vmovl_u8(b), ua);
+    uint16x8_t v = vaddq_u16(vshlq_n_u16(ua, 8), vmulq_u16(d, vdupq_n_u16(static_cast<uint16_t>(k))));
+    v = vshrq_n_u16(vaddq_u16(v, vdupq_n_u16(128)), 8);
+    return vmovn_u16(v);
 }
 
 // CPU time actually consumed by the calling thread, excluding time spent descheduled.
@@ -415,65 +506,83 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     const int bwy = (h + kBlock - 1) / kBlock;
     const float t = timestep;
     const float u = 1.0f - t;
-    // A full block's source window is clamped into [0, dim-16] so the warp is a fully
-    // in-bounds contiguous 16x16 read, which is what makes the NEON path possible. Partial
-    // edge tiles (frame size not a multiple of 16) fall back to per-pixel clamping.
-    const int maxX = w - kBlock;
-    const int maxY = h - kBlock;
+    // Final time blend as a 1/256 weight on in1: (a*(256-k) + b*k + 128) >> 8 is an exact,
+    // division-free lerp. k=128 reproduces the old (a+b+1)>>1 exactly, but the weight now
+    // tracks the timestep instead of being hard-wired to 50/50.
+    const int wt = clampi(static_cast<int>(t * 256.0f + 0.5f), 0, 256);
+    // Vectors are whole pixels. Scaling by 16 puts the interpolated field on a 1/16 px grid, and
+    // one further multiply by the timestep lands on the 1/256 px fixed point the sampler reads.
+    const float ts = t * 16.0f;
+    const float us = u * 16.0f;
+    // Number of distinct bracketing pairs along x: pixels past the last vector reuse it, and a
+    // frame narrower than one block has a single pair covering the whole row.
+    const int ncol = bwx < 2 ? 1 : bwx - 1;
 
-    parallelFor(0, bwy, [&](int r0, int r1) {
-        for (int br = r0; br < r1; br++) {
-            const int y0 = br * kBlock;
-            const int bh = std::min(kBlock, h - y0);
-            for (int bc = 0; bc < bwx; bc++) {
-                const int x0 = bc * kBlock;
-                const int bw = std::min(kBlock, w - x0);
-                const int idx = br * bwx + bc;
+    // Dense per-pixel warp: every output pixel interpolates its own vector from the four nearest
+    // block centres, so motion varies continuously across the frame instead of stepping at block
+    // edges. Each sample is a 4-tap bilinear read, which is what removes the block seams.
+    parallelFor(0, h, [&](int rowBegin, int rowEnd) {
+        for (int y = rowBegin; y < rowEnd; y++) {
+            int iy0, iy1, wy1;
+            mvGridAxis(y, bwy, kBlock, &iy0, &iy1, &wy1);
+            const int wy0 = kBlock - wy1;
+            const int rowA0 = iy0 * bwx;
+            const int rowA1 = iy1 * bwx;
+            const size_t outRow = static_cast<size_t>(y) * w;
 
-                // Flow points forward (where the pixel went), so the sample position is the
-                // requested coordinate traced BACK along it: pa = in0[x - mvf*t],
-                // pb = in1[x - mvb*(1-t)].
-                const int srcAx = x0 - roundScaled(mvf_x[idx], t);
-                const int srcAy = y0 - roundScaled(mvf_y[idx], t);
-                const int srcBx = x0 - roundScaled(mvb_x[idx], u);
-                const int srcBy = y0 - roundScaled(mvb_y[idx], u);
+            for (int bc = 0; bc < ncol; bc++) {
+                const int xStart = (bc == 0) ? 0 : bc * kBlock + kBlock / 2;
+                int xEnd = (bc + 2 >= bwx) ? w : bc * kBlock + kBlock / 2 + kBlock;
+                if (xEnd > w) xEnd = w;
+                if (xEnd <= xStart) continue;
 
-                if (bw == kBlock && bh == kBlock) {
-                    const int ax = clampi(srcAx, 0, maxX);
-                    const int ay = clampi(srcAy, 0, maxY);
-                    const int bx = clampi(srcBx, 0, maxX);
-                    const int by = clampi(srcBy, 0, maxY);
+                const int i00 = rowA0 + bc;
+                const int i01 = (bwx < 2) ? i00 : i00 + 1;
+                const int i10 = rowA1 + bc;
+                const int i11 = (bwx < 2) ? i10 : i10 + 1;
 
-                    for (int i = 0; i < kBlock; i++) {
-                        const uint8_t* pa = in0 + (static_cast<size_t>(ay + i) * w + ax) * 4;
-                        const uint8_t* pb = in1 + (static_cast<size_t>(by + i) * w + bx) * 4;
-                        uint8_t* po = out + (static_cast<size_t>(y0 + i) * w + x0) * 4;
-                        for (int k = 0; k < kBlock * 4; k += 16) {
-                            // vrhaddq = rounding halving add, i.e. (a + b + 1) >> 1
-                            vst1q_u8(po + k, vrhaddq_u8(vld1q_u8(pa + k), vld1q_u8(pb + k)));
-                        }
-                        // Sources come from an opaque EGL readback so the average is already
-                        // 255, but force it to match RifeEngine's alpha=255 contract exactly.
-                        for (int k = 0; k < kBlock; k++) po[k * 4 + 3] = 255;
-                    }
-                } else {
-                    for (int i = 0; i < bh; i++) {
-                        const size_t dy = static_cast<size_t>(y0 + i);
-                        for (int j = 0; j < bw; j++) {
-                            const int dx = x0 + j;
-                            const uint8_t* pa = in0 +
-                                (static_cast<size_t>(clampi(srcAy + i, 0, h - 1)) * w +
-                                 static_cast<size_t>(clampi(srcAx + j, 0, w - 1))) * 4;
-                            const uint8_t* pb = in1 +
-                                (static_cast<size_t>(clampi(srcBy + i, 0, h - 1)) * w +
-                                 static_cast<size_t>(clampi(srcBx + j, 0, w - 1))) * 4;
-                            uint8_t* po = out + (dy * w + static_cast<size_t>(dx)) * 4;
-                            for (int c = 0; c < 3; c++) {
-                                po[c] = static_cast<uint8_t>((pa[c] + pb[c]) >> 1);
-                            }
-                            po[3] = 255;
-                        }
-                    }
+                // Fold the y-axis weight into the vectors once per (row, column), so the inner
+                // loop needs two multiplies per vector instead of four. The result is the vector
+                // sum in units of whole pixels * (wy0 + wy1); div16r() then divides out the
+                // remaining pitch factor and rounds onto the 1/16 px grid.
+                const int32_t p0fx = mvf_x[i00] * wy0 + mvf_x[i10] * wy1;
+                const int32_t p1fx = mvf_x[i01] * wy0 + mvf_x[i11] * wy1;
+                const int32_t p0fy = mvf_y[i00] * wy0 + mvf_y[i10] * wy1;
+                const int32_t p1fy = mvf_y[i01] * wy0 + mvf_y[i11] * wy1;
+                const int32_t p0bx = mvb_x[i00] * wy0 + mvb_x[i10] * wy1;
+                const int32_t p1bx = mvb_x[i01] * wy0 + mvb_x[i11] * wy1;
+                const int32_t p0by = mvb_y[i00] * wy0 + mvb_y[i10] * wy1;
+                const int32_t p1by = mvb_y[i01] * wy0 + mvb_y[i11] * wy1;
+                const int baseX = bc * kBlock + kBlock / 2;
+
+                for (int x = xStart; x < xEnd; x++) {
+                    int wx1 = x - baseX;
+                    if (wx1 < 0) wx1 = 0;
+                    if (wx1 > kBlock) wx1 = kBlock;
+                    const int wx0 = kBlock - wx1;
+
+                    const int32_t fxi = div16r(p0fx * wx0 + p1fx * wx1);
+                    const int32_t fyi = div16r(p0fy * wx0 + p1fy * wx1);
+                    const int32_t bxi = div16r(p0bx * wx0 + p1bx * wx1);
+                    const int32_t byi = div16r(p0by * wx0 + p1by * wx1);
+
+                    // Flow points forward (where the pixel went), so the sample position is
+                    // traced back along it: pa = in0[x - mvf*t], pb = in1[x - mvb*(1-t)].
+                    const int32_t ax = (x << 8) - static_cast<int32_t>(fxi * ts + (fxi >= 0 ? 0.5f : -0.5f));
+                    const int32_t ay = (y << 8) - static_cast<int32_t>(fyi * ts + (fyi >= 0 ? 0.5f : -0.5f));
+                    const int32_t bx = (x << 8) - static_cast<int32_t>(bxi * us + (bxi >= 0 ? 0.5f : -0.5f));
+                    const int32_t by = (y << 8) - static_cast<int32_t>(byi * us + (byi >= 0 ? 0.5f : -0.5f));
+
+                    const uint8x8_t ca = sampleBilinear(in0, w, h, ax, ay);
+                    const uint8x8_t cb = sampleBilinear(in1, w, h, bx, by);
+
+                    uint32_t px = 0;
+                    vst1_lane_u32(&px, vreinterpret_u32_u8(blend256(ca, cb, wt)), 0);
+                    // Sources come from an opaque EGL readback, but force alpha to match
+                    // RifeEngine's 255 contract exactly.
+                    uint32_t* po = reinterpret_cast<uint32_t*>(
+                        out + (outRow + static_cast<size_t>(x)) * 4);
+                    *po = px | 0xFF000000u;
                 }
             }
         }
