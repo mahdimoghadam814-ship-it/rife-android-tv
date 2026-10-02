@@ -2,6 +2,18 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project("rife_native")
 
+# Gradle's "debug" variant -- the only variant CI builds -- passes
+# -DCMAKE_BUILD_TYPE=Debug, and for Clang Debug is just "-g": there is no -O flag.
+# Every target below, ncnn included, was therefore compiling at -O0. Measured cost:
+# the identical sources built with -O2 outside Gradle ran 14-26x faster on the same
+# phone (sad16x16 was still an out-of-line call, and the .so carried 44 MB of
+# .debug_info). Appended after project() so the NDK toolchain has already run and
+# cannot clobber it, and as a base flag rather than a per-config override so it
+# applies even if Gradle leaves CMAKE_BUILD_TYPE unset. -g from the Debug config
+# still follows, so debuggable builds keep their symbols.
+set(CMAKE_C_FLAGS   "${CMAKE_C_FLAGS} -O2")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
+
 # Configure ncnn options
 set(NCNN_VULKAN ON CACHE BOOL "" FORCE)
 set(NCNN_SYSTEM_GLSLANG OFF CACHE BOOL "" FORCE)
