@@ -69,9 +69,14 @@ static inline void mvGridAxis(int pos, int blocks, int pitch, int* i0, int* i1, 
         return;
     }
     int g = (pos - pitch / 2) / pitch;  // truncates toward zero, which is what we want below 0
-    int frac = pos - (g * pitch + pitch / 2);
-    if (g < 0) { g = 0; frac = pos - pitch / 2; }
+    if (g < 0) g = 0;
     if (g > blocks - 2) g = blocks - 2;
+    // frac is measured from the clamped bracket, not from the bracket the raw index landed in.
+    // The last pitch/2 pixels of the frame sit past the final block centre, and measuring them
+    // from the discarded index made them interpolate half-way back into the previous block -
+    // a visible seam along the bottom and right edges. This also reproduces the clamp-to-edge
+    // bilinear the GPU shader uses, so both paths sample the same vector.
+    int frac = pos - (g * pitch + pitch / 2);
     if (frac < 0) frac = 0;
     if (frac > pitch) frac = pitch;
     *i0 = g;
