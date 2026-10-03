@@ -359,6 +359,8 @@ class VideoFrameProcessor(
      * matching transfer curve. Read on the worker thread only.
      */
     private var outputDataSpace: Int = 0
+    /** Set once the GPU warp has refused a pair, so the fallback is reported without spamming. */
+    private var warnedGpuWarpFallback = false
 
     @Volatile
     private var inputWidth = 0
@@ -770,9 +772,20 @@ class VideoFrameProcessor(
         val surface = pendingOutputSurfaceInfo?.surface
         if (surface == null || !surface.isValid) return
         val rc = NativeEngine.setOutputDataSpace(surface, outputDataSpace)
-        if (rc != 0) {
-            Log.w(TAG, "setOutputDataSpace($outputDataSpace) failed: rc=$rc")
+        when {
+            rc == 0 && outputDataSpace != 0 ->
+                Log.i(TAG, "Output dataspace tagged: $outputDataSpace")
+            rc == 0 -> Unit
+            else -> Log.w(TAG, "setOutputDataSpace($outputDataSpace) failed: ${dataSpaceError(rc)}")
         }
+    }
+
+    /** Turns the JNI stage's failure code back into something readable in a log line. */
+    private fun dataSpaceError(rc: Int): String = when (rc) {
+        -1001 -> "rc=-1001 (null surface)"
+        -1002 -> "rc=-1002 (null window)"
+        -1003 -> "rc=-1003 (ANativeWindow_setBuffersDataSpace not resolvable)"
+        else -> "rc=$rc"
     }
 
     /**
@@ -1754,6 +1767,15 @@ class VideoFrameProcessor(
                 // Every point gets its own CPU interpolation: `success` only ever filled outBuf
                 // for the one timestep the GPU path was asked about, so reusing it would put the
                 // same midpoint on screen more than once at a level above 2x.
+                if (!warnedGpuWarpFallback) {
+                    warnedGpuWarpFallback = true
+                    Log.w(
+                        TAG,
+                        "GPU warp refused the pair (motionReady=$motionReady " +
+                            "timesteps=${intermediate.size}); falling back to the CPU " +
+                            "interpolator, which resamples per block and will show as blocks"
+                    )
+                }
                 for (t in intermediate) {
                     NativeEngine.interpolateFrameBuffers(
                         src0Buf,

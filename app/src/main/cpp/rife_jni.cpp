@@ -101,6 +101,13 @@ Java_com_rife_androidtv_NativeEngine_getMemcLastDurationMs(JNIEnv* env, jclass c
     return static_cast<jdouble>(g_memc.lastDurationMs());
 }
 
+// Failure codes for setOutputDataSpace(). Deliberately outside the -1..-38 range any status_t
+// the platform can return, so a zero means the panel took the value, a small negative means it
+// refused it, and one of these three means we never got as far as asking.
+static constexpr jint kNullSurface = -1001;
+static constexpr jint kNullWindow = -1002;
+static constexpr jint kSymbolMissing = -1003;
+
 // The processed frames are blitted into a plain RGBA8888 window, which the display stack
 // otherwise treats as SDR no matter what the source was: PQ/HLG code values get shown through an
 // sRGB transfer curve and the picture comes out flat and milky. Tagging the buffers is what makes
@@ -109,24 +116,47 @@ Java_com_rife_androidtv_NativeEngine_getMemcLastDurationMs(JNIEnv* env, jclass c
 //
 // ANativeWindow_setBuffersDataSpace() only exists from API 28 while minSdk is 24, so it is
 // resolved lazily instead of called directly: a direct reference would not link on the devices
-// the app still installs on, and a distinct return code when it is missing is more useful to the
-// caller than a silent no-op.
+// the app still installs on.
+//
+// Resolving it through RTLD_DEFAULT alone is not enough. The symbol is no longer exported by
+// libandroid.so - the native window implementation lives in libnativewindow.so, and
+// RTLD_DEFAULT only walks the default namespace's global group, which is where libandroid
+// itself sits, not where this symbol was left. The lookup therefore asks the owning library
+// directly and falls back to the ambient scope. Nothing here can fail silently: every stage
+// returns a distinct code far enough from any status_t the platform can produce that the
+// caller can tell "the symbol is missing" from "the surface refused the value".
 static jint setBuffersDataSpaceCompat(ANativeWindow* window, int32_t dataSpace) {
     using Setter = int32_t (*)(ANativeWindow*, int32_t);
     static Setter setter = [] {
-        return reinterpret_cast<Setter>(
-            dlsym(RTLD_DEFAULT, "ANativeWindow_setBuffersDataSpace"));
+        static const char* const kName = "ANativeWindow_setBuffersDataSpace";
+        // RTLD_NOLOAD first: if the library is already resident its handle comes back without a
+        // path search, which keeps this working on the linker namespaces that refuse to open a
+        // second copy by name.
+        static const char* const kLibraries[] = {"libnativewindow.so", "libandroid.so"};
+        for (const char* library : kLibraries) {
+            void* handle = dlopen(library, RTLD_NOW | RTLD_NOLOAD);
+            if (handle == nullptr) {
+                handle = dlopen(library, RTLD_NOW);
+            }
+            if (handle == nullptr) {
+                continue;
+            }
+            if (void* symbol = dlsym(handle, kName)) {
+                return reinterpret_cast<Setter>(symbol);
+            }
+        }
+        return reinterpret_cast<Setter>(dlsym(RTLD_DEFAULT, kName));
     }();
-    if (setter == nullptr) return -3;
+    if (setter == nullptr) return kSymbolMissing;
     return static_cast<jint>(setter(window, dataSpace));
 }
 
 extern "C" JNIEXPORT jint JNICALL
 Java_com_rife_androidtv_NativeEngine_setOutputDataSpace(
     JNIEnv* env, jclass clazz, jobject surface, jint dataSpace) {
-    if (surface == nullptr) return -1;
+    if (surface == nullptr) return kNullSurface;
     ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
-    if (window == nullptr) return -2;
+    if (window == nullptr) return kNullWindow;
     const jint rc = setBuffersDataSpaceCompat(window, static_cast<int32_t>(dataSpace));
     ANativeWindow_release(window);
     return rc;

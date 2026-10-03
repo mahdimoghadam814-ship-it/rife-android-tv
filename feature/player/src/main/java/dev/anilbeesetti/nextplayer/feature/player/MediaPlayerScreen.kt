@@ -1,5 +1,6 @@
 package dev.anilbeesetti.nextplayer.feature.player
 
+import android.util.Log
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
@@ -190,7 +191,11 @@ internal fun MediaPlayerContent(
     DisposableEffect(player) {
         val listener = object : Player.Listener {
             override fun onTracksChanged(tracks: Tracks) {
-                outputDataSpace = tracks.outputDataSpace()
+                val detected = tracks.outputDataSpace()
+                if (detected != outputDataSpace) {
+                    Log.i(TAG, "Source output dataspace: $detected")
+                }
+                outputDataSpace = detected
             }
         }
         player.addListener(listener)
@@ -349,23 +354,36 @@ private fun RifeResolutionSetting.toRifeResolution(): RifeResolution = when (thi
     RifeResolutionSetting.RES_480P -> RifeResolution.RES_480P
 }
 
+private const val TAG = "MediaPlayerScreen"
+
 /**
  * Dataspace the processed output must carry for this track list: BT.2020 PQ for an HDR10 source,
  * BT.2020 HLG for an HLG one, and `0` (UNKNOWN) for SDR so the platform default is left alone.
  *
  * The two numbers are `android.hardware.DataSpace.DATASPACE_BT2020_HLG/PQ` written out rather
  * than referenced, so nothing depends on that class being present at runtime below API 34.
+ *
+ * The result is logged because a container that never publishes a `ColorInfo` leaves this at 0
+ * just like an SDR one, and the only way to tell those two apart from a log is to see that the
+ * colour metadata was there at all.
  */
 private fun Tracks.outputDataSpace(): Int {
+    var sawColorInfo = false
     for (group in groups) {
         for (index in 0 until group.length) {
             val colorInfo = group.getTrackFormat(index).colorInfo ?: continue
+            sawColorInfo = true
             if (!ColorInfo.isTransferHdr(colorInfo)) continue
-            return when (colorInfo.colorTransfer) {
+            val dataSpace = when (colorInfo.colorTransfer) {
                 C.COLOR_TRANSFER_HLG -> 168165376 // DataSpace.DATASPACE_BT2020_HLG
                 else -> 163971072 // DataSpace.DATASPACE_BT2020_PQ
             }
+            Log.i(TAG, "HDR transfer=${colorInfo.colorTransfer} -> dataspace=$dataSpace")
+            return dataSpace
         }
+    }
+    if (sawColorInfo) {
+        Log.i(TAG, "Colour metadata present but no HDR transfer; leaving dataspace unknown")
     }
     return 0 // DataSpace.DATASPACE_UNKNOWN
 }
