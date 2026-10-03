@@ -79,6 +79,9 @@ internal object GpuMeProbe {
     /** Elements the compute probe writes and reads back: 10, 20, 30, 40. */
     private const val COMPUTE_PROBE_ELEMENTS = 4
 
+    /** Square work-group edge for the compute throughput bench; 64 invocations per group. */
+    private const val LOCAL_SIZE = 8
+
     private var attempted = false
 
     private val vertexBuffer: FloatBuffer = ByteBuffer
@@ -111,29 +114,36 @@ internal object GpuMeProbe {
             val es = logCapabilities()
             val compute = probeCompute(es)
             Log.i(TAG, "compute=${if (compute) "YES" else "NO"}")
-            if (!compute) {
-                Log.i(TAG, "GPU ME bench: unavailable (compute dispatch failed)")
-                return
-            }
-            val gtex = measureFetchThroughput()
-            val gops = measureAluThroughput()
+            val gtex = bench("fetch") { measureFetchThroughput() }
+            val fragmentGops = bench("alu-fragment") { measureAluThroughput() }
+            val computeGops = bench("alu-compute") { measureComputeAluThroughput() }
+            val gops = if (computeGops > 0.0) computeGops else fragmentGops
+            val used = if (computeGops > 0.0) "compute" else "fragment"
             Log.i(
                 TAG,
-                ("throughput gtex=%.2f Gtex/s gops=%.2f Gops/s " +
-                    "(%d fragments x %d iters, %d fetches, %d alu ops)")
+                ("throughput bench=$used gtex=%.2f Gtex/s gops=%.2f Gops/s " +
+                    "fragmentGops=%.2f (%d fragments x %d iters, %d fetches, %d alu ops)")
                     .format(
                         gtex,
                         gops,
+                        fragmentGops,
                         BENCH_W.toLong() * BENCH_H,
                         BENCH_ITERS,
                         BENCH_W.toLong() * BENCH_H * BENCH_ITERS * FETCHES_PER_ITER,
                         BENCH_W.toLong() * BENCH_H * BENCH_ITERS * ALU_OPS_PER_ITER
                     )
             )
-            reportEstimate(gtex, gops)
+            reportEstimate(gtex, gops, used)
         } catch (t: Throwable) {
             Log.w(TAG, "GPU ME bench: unavailable (${t.javaClass.simpleName}: ${t.message})")
         }
+    }
+
+    private fun bench(name: String, block: () -> Double): Double = try {
+        block()
+    } catch (t: Throwable) {
+        Log.i(TAG, "$name bench: unavailable (${t.javaClass.simpleName}: ${t.message})")
+        0.0
     }
 
     /** Logs the context identity and the compute limits the GPU ME design depends on. */
@@ -153,6 +163,8 @@ internal object GpuMeProbe {
                 TAG,
                 "GL compute: workGroupMax=${query3(GLES31.GL_MAX_COMPUTE_WORK_GROUP_SIZE)} " +
                     "workGroupCount=${query3(GLES31.GL_MAX_COMPUTE_WORK_GROUP_COUNT)} " +
+                    "invocations=${queryInt(GLES31.GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS)} " +
+                    "ssboBindings=${queryInt(GLES31.GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS)} " +
                     "sharedMemory=${queryInt(GLES31.GL_MAX_COMPUTE_SHARED_MEMORY_SIZE)}"
             )
         }
@@ -173,6 +185,7 @@ internal object GpuMeProbe {
      */
     private fun probeCompute(es: Float): Boolean {
         if (es < 3.1f) {
+            Log.i(TAG, "compute probe: skipped, GLES $es does not report 3.1")
             return false
         }
         var program = 0
@@ -183,12 +196,15 @@ internal object GpuMeProbe {
             }
             val shader = GLES20.glCreateShader(GLES31.GL_COMPUTE_SHADER)
             if (shader == 0) {
+                Log.i(TAG, "compute probe: glCreateShader failed, gl=0x${GLES20.glGetError().toString(16)}")
                 return false
             }
             GLES20.glShaderSource(shader, COMPUTE_PROBE_SRC)
             GLES20.glCompileShader(shader)
             if (!shaderCompiled(shader)) {
+                val log = GLES20.glGetShaderInfoLog(shader) ?: ""
                 GLES20.glDeleteShader(shader)
+                Log.i(TAG, "compute probe: compile failed: $log")
                 return false
             }
             program = GLES20.glCreateProgram()
@@ -198,8 +214,10 @@ internal object GpuMeProbe {
             val linked = IntArray(1)
             GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linked, 0)
             if (linked[0] != GLES20.GL_TRUE) {
+                val log = GLES20.glGetProgramInfoLog(program) ?: ""
                 GLES20.glDeleteProgram(program)
                 program = 0
+                Log.i(TAG, "compute probe: link failed: $log")
                 return false
             }
 
@@ -209,7 +227,7 @@ internal object GpuMeProbe {
                 GLES31.GL_SHADER_STORAGE_BUFFER, COMPUTE_PROBE_ELEMENTS * 4, null,
                 GLES30.GL_DYNAMIC_COPY
             )
-            GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, buffers[0])
+            bindSsboEverywhere(buffers[0])
             GLES20.glUseProgram(program)
             GLES31.glDispatchCompute(1, 1, 1)
             GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
@@ -233,6 +251,8 @@ internal object GpuMeProbe {
                 first = bytes.getInt(0)
                 third = bytes.getInt(COMPUTE_PROBE_ELEMENTS * 4 - 4)
                 GLES30.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)
+            } else {
+                Log.i(TAG, "compute probe: map failed, mapped=${mapped != null}")
             }
             if (first != 10 || third != 40) {
                 Log.i(TAG, "compute probe: unexpected result first=$first third=$third")
@@ -242,7 +262,7 @@ internal object GpuMeProbe {
         } finally {
             GLES20.glUseProgram(0)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-            GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, 0)
+            clearSsboBindings()
             GLES20.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
             if (buffers[0] != 0) {
                 GLES20.glDeleteBuffers(1, buffers, 0)
@@ -252,6 +272,26 @@ internal object GpuMeProbe {
             }
         }
     }
+
+    /**
+     * The buffer block carries no explicit binding, so its index is whatever the driver assigned.
+     * Occupying every legal binding point removes that as a variable; the bindings are cleared
+     * again by the caller's `finally`.
+     */
+    private fun bindSsboEverywhere(buffer: Int) {
+        for (index in 0 until ssboBindingCount()) {
+            GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, index, buffer)
+        }
+    }
+
+    private fun clearSsboBindings() {
+        for (index in 0 until ssboBindingCount()) {
+            GLES30.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, index, 0)
+        }
+    }
+
+    private fun ssboBindingCount(): Int =
+        queryInt(GLES31.GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS).coerceIn(1, 16)
 
     private fun measureFetchThroughput(): Double {
         val fetches = BENCH_W.toLong() * BENCH_H * BENCH_ITERS * FETCHES_PER_ITER
@@ -265,9 +305,114 @@ internal object GpuMeProbe {
         return ops.toDouble() / (ns / 1_000_000_000.0)
     }
 
-    private fun reportEstimate(gtex: Double, gops: Double) {
+    /**
+     * Same recurrence as [measureAluThroughput] but dispatched as compute, because that is the
+     * shape Build 2 would actually use. The result is read back so a driver cannot discard the
+     * loop as dead work and report a misleadingly fast pass. Returns 0 when the dispatch cannot be
+     * established, having logged why.
+     */
+    private fun measureComputeAluThroughput(): Double {
+        val work = BENCH_W.toLong() * BENCH_H * BENCH_ITERS
+        var program = 0
+        val buffers = IntArray(1)
+        try {
+            while (GLES20.glGetError() != GLES20.GL_NO_ERROR) {
+                // no-op: drain errors left by an earlier stage
+            }
+            val shader = GLES20.glCreateShader(GLES31.GL_COMPUTE_SHADER)
+            if (shader == 0) {
+                Log.i(TAG, "compute alu bench: glCreateShader failed, gl=0x${GLES20.glGetError().toString(16)}")
+                return 0.0
+            }
+            GLES20.glShaderSource(shader, COMPUTE_ALU_SRC)
+            GLES20.glCompileShader(shader)
+            if (!shaderCompiled(shader)) {
+                val log = GLES20.glGetShaderInfoLog(shader) ?: ""
+                GLES20.glDeleteShader(shader)
+                Log.i(TAG, "compute alu bench: compile failed: $log")
+                return 0.0
+            }
+            program = GLES20.glCreateProgram()
+            GLES20.glAttachShader(program, shader)
+            GLES20.glLinkProgram(program)
+            GLES20.glDeleteShader(shader)
+            val linked = IntArray(1)
+            GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linked, 0)
+            if (linked[0] != GLES20.GL_TRUE) {
+                val log = GLES20.glGetProgramInfoLog(program) ?: ""
+                Log.i(TAG, "compute alu bench: link failed: $log")
+                return 0.0
+            }
+
+            GLES20.glGenBuffers(1, buffers, 0)
+            GLES20.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, buffers[0])
+            GLES20.glBufferData(
+                GLES31.GL_SHADER_STORAGE_BUFFER, BENCH_W * BENCH_H * 4, null,
+                GLES30.GL_DYNAMIC_COPY
+            )
+            bindSsboEverywhere(buffers[0])
+            GLES20.glUseProgram(program)
+
+            GLES20.glFinish()
+            var best = Long.MAX_VALUE
+            repeat(BENCH_RUNS) {
+                GLES20.glFinish()
+                val start = System.nanoTime()
+                GLES31.glDispatchCompute(
+                    (BENCH_W + LOCAL_SIZE - 1) / LOCAL_SIZE,
+                    (BENCH_H + LOCAL_SIZE - 1) / LOCAL_SIZE,
+                    1
+                )
+                GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
+                GLES20.glFinish()
+                val elapsed = System.nanoTime() - start
+                if (elapsed in 1 until best) {
+                    best = elapsed
+                }
+            }
+
+            val error = GLES20.glGetError()
+            if (error != GLES20.GL_NO_ERROR) {
+                Log.i(TAG, "compute alu bench: gl error 0x${error.toString(16)}")
+                return 0.0
+            }
+            if (best == Long.MAX_VALUE) {
+                Log.i(TAG, "compute alu bench: no sample")
+                return 0.0
+            }
+
+            GLES20.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, buffers[0])
+            val mapped = GLES30.glMapBufferRange(
+                GLES31.GL_SHADER_STORAGE_BUFFER, 0, 4, GLES30.GL_MAP_READ_BIT
+            )
+            val sample = if (mapped != null && mapped.remaining() >= 4) {
+                val value = (mapped as ByteBuffer).getFloat(0)
+                GLES30.glUnmapBuffer(GLES31.GL_SHADER_STORAGE_BUFFER)
+                value
+            } else {
+                -1.0f
+            }
+            if (!(sample > 0.0f)) {
+                Log.i(TAG, "compute alu bench: output not written, sample=$sample")
+                return 0.0
+            }
+            return (work * ALU_OPS_PER_ITER).toDouble() / (best / 1_000_000_000.0)
+        } finally {
+            GLES20.glUseProgram(0)
+            clearSsboBindings()
+            GLES20.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+            if (buffers[0] != 0) {
+                GLES20.glDeleteBuffers(1, buffers, 0)
+            }
+            if (program != 0) {
+                GLES20.glDeleteProgram(program)
+            }
+        }
+    }
+
+    private fun reportEstimate(gtex: Double, gops: Double, bench: String) {
         if (gtex <= 0.0 || gops <= 0.0) {
-            Log.i(TAG, "GPU ME bench: unavailable (non-positive throughput)")
+            Log.i(TAG, "GPU ME bench: unavailable (bench=$bench gtex=$gtex gops=$gops)")
             return
         }
         val loadMs = ME_GLOBAL_LOADS / gtex * 1000.0
@@ -276,7 +421,7 @@ internal object GpuMeProbe {
         val verdict = if (totalMs <= BUDGET_MS) "PASS" else "FAIL"
         Log.i(
             TAG,
-            ("GPU ME estimate: load=%.1fms alu=%.1fms bidirectional=%.1fms " +
+            ("GPU ME estimate bench=$bench: load=%.1fms alu=%.1fms bidirectional=%.1fms " +
                 "vs %.0fms budget -> %s")
                 .format(loadMs, aluMs, totalMs, BUDGET_MS, verdict)
         )
@@ -457,17 +602,38 @@ internal object GpuMeProbe {
         }
     """
 
-    private val COMPUTE_PROBE_SRC: String = """
-        #version 310 es
-        layout(local_size_x = $COMPUTE_PROBE_ELEMENTS, local_size_y = 1, local_size_z = 1) in;
-        layout(std430, binding = 0) buffer ProbeBuf { int values[]; } probeOut;
-        void main() {
-            uint i = gl_GlobalInvocationID.x;
-            if (i < ${COMPUTE_PROBE_ELEMENTS}u) {
-                probeOut.values[i] = int(i) * 10 + 10;
-            }
-        }
-    """
+    private val COMPUTE_PROBE_SRC: String =
+        "#version 310 es\n" +
+            "layout(local_size_x = $COMPUTE_PROBE_ELEMENTS, local_size_y = 1, local_size_z = 1) in;\n" +
+            "layout(std430) buffer ProbeBuf { int values[]; } probeOut;\n" +
+            "void main() {\n" +
+            "    uint i = gl_GlobalInvocationID.x;\n" +
+            "    if (i < ${COMPUTE_PROBE_ELEMENTS}u) {\n" +
+            "        probeOut.values[i] = int(i) * 10 + 10;\n" +
+            "    }\n" +
+            "}\n"
+
+    private val COMPUTE_ALU_SRC: String =
+        "#version 310 es\n" +
+            "precision highp float;\n" +
+            "precision highp int;\n" +
+            "layout(local_size_x = $LOCAL_SIZE, local_size_y = $LOCAL_SIZE, local_size_z = 1) in;\n" +
+            "layout(std430) buffer AluBuf { float values[]; } aluOut;\n" +
+            "void main() {\n" +
+            "    uvec2 id = gl_GlobalInvocationID.xy;\n" +
+            "    if (id.x >= ${BENCH_W}u || id.y >= ${BENCH_H}u) {\n" +
+            "        return;\n" +
+            "    }\n" +
+            "    float a = fract(float(id.x) * 0.017);\n" +
+            "    float b = fract(float(id.y) * 0.031);\n" +
+            "    float acc = 0.0;\n" +
+            "    for (int i = 0; i < $BENCH_ITERS; i++) {\n" +
+            "        a = fract(a * 1.001 + 0.037 + float(i) * 0.0001);\n" +
+            "        b = fract(b * 1.003 + 0.071 + float(i) * 0.0002);\n" +
+            "        acc += abs(a - b);\n" +
+            "    }\n" +
+            "    aluOut.values[id.y * ${BENCH_W}u + id.x] = acc * 0.01;\n" +
+            "}\n"
 
     private fun parseEsVersion(version: String): Float {
         val match = Regex("""(\d+)\.(\d+)""").find(version) ?: return 0.0f
@@ -482,10 +648,23 @@ internal object GpuMeProbe {
         return out[0]
     }
 
+    /**
+     * Work-group size and count are indexed per dimension, so they answer to `glGetIntegeri_v`;
+     * `glGetIntegerv` on them raises GL_INVALID_ENUM and leaves the caller's zeros untouched.
+     */
     private fun query3(pname: Int): String {
         val out = IntArray(3)
-        GLES20.glGetIntegerv(pname, out, 0)
-        return "${out[0]}x${out[1]}x${out[2]}"
+        for (dimension in 0 until 3) {
+            val single = IntArray(1)
+            GLES30.glGetIntegeri_v(pname, dimension, single, 0)
+            out[dimension] = single[0]
+        }
+        val error = GLES20.glGetError()
+        return if (error != GLES20.GL_NO_ERROR) {
+            "err=0x${error.toString(16)}"
+        } else {
+            "${out[0]}x${out[1]}x${out[2]}"
+        }
     }
 
     private fun shaderCompiled(shader: Int): Boolean {
