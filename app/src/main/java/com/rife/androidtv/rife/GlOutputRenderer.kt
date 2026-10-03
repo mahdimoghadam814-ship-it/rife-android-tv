@@ -443,6 +443,8 @@ class GlOutputRenderer {
         initWarp()
 
         Log.i(TAG, "Output blit program ready (textureId=$textureId, warp=${if (warpProgram != 0) "on" else "off"})")
+
+        GpuMeProbe.run()
     }
 
     /**
