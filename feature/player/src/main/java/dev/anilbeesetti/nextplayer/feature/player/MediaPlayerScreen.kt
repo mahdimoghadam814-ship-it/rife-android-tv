@@ -29,6 +29,7 @@ import androidx.media3.common.C
 import androidx.media3.common.ColorInfo
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
@@ -189,17 +190,28 @@ internal fun MediaPlayerContent(
     // matching dataspace so the panel decodes it as HDR again.
     var outputDataSpace by remember { mutableIntStateOf(0) }
     DisposableEffect(player) {
+        fun publish(detected: Int?, source: String) {
+            // `null` means the player handed over a track list with no video in it yet - the gap
+            // between two items. Treating that as "the source is SDR" is what used to clear the
+            // tag a moment before playback resumed, leaving the replay untagged.
+            if (detected == null || detected == outputDataSpace) return
+            Log.i(TAG, "Source output dataspace ($source): $detected")
+            outputDataSpace = detected
+        }
         val listener = object : Player.Listener {
             override fun onTracksChanged(tracks: Tracks) {
-                val detected = tracks.outputDataSpace()
-                if (detected != outputDataSpace) {
-                    Log.i(TAG, "Source output dataspace: $detected")
-                }
-                outputDataSpace = detected
+                publish(tracks.outputDataSpace(), "tracks")
+            }
+
+            // Tracks are only reported when they change, so a replay that reuses the same track
+            // list never fires onTracksChanged. The video format arriving is a second, independent
+            // signal that the colour metadata is now known.
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                publish(player.currentTracks.outputDataSpace(), "videoSize")
             }
         }
         player.addListener(listener)
-        outputDataSpace = player.currentTracks.outputDataSpace()
+        publish(player.currentTracks.outputDataSpace(), "initial")
         onDispose { player.removeListener(listener) }
     }
     LaunchedEffect(outputDataSpace) {
@@ -244,26 +256,29 @@ internal fun MediaPlayerContent(
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         if (pictureInPictureState != null) {
-            if (!rifeProcessingEnabled) {
-                // Real Next Player surface: normal playback path.
-                PlayerContentFrame(
-                    player = player,
-                    pictureInPictureState = pictureInPictureState,
-                    videoZoomAndContentScaleState = videoZoomAndContentScaleState,
-                    subtitleConfiguration = SubtitleConfiguration(
-                        useSystemCaptionStyle = playerPreferences.useSystemCaptionStyle,
-                        showBackground = playerPreferences.subtitleBackground,
-                        font = playerPreferences.subtitleFont,
-                        textSize = playerPreferences.subtitleTextSize,
-                        textBold = playerPreferences.subtitleTextBold,
-                        applyEmbeddedStyles = playerPreferences.applyEmbeddedStyles,
-                    ),
-                )
-            } else {
-                // Processing path: the decoder renders into the processor input surface and the
-                // processed frames are rendered to this surface instead.
-                RifeOutputView(rifeController)
-            }
+            // Real Next Player surface while nothing is processing. The processing path feeds the
+            // same frame instead of replacing it, so content scale, pinch zoom, subtitles and the
+            // shutter keep working with MEMC or denoise on.
+            PlayerContentFrame(
+                player = player,
+                pictureInPictureState = pictureInPictureState,
+                videoZoomAndContentScaleState = videoZoomAndContentScaleState,
+                subtitleConfiguration = SubtitleConfiguration(
+                    useSystemCaptionStyle = playerPreferences.useSystemCaptionStyle,
+                    showBackground = playerPreferences.subtitleBackground,
+                    font = playerPreferences.subtitleFont,
+                    textSize = playerPreferences.subtitleTextSize,
+                    textBold = playerPreferences.subtitleTextBold,
+                    applyEmbeddedStyles = playerPreferences.applyEmbeddedStyles,
+                ),
+                processingContent = if (rifeProcessingEnabled) {
+                    // The decoder renders into the processor input surface and the processed
+                    // frames are rendered to this surface instead.
+                    { RifeOutputView(rifeController) }
+                } else {
+                    null
+                },
+            )
             if (volumeAndBrightnessGestureState != null) {
                 PlayerGestures(
                     controlsVisibilityState = controlsVisibilityState,
@@ -367,7 +382,8 @@ private const val TAG = "MediaPlayerScreen"
  * just like an SDR one, and the only way to tell those two apart from a log is to see that the
  * colour metadata was there at all.
  */
-private fun Tracks.outputDataSpace(): Int {
+private fun Tracks.outputDataSpace(): Int? {
+    if (groups.isEmpty()) return null
     var sawColorInfo = false
     for (group in groups) {
         for (index in 0 until group.length) {

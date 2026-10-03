@@ -31,39 +31,51 @@ fun PlayerContentFrame(
     pictureInPictureState: PictureInPictureState,
     videoZoomAndContentScaleState: VideoZoomAndContentScaleState,
     subtitleConfiguration: SubtitleConfiguration,
+    processingContent: (@Composable () -> Unit)? = null,
 ) {
     val presentationState = rememberPresentationState(player)
     Box(modifier.fillMaxSize()) {
-        PlayerSurface(
-            player = player,
-            surfaceType = SURFACE_TYPE_SURFACE_VIEW,
-            modifier = Modifier
-                .resizeWithContentScale(
-                    contentScale = videoZoomAndContentScaleState.videoContentScale.toContentScale(),
-                    sourceSizeDp = presentationState.videoSizeDp?.let { size ->
-                        size.copy(
-                            width = with(LocalDensity.current) { size.width.toDp().value },
-                            height = with(LocalDensity.current) { size.height.toDp().value },
-                        )
-                    },
-                )
-                .onGloballyPositioned {
-                    val bounds = it.boundsInWindow()
-                    val rect = Rect(
-                        bounds.left.toInt(),
-                        bounds.top.toInt(),
-                        bounds.right.toInt(),
-                        bounds.bottom.toInt(),
+        // Shared by both paths on purpose: content scale, pinch zoom, the PiP hit rect and the
+        // shutter belong to the frame around the video, not to whichever view happens to be
+        // showing it. Rendering the processing path without them is what made the display
+        // settings stop working - and subtitles disappear - as soon as a stage was switched on.
+        val contentModifier = Modifier
+            .resizeWithContentScale(
+                contentScale = videoZoomAndContentScaleState.videoContentScale.toContentScale(),
+                sourceSizeDp = presentationState.videoSizeDp?.let { size ->
+                    size.copy(
+                        width = with(LocalDensity.current) { size.width.toDp().value },
+                        height = with(LocalDensity.current) { size.height.toDp().value },
                     )
-                    pictureInPictureState.setVideoViewRect(rect)
-                }
-                .graphicsLayer {
-                    scaleX = videoZoomAndContentScaleState.zoom
-                    scaleY = videoZoomAndContentScaleState.zoom
-                    translationX = videoZoomAndContentScaleState.offset.x
-                    translationY = videoZoomAndContentScaleState.offset.y
                 },
-        )
+            )
+            .onGloballyPositioned {
+                val bounds = it.boundsInWindow()
+                val rect = Rect(
+                    bounds.left.toInt(),
+                    bounds.top.toInt(),
+                    bounds.right.toInt(),
+                    bounds.bottom.toInt(),
+                )
+                pictureInPictureState.setVideoViewRect(rect)
+            }
+            .graphicsLayer {
+                scaleX = videoZoomAndContentScaleState.zoom
+                scaleY = videoZoomAndContentScaleState.zoom
+                translationX = videoZoomAndContentScaleState.offset.x
+                translationY = videoZoomAndContentScaleState.offset.y
+            }
+        if (processingContent != null) {
+            Box(modifier = contentModifier) {
+                processingContent()
+            }
+        } else {
+            PlayerSurface(
+                player = player,
+                surfaceType = SURFACE_TYPE_SURFACE_VIEW,
+                modifier = contentModifier,
+            )
+        }
 
         SubtitleView(
             player = player,

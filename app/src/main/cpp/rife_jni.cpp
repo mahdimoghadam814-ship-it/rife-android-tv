@@ -125,30 +125,43 @@ static constexpr jint kSymbolMissing = -1003;
 // directly and falls back to the ambient scope. Nothing here can fail silently: every stage
 // returns a distinct code far enough from any status_t the platform can produce that the
 // caller can tell "the symbol is missing" from "the surface refused the value".
+template <typename Fn>
+static Fn resolveWindowSymbol(const char* name) {
+    // RTLD_NOLOAD first: if the library is already resident its handle comes back without a
+    // path search, which keeps this working on the linker namespaces that refuse to open a
+    // second copy by name.
+    static const char* const kLibraries[] = {"libnativewindow.so", "libandroid.so"};
+    for (const char* library : kLibraries) {
+        void* handle = dlopen(library, RTLD_NOW | RTLD_NOLOAD);
+        if (handle == nullptr) {
+            handle = dlopen(library, RTLD_NOW);
+        }
+        if (handle == nullptr) {
+            continue;
+        }
+        if (void* symbol = dlsym(handle, name)) {
+            return reinterpret_cast<Fn>(symbol);
+        }
+    }
+    return reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, name));
+}
+
 static jint setBuffersDataSpaceCompat(ANativeWindow* window, int32_t dataSpace) {
     using Setter = int32_t (*)(ANativeWindow*, int32_t);
-    static Setter setter = [] {
-        static const char* const kName = "ANativeWindow_setBuffersDataSpace";
-        // RTLD_NOLOAD first: if the library is already resident its handle comes back without a
-        // path search, which keeps this working on the linker namespaces that refuse to open a
-        // second copy by name.
-        static const char* const kLibraries[] = {"libnativewindow.so", "libandroid.so"};
-        for (const char* library : kLibraries) {
-            void* handle = dlopen(library, RTLD_NOW | RTLD_NOLOAD);
-            if (handle == nullptr) {
-                handle = dlopen(library, RTLD_NOW);
-            }
-            if (handle == nullptr) {
-                continue;
-            }
-            if (void* symbol = dlsym(handle, kName)) {
-                return reinterpret_cast<Setter>(symbol);
-            }
-        }
-        return reinterpret_cast<Setter>(dlsym(RTLD_DEFAULT, kName));
-    }();
+    static Setter setter = resolveWindowSymbol<Setter>("ANativeWindow_setBuffersDataSpace");
     if (setter == nullptr) return kSymbolMissing;
     return static_cast<jint>(setter(window, dataSpace));
+}
+
+// Reading the dataspace back is what tells a tag that survived from one that EGL quietly replaced
+// when it (re)created the window surface, and it is also how the decoder's own choice is observed:
+// MediaCodec stamps its output window itself, which is exactly the value the bypass path displays.
+// Returns the dataspace on success and one of the k* sentinels when it could not be asked.
+static jint getBuffersDataSpaceCompat(ANativeWindow* window) {
+    using Getter = int32_t (*)(ANativeWindow*);
+    static Getter getter = resolveWindowSymbol<Getter>("ANativeWindow_getBuffersDataSpace");
+    if (getter == nullptr) return kSymbolMissing;
+    return static_cast<jint>(getter(window));
 }
 
 extern "C" JNIEXPORT jint JNICALL
@@ -162,13 +175,25 @@ Java_com_rife_androidtv_NativeEngine_setOutputDataSpace(
     return rc;
 }
 
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rife_androidtv_NativeEngine_getOutputDataSpace(
+    JNIEnv* env, jclass clazz, jobject surface) {
+    if (surface == nullptr) return kNullSurface;
+    ANativeWindow* window = ANativeWindow_fromSurface(env, surface);
+    if (window == nullptr) return kNullWindow;
+    const jint value = getBuffersDataSpaceCompat(window);
+    ANativeWindow_release(window);
+    return value;
+}
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_rife_androidtv_NativeEngine_computeMotionField(
     JNIEnv* env, jclass clazz,
     jobject in0Buffer, jobject in1Buffer,
     jint srcWidth, jint srcHeight,
     jint targetWidth, jint targetHeight,
-    jobject mvBuffer
+    jobject mvBuffer,
+    jboolean forwardOnly
 ) {
     uint8_t* in0Ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(in0Buffer));
     uint8_t* in1Ptr = static_cast<uint8_t*>(env->GetDirectBufferAddress(in1Buffer));
@@ -193,7 +218,8 @@ Java_com_rife_androidtv_NativeEngine_computeMotionField(
     return g_memc.motionField(in0Ptr, in1Ptr,
                               srcWidth, srcHeight,
                               targetWidth, targetHeight,
-                              mvPtr, static_cast<size_t>(mvCapacity));
+                              mvPtr, static_cast<size_t>(mvCapacity),
+                              forwardOnly == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL

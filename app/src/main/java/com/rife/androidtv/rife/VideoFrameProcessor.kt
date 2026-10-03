@@ -359,6 +359,20 @@ class VideoFrameProcessor(
      * matching transfer curve. Read on the worker thread only.
      */
     private var outputDataSpace: Int = 0
+
+    /**
+     * Dataspace MediaCodec stamped on its own output window, read back through
+     * [NativeEngine.getOutputDataSpace]. While a stage is running the decoder writes into our
+     * input surface instead of the display, so this is the only place the value the bypass path
+     * would have shown can be observed - and mirroring it is what keeps the processed picture
+     * identical to the bypass one whatever range the codec chose. `0` means it has not been
+     * read yet or the decoder left it unspecified, in which case [outputDataSpace] is used.
+     * Read on the worker thread only.
+     */
+    private var codecDataSpace: Int = 0
+    private var codecDataSpaceProbed = false
+    private var codecDataSpaceProbeLogged = false
+
     /** Set once the GPU warp has refused a pair, so the fallback is reported without spamming. */
     private var warnedGpuWarpFallback = false
 
@@ -730,8 +744,13 @@ class VideoFrameProcessor(
 
     fun setOutputDataSpace(dataSpace: Int) {
         runOnWorker("setOutputDataSpace()") {
-            if (outputDataSpace == dataSpace) return@runOnWorker
-            outputDataSpace = dataSpace
+            if (outputDataSpace != dataSpace) {
+                outputDataSpace = dataSpace
+                // A new value means a new stream, so the decoder's own answer is stale too.
+                codecDataSpace = 0
+                codecDataSpaceProbed = false
+                codecDataSpaceProbeLogged = false
+            }
             applyOutputDataSpace()
         }
     }
@@ -771,13 +790,69 @@ class VideoFrameProcessor(
     private fun applyOutputDataSpace() {
         val surface = pendingOutputSurfaceInfo?.surface
         if (surface == null || !surface.isValid) return
-        val rc = NativeEngine.setOutputDataSpace(surface, outputDataSpace)
+        probeCodecDataSpace()
+        val want = effectiveOutputDataSpace()
+        val rc = NativeEngine.setOutputDataSpace(surface, want)
         when {
-            rc == 0 && outputDataSpace != 0 ->
-                Log.i(TAG, "Output dataspace tagged: $outputDataSpace")
+            rc == 0 && want != 0 -> {
+                val window = NativeEngine.getOutputDataSpace(surface)
+                Log.i(TAG, "Output dataspace tagged: $want (window reports $window)")
+            }
             rc == 0 -> Unit
-            else -> Log.w(TAG, "setOutputDataSpace($outputDataSpace) failed: ${dataSpaceError(rc)}")
+            else -> Log.w(TAG, "setOutputDataSpace($want) failed: ${dataSpaceError(rc)}")
         }
+    }
+
+    /**
+     * Reads the dataspace the decoder is using for the current stream, once per input surface.
+     * [NativeEngine.getOutputDataSpace] reports 0 for "unspecified" as well as for the decoder
+     * simply not having configured itself yet, so an unanswered probe is retried on the next
+     * stats window rather than cached forever.
+     */
+    private fun probeCodecDataSpace() {
+        if (codecDataSpaceProbed) return
+        val surface = createdInputSurface
+        if (surface == null || !surface.isValid) return
+        val value = NativeEngine.getOutputDataSpace(surface)
+        if (value > 0) {
+            codecDataSpace = value
+            codecDataSpaceProbed = true
+            Log.i(TAG, "Codec output dataspace: $value (colour metadata says $outputDataSpace)")
+        } else if (!codecDataSpaceProbeLogged) {
+            codecDataSpaceProbeLogged = true
+            Log.i(TAG, "Codec output dataspace: not reported ($value); using colour metadata")
+        }
+    }
+
+    /**
+     * The value the output window should carry: the decoder's own whenever it is willing to say,
+     * so the processed path is displayed exactly like the bypass path, and the colour-metadata
+     * value otherwise. SDR stays at `0` either way.
+     */
+    private fun effectiveOutputDataSpace(): Int =
+        if (outputDataSpace != 0 && codecDataSpace != 0) codecDataSpace else outputDataSpace
+
+    /**
+     * Puts the tag back if something took it away. EGL silently resets the dataspace when it
+     * recreates the window surface, which any pipeline reset that touches the output can do, so a
+     * tag written once does not survive - this reads before it writes and only speaks up when the
+     * window had drifted, which is precisely the evidence needed to tell a lost tag from a stable
+     * one. Only valid on the worker thread.
+     */
+    private fun reassertOutputDataSpace(reason: String) {
+        if (outputDataSpace == 0) return
+        val surface = pendingOutputSurfaceInfo?.surface
+        if (surface == null || !surface.isValid) return
+        probeCodecDataSpace()
+        val want = effectiveOutputDataSpace()
+        val before = NativeEngine.getOutputDataSpace(surface)
+        if (before == want) return
+        val rc = NativeEngine.setOutputDataSpace(surface, want)
+        Log.w(
+            TAG,
+            "Output dataspace drifted ($reason): window=$before want=$want " +
+                "codec=$codecDataSpace rc=${if (rc == 0) "ok" else dataSpaceError(rc)}"
+        )
     }
 
     /** Turns the JNI stage's failure code back into something readable in a log line. */
@@ -972,7 +1047,15 @@ class VideoFrameProcessor(
         lastCaptureLogH = 0
         lastCaptureLogRes = null
 
+        // The decoder may already have moved on to a new stream, so its dataspace answer is stale.
+        codecDataSpace = 0
+        codecDataSpaceProbed = false
+        codecDataSpaceProbeLogged = false
+
         Log.i(TAG, "resetPipeline: reason=$reason discardedFrames=$discarded")
+        // A reset is exactly when the EGL window surface gets torn down and rebuilt, which is
+        // where a tag written earlier stops being true.
+        reassertOutputDataSpace(reason)
     }
 
     private fun releaseStateOnWorker() {
@@ -1546,7 +1629,8 @@ class VideoFrameProcessor(
                         in0Buf, in1Buf,
                         rifeInputW, rifeInputH,
                         rifeInputW, rifeInputH,
-                        motionBuf
+                        motionBuf,
+                        forwardOnly = true,
                     )
                     nsJni += System.nanoTime() - tFieldStart
                     if (fieldReady) {
@@ -1675,7 +1759,8 @@ class VideoFrameProcessor(
                 rifeInputH,
                 rifeOutputW,
                 rifeOutputH,
-                motionBuf
+                motionBuf,
+                forwardOnly = false,
             )
         }
         val success = motionReady || NativeEngine.interpolateFrameBuffers(
@@ -1986,6 +2071,10 @@ class VideoFrameProcessor(
         nsPair = 0
         capturedAtWindowStart = frameCountInput
         droppedAtWindowStart = droppedFrameCount
+
+        // Periodic safety net: a wipe between two resets would otherwise go unnoticed until the
+        // next surface change, and the decoder's answer is only available once frames are flowing.
+        reassertOutputDataSpace("stats")
     }
 
     private fun fmtMs(nsPerCycle: Double): String =

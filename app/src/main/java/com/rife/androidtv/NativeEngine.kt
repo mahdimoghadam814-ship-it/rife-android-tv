@@ -42,6 +42,10 @@ object NativeEngine {
      *
      * The caller uploads the two halves as separate RGBA textures and lets a fragment shader do
      * the bilinear resample, which is what keeps the per-pixel warp off the CPU.
+     *
+     * [forwardOnly] drops the backward search when nothing will read it - the denoiser samples
+     * history along the forward vector alone, so with interpolation off the second estimate is
+     * the largest single cost in the frame and pure overhead.
      */
     @JvmStatic
     external fun computeMotionField(
@@ -51,7 +55,8 @@ object NativeEngine {
         srcHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-        mvBuffer: ByteBuffer
+        mvBuffer: ByteBuffer,
+        forwardOnly: Boolean,
     ): Boolean
 
     /**
@@ -65,6 +70,19 @@ object NativeEngine {
      */
     @JvmStatic
     external fun setOutputDataSpace(surface: Surface, dataSpace: Int): Int
+
+    /**
+     * Reads the `android.hardware.DataSpace` the buffers of [surface] currently carry.
+     *
+     * Used for two things: confirming that a tag written by [setOutputDataSpace] is still there
+     * (EGL quietly resets it when it recreates the window surface), and observing the dataspace
+     * MediaCodec stamped on its own output window - the exact value the bypass path displays.
+     *
+     * Returns the dataspace on success, or a negative failure code far enough from any platform
+     * `status_t` that it cannot be mistaken for one.
+     */
+    @JvmStatic
+    external fun getOutputDataSpace(surface: Surface): Int
 
     @JvmStatic
     external fun runRifeTest(width: Int, height: Int): Boolean

@@ -948,6 +948,7 @@ void MemcInterpolator::microBench() {
 bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
                                int srcW, int srcHeight,
                                int targetWidth, int targetHeight,
+                               bool forwardOnly,
                                const uint8_t** aOut, const uint8_t** bOut) {
     if (!src0 || !src1) return false;
     if (srcW <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) return false;
@@ -1024,13 +1025,23 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
                     tmpx_.data(), tmpy_.data(), mvf_x_.data(), mvf_y_.data());
     acc_fwd_ns_ += nsSince(tFwd);
 
-    const auto tBwd = std::chrono::steady_clock::now();
-    const long long sadBwd = motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
-    regulariseField(luma1_.data(), luma0_.data(), w, h,
-                    mvb_x_.data(), mvb_y_.data(), tmpx_.data(), tmpy_.data());
-    regulariseField(luma1_.data(), luma0_.data(), w, h,
-                    tmpx_.data(), tmpy_.data(), mvb_x_.data(), mvb_y_.data());
-    acc_bwd_ns_ += nsSince(tBwd);
+    long long sadBwd = 0;
+    if (forwardOnly) {
+        // Nothing downstream reads this half: the denoiser samples history along the forward
+        // vector, and packMotionField() writes maskB as clear from a zero field. Skipping the
+        // search is what keeps the denoise-only stage off the full bidirectional cost it used
+        // to pay while producing nothing with it.
+        std::fill(mvb_x_.begin(), mvb_x_.end(), 0);
+        std::fill(mvb_y_.begin(), mvb_y_.end(), 0);
+    } else {
+        const auto tBwd = std::chrono::steady_clock::now();
+        sadBwd = motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
+        regulariseField(luma1_.data(), luma0_.data(), w, h,
+                        mvb_x_.data(), mvb_y_.data(), tmpx_.data(), tmpy_.data());
+        regulariseField(luma1_.data(), luma0_.data(), w, h,
+                        tmpx_.data(), tmpy_.data(), mvb_x_.data(), mvb_y_.data());
+        acc_bwd_ns_ += nsSince(tBwd);
+    }
 
     // Scene-change gate: MVTools' thSCD1/thSCD2, restated as the mean per-pixel luma SAD of the
     // motion-compensated pair. One shot of video sits in single digits; two unrelated frames sit
@@ -1047,7 +1058,9 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     if (nblocks > 0.0) {
         const double scale = 1.0 / (nblocks * kBlock * kBlock);
         const double meanFwd = static_cast<double>(sadFwd) * scale;
-        const double meanBwd = static_cast<double>(sadBwd) * scale;
+        // With the backward search skipped there is only one signal to judge, and requiring both
+        // would disable the gate outright - the denoiser would then smear history across a cut.
+        const double meanBwd = (forwardOnly ? sadFwd : sadBwd) * scale;
         if (meanFwd > kSceneCutMeanSad && meanBwd > kSceneCutMeanSad) {
             sceneCut_ = true;
             std::fill(mvf_x_.begin(), mvf_x_.end(), 0);
@@ -1077,7 +1090,7 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
     const auto t0 = std::chrono::steady_clock::now();
     const uint8_t* a = nullptr;
     const uint8_t* b = nullptr;
-    if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight, &a, &b)) {
+    if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight, false, &a, &b)) {
         return false;
     }
 
@@ -1107,7 +1120,7 @@ size_t MemcInterpolator::motionFieldBytes(int targetWidth, int targetHeight) {
     return bwx * bwy * 8;
 }
 
-void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
+void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwardOnly) {
     const int bwx = (w + kBlock - 1) / kBlock;
     const int bwy = (h + kBlock - 1) / kBlock;
     const size_t blocks = static_cast<size_t>(bwx) * bwy;
@@ -1140,14 +1153,20 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
                 // `p - mv` at t = 1, the same position the warp shader samples the partner at.
                 const int sadF = sadAt(luma1_.data(), luma0_.data(), w, w, h,
                                        cx, cy, cx - mvf_x_[i], cy - mvf_y_[i]);
-                const int sadB = sadAt(luma0_.data(), luma1_.data(), w, w, h,
-                                       cx, cy, cx - mvb_x_[i], cy - mvb_y_[i]);
-                const int sf = clampi(sadF / 64, 0, 255);
-                const int sb = clampi(sadB / 64, 0, 255);
-                nlmScore_[i * 2] = static_cast<uint8_t>(sf);
-                nlmScore_[i * 2 + 1] = static_cast<uint8_t>(sb);
-                hist[sf]++;
-                hist[sb]++;
+                nlmScore_[i * 2] = static_cast<uint8_t>(clampi(sadF / 64, 0, 255));
+                hist[nlmScore_[i * 2]]++;
+                // The backward residual is only a real residual when the backward field is.
+                // With forwardOnly the vectors are all zero, so this would score the *unwarped*
+                // pair - which is full of misalignment, not noise - and pooling it drags the
+                // percentile that becomes the noise floor up with it, letting the denoiser merge
+                // harder than its own measurement justifies. Only the forward half counts then.
+                if (!forwardOnly) {
+                    const int sadB = sadAt(luma0_.data(), luma1_.data(), w, w, h,
+                                           cx, cy, cx - mvb_x_[i], cy - mvb_y_[i]);
+                    const int sb = clampi(sadB / 64, 0, 255);
+                    nlmScore_[i * 2 + 1] = static_cast<uint8_t>(sb);
+                    hist[sb]++;
+                }
             }
         }
     }
@@ -1157,7 +1176,7 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
     // anyone having to decide which blocks are flat. A cut is handled before this by zeroing the
     // field, which would otherwise make the whole histogram large and the floor claim that two
     // unrelated pictures were one noisy one.
-    const long long samples = static_cast<long long>(blocks) * 2;
+    const long long samples = static_cast<long long>(blocks) * (forwardOnly ? 1 : 2);
     long long target = samples * kNlmFloorPercentile / 100;
     if (target < 1) target = 1;
     long long acc = 0;
@@ -1224,12 +1243,13 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv) {
 bool MemcInterpolator::motionField(const uint8_t* src0, const uint8_t* src1,
                                    int srcW, int srcHeight,
                                    int targetWidth, int targetHeight,
-                                   uint8_t* outMv, size_t outMvBytes) {
+                                   uint8_t* outMv, size_t outMvBytes,
+                                   bool forwardOnly) {
     if (!outMv) return false;
     if (outMvBytes < motionFieldBytes(targetWidth, targetHeight)) return false;
 
     const auto t0 = std::chrono::steady_clock::now();
-    if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight)) {
+    if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight, forwardOnly)) {
         return false;
     }
 
@@ -1237,7 +1257,7 @@ bool MemcInterpolator::motionField(const uint8_t* src0, const uint8_t* src1,
     // buy back the microseconds the barriers cost. The warp stage stays at ~0 here, which is the
     // signal in the STAGES line that the shader - not motionCompensate() - is doing the resample.
     const auto tPack = std::chrono::steady_clock::now();
-    packMotionField(targetWidth, targetHeight, outMv);
+    packMotionField(targetWidth, targetHeight, outMv, forwardOnly);
     acc_warp_ns_ += nsSince(tPack);
 
     acc_total_ns_ += nsSince(t0);

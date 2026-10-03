@@ -7,11 +7,20 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.systemBars
+import androidx.compose.foundation.layout.union
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.ui.compose.state.ProgressStateWithTickInterval
@@ -75,12 +84,24 @@ fun PlayerControls(
             }
             // Engine status sits directly under the title row so the two read as one block, and
             // follows the controls it belongs to instead of floating over the video on its own.
+            // It takes the same horizontal insets and gutter as that row: without them it starts
+            // at the raw edge of the window, which on a phone in landscape is under the status bar.
             AnimatedVisibility(
                 visible = controlsVisibilityState.controlsVisible,
                 enter = fadeIn(),
                 exit = fadeOut(),
             ) {
-                engineStatusOverlay()
+                Box(
+                    modifier = Modifier
+                        .windowInsetsPadding(
+                            WindowInsets.systemBars
+                                .union(WindowInsets.displayCutout)
+                                .only(WindowInsetsSides.Horizontal),
+                        )
+                        .padding(horizontal = 16.dp),
+                ) {
+                    engineStatusOverlay()
+                }
             }
             Spacer(modifier = Modifier.weight(1f))
             AnimatedVisibility(

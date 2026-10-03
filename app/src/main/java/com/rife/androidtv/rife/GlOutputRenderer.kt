@@ -592,6 +592,19 @@ class GlOutputRenderer {
      * the worker's EGL context current. Passing `null` releases the window surface.
      */
     fun setOutputSurface(display: EGLDisplay, surface: Surface?) {
+        // A redundant call used to be expensive: tearing the window surface down and building it
+        // again costs a frame - the hitch seen whenever the player UI brings the SurfaceView
+        // through a relayout - and it silently resets the dataspace tag the HDR path depends on.
+        // SurfaceView reports the same Surface again on those relayouts, so compare first and
+        // only re-query the size, which is the part that genuinely can have changed.
+        if (display == this.display &&
+            surface == outputSurface &&
+            windowSurface != null &&
+            (surface == null || surface.isValid)
+        ) {
+            updateSurfaceSize()
+            return
+        }
         this.display = display
         releaseWindowSurface()
         outputSurface = surface

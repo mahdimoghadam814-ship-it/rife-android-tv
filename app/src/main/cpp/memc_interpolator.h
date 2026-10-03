@@ -99,10 +99,16 @@ public:
     // the same bilinear field the CPU path builds, so the per-pixel resample - by far the most
     // expensive thing motionCompensate() does - costs a texture fetch instead of a NEON loop.
     // The two halves are contiguous, so a caller uploads them as two textures out of one buffer.
+    //
+    // forwardOnly skips the backward estimate entirely. The denoiser samples its history along
+    // the forward vector alone, so with interpolation switched off the second search is pure
+    // overhead - and at 1080p it is the single largest number in the STAGES line. Scene-cut
+    // detection then keys off the forward SAD by itself, which is the half it can still see.
     bool motionField(const uint8_t* src0, const uint8_t* src1,
                      int srcW, int srcHeight,
                      int targetWidth, int targetHeight,
-                     uint8_t* outMv, size_t outMvBytes);
+                     uint8_t* outMv, size_t outMvBytes,
+                     bool forwardOnly = false);
 
     // Exact byte count motionField() writes for a processing size: eight bytes per block. Also
     // the size the caller must allocate for the packed field, still only tens of kB at 1080p.
@@ -196,16 +202,21 @@ private:
     // Shared front half of interpolate() and motionField(): scratch sizing, the optional shrink to
     // the processing size, RGBA->luma, the pyramid and both motion estimates. On success *aOut and
     // *bOut (when non-null) point at the processing-sized frames - the inputs themselves when no
-    // resize was needed, otherwise resized0_/resized1_.
+    // resize was needed, otherwise resized0_/resized1_. forwardOnly drops the backward estimate
+    // (and zeroes that half of the field) for callers that never read it.
     bool prepare(const uint8_t* src0, const uint8_t* src1,
                  int srcW, int srcHeight,
                  int targetWidth, int targetHeight,
+                 bool forwardOnly = false,
                  const uint8_t** aOut = nullptr,
                  const uint8_t** bOut = nullptr);
 
     // Serial: bwy*bwx is a few thousand bytes, so a parallel region would cost more in barrier
-    // time than the write itself.
-    void packMotionField(int w, int h, uint8_t* outMv);
+    // time than the write itself. forwardOnly drops the backward residual from the noise-floor
+    // histogram: with that field zeroed the score measures unwarped misalignment rather than
+    // noise, and letting it in would raise the floor and make the published weights merge harder
+    // than the forward measurement alone justifies.
+    void packMotionField(int w, int h, uint8_t* outMv, bool forwardOnly);
 
     template <typename F>
     void parallelFor(int begin, int end, F&& fn);
