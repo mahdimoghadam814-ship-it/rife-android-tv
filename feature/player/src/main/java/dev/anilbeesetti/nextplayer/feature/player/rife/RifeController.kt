@@ -31,6 +31,11 @@ enum class InterpolationAlgorithm {
 data class RifeStats(
     val inputFps: Float,
     val outputFps: Float,
+    /**
+     * The instantaneous output frame rate over the last pair. The encoder is opened at this rate;
+     * [outputFps] is a one-second average and would open a 72 fps stream as 60.
+     */
+    val outputFrameRate: Float,
     val processingTimeMs: Long,
     val droppedFrames: Long,
     val currentResolution: String,

@@ -22,6 +22,7 @@ import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
 import dev.anilbeesetti.nextplayer.feature.player.rife.InterpolationAlgorithm as FeatureInterpolationAlgorithm
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeStats
+import java.io.Closeable
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
@@ -64,6 +65,7 @@ class RifeEngineController(
             _stats.value = RifeStats(
                 inputFps = stats.inputFps,
                 outputFps = stats.outputFps,
+                outputFrameRate = stats.outputFrameRate,
                 processingTimeMs = stats.processingTimeMs,
                 droppedFrames = stats.droppedFrames,
                 currentResolution = stats.currentResolution,
@@ -84,6 +86,7 @@ class RifeEngineController(
         RifeStats(
             inputFps = 0f,
             outputFps = 0f,
+            outputFrameRate = 0f,
             processingTimeMs = 0L,
             droppedFrames = 0L,
             currentResolution = "Original",
@@ -274,6 +277,12 @@ class RifeEngineController(
 
     private var encoder: HdrHevcEncoder? = null
     private var encodeConfig: HdrHevcEncoder.Config? = null
+
+    /**
+     * The transport sink the current encode is writing to, held so [stopEncoding] can close it.
+     * Without this the UDP socket, its sender thread and its buffer slots leak on every stop.
+     */
+    private var packetSink: TsPacketSink? = null
     private val encodedUnits = AtomicLong()
     private val encodedBytes = AtomicLong()
     private var capabilitiesLogged = false
@@ -308,6 +317,7 @@ class RifeEngineController(
         }
         encoder = candidate
         encodeConfig = config
+        this.packetSink = packetSink
         encodedUnits.set(0)
         encodedBytes.set(0)
         processor.setEncodeSurface(surface)
@@ -334,6 +344,12 @@ class RifeEngineController(
         val units = encodedUnits.get()
         val bytes = encodedBytes.get()
         running.close()
+        // The sink owns a socket and a sender thread (UDP) or an open file (Phase D), and the
+        // encoder's close does not reach it. Closing it here is what stops a start/stop cycle from
+        // leaking both.
+        val sink = packetSink
+        packetSink = null
+        if (sink is Closeable) runCatching { sink.close() }
         val fps = cfg?.frameRate ?: 0
         val seconds = if (fps > 0) units.toDouble() / fps else 0.0
         val avgBitrate = if (seconds > 0.0) (bytes * 8.0 / seconds).toLong() else 0L

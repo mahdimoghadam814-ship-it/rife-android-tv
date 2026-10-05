@@ -51,6 +51,12 @@ data class FrameData(
 data class Statistics(
     val inputFps: Float,
     val outputFps: Float,
+    /**
+     * The instantaneous output frame rate over the last pair, in frames per second. This is the
+     * number the encoder must be opened at: the windowed [outputFps] is smoothed over a second and
+     * would open a 72 fps stream as 60.
+     */
+    val outputFrameRate: Float,
     val processingTimeMs: Long,
     val droppedFrames: Long,
     val currentResolution: String
@@ -308,6 +314,9 @@ class VideoFrameProcessor(
      * until the first pair, and rejected outside [1ms, 1s] so a seek cannot set a nonsense one.
      */
     private var sourceIntervalNs = 0L
+
+    /** Microseconds between the last pair's two source frames; 0 until a pair has been seen. */
+    private var lastPairIntervalUs = 0L
 
     /**
      * Interpolation ratio: how many output frames are synthesised per source frame. Two is one
@@ -1560,7 +1569,7 @@ class VideoFrameProcessor(
                     calculateChecksum(nextFrame.pixels, nextFrame.width, nextFrame.height)
                 Log.d(TAG, "PIPELINE CHECKSUM: firstFrame ${nextFrame.width}x${nextFrame.height} checksum=$firstFrameChecksum")
             }
-            renderFrameToOutput(nextFrame)
+            renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             frameCountOutput++
             previousFrame = nextFrame
             updateStats()
@@ -1572,7 +1581,7 @@ class VideoFrameProcessor(
             // mismatched buffers.
             Log.i(TAG, "Frame size changed, restarting the RIFE pair")
             releaseFrameBuffer(prev.pixels)
-            renderFrameToOutput(nextFrame)
+            renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             frameCountOutput++
             previousFrame = nextFrame
             updateStats()
@@ -1583,6 +1592,7 @@ class VideoFrameProcessor(
         val srcIntervalUs = nextFrame.timestampUs - prev.timestampUs
         if (srcIntervalUs in 1_000L..1_000_000L) {
             sourceIntervalNs = srcIntervalUs * 1_000L
+            lastPairIntervalUs = srcIntervalUs
         }
 
         val rifeInputW = nextFrame.width
@@ -1600,7 +1610,7 @@ class VideoFrameProcessor(
 
         if (!ensureCachedBuffers(requiredInputBytes, requiredOutputBytes, rifeInputW, rifeInputH)) {
             releaseFrameBuffer(prev.pixels)
-            renderFrameToOutput(nextFrame)
+            renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             previousFrame = nextFrame
             return
         }
@@ -1687,7 +1697,9 @@ class VideoFrameProcessor(
                     if (fieldReady) {
                         val tRenderStart = System.nanoTime()
                         presented = outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
-                            outputRenderer?.presentDenoised(rifeInputW, rifeInputH) == true
+                            outputRenderer?.presentDenoised(
+                                rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
+                            ) == true
                         nsRender += System.nanoTime() - tRenderStart
                     }
                 }
@@ -1713,14 +1725,14 @@ class VideoFrameProcessor(
                     // DIAGNOSTICS: Log checksum after FastDVDnet pass-through
                     val fastDvdNetChecksum = calculateChecksum(den1Buf, rifeInputW, rifeInputH)
                     Log.d(TAG, "PIPELINE CHECKSUM: after FastDVDnet ${rifeInputW}x${rifeInputH} checksum=$fastDvdNetChecksum (unchanged=${fastDvdNetChecksum == nextChecksum})")
-                    renderBufferToOutput(den1Buf, rifeInputW, rifeInputH)
+                    renderBufferToOutput(den1Buf, rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L)
                 } else {
-                    renderFrameToOutput(nextFrame)
+                    renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
                 }
             } else {
                 // Both stages were switched off between capture and processing: forward the frame
                 // instead of leaving a stale picture on the output surface.
-                renderFrameToOutput(nextFrame)
+                renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             }
             lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
             frameCountOutput++
@@ -1871,6 +1883,14 @@ class VideoFrameProcessor(
                 times
             }
 
+            // The presentation time each interpolated frame must carry. Without it the encoder
+            // reports zero for every access unit and the muxer invents a timeline at the
+            // configured frame rate, which is how a 24 fps source at 3x ends up streamed as 60.
+            val pairSpanUs = nextFrame.timestampUs - prev.timestampUs
+            val timestamps = LongArray(intermediate.size) { i ->
+                ((prev.timestampUs + intermediate[i] * pairSpanUs) * 1000L).toLong()
+            }
+
             var presented = intermediate.isEmpty()
             if (!presented && motionReady && motionBuf != null) {
                 // From the denoised pair when there is one. The first cycle after a reset has no
@@ -1884,7 +1904,8 @@ class VideoFrameProcessor(
                         rifeInputH,
                         rifeOutputW,
                         rifeOutputH,
-                        intermediate
+                        intermediate,
+                        timestamps
                     ) == true
                 } else {
                     outputRenderer?.renderWarp(
@@ -1895,7 +1916,8 @@ class VideoFrameProcessor(
                         rifeInputH,
                         rifeOutputW,
                         rifeOutputH,
-                        intermediate
+                        intermediate,
+                        timestamps
                     ) == true
                 }
             }
@@ -1914,7 +1936,8 @@ class VideoFrameProcessor(
                             "interpolator, which resamples per block and will show as blocks"
                     )
                 }
-                for (t in intermediate) {
+                for (i in intermediate.indices) {
+                    val t = intermediate[i]
                     NativeEngine.interpolateFrameBuffers(
                         src0Buf,
                         src1Buf,
@@ -1938,7 +1961,7 @@ class VideoFrameProcessor(
                         Log.d(TAG, "PIPELINE CHECKSUM: after interpolation ${rifeOutputW}x$rifeOutputH checksum=$rifeOutputChecksum")
                     }
 
-                    renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH)
+                    renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH, timestamps[i])
                 }
             }
 
@@ -1947,11 +1970,13 @@ class VideoFrameProcessor(
             // - rather than paying for a warp that would only resample it onto itself.
             if (ownFrame) {
                 if (denoiseReady &&
-                    outputRenderer?.presentDenoised(rifeInputW, rifeInputH) == true
+                    outputRenderer?.presentDenoised(
+                        rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
+                    ) == true
                 ) {
                     // already on the surface
                 } else {
-                    renderFrameToOutput(nextFrame)
+                    renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
                 }
             }
             nsRender += System.nanoTime() - tRenderStart
@@ -1966,7 +1991,7 @@ class VideoFrameProcessor(
                 }
             )
             val tRenderStart = System.nanoTime()
-            renderFrameToOutput(nextFrame)
+            renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             nsRender += System.nanoTime() - tRenderStart
             frameCountOutput++
         }
@@ -2264,9 +2289,9 @@ class VideoFrameProcessor(
         )
     }
 
-    private fun renderFrameToOutput(frame: FrameData) {
+    private fun renderFrameToOutput(frame: FrameData, timestampNs: Long = 0L) {
         frame.pixels.clear()
-        renderBufferToOutput(frame.pixels, frame.width, frame.height)
+        renderBufferToOutput(frame.pixels, frame.width, frame.height, timestampNs)
     }
 
     /**
@@ -2275,17 +2300,27 @@ class VideoFrameProcessor(
      * producer left behind: the RIFE output buffer is filled through a raw JNI pointer (so its
      * position is never advanced) and the pooled frame buffers may have a capacity larger than
      * this frame.
+     *
+     * [timestampNs] is the frame's presentation time, handed to `eglPresentationTimeANDROID` so
+     * the encoder can stamp the access unit with it.
      */
-    private fun renderBufferToOutput(pixels: ByteBuffer, width: Int, height: Int) {
+    private fun renderBufferToOutput(
+        pixels: ByteBuffer,
+        width: Int,
+        height: Int,
+        timestampNs: Long = 0L
+    ) {
         // An encode can run before, or without, any preview surface being published, so the
         // encoder target counts as a legitimate destination here.
         if (pendingOutputSurfaceInfo == null && encodeSurface == null) return
         val surface = activeOutputSurface()
         if (surface == null || !surface.isValid) {
+            Log.w(TAG, "renderBufferToOutput: no valid output surface; frame dropped")
             return
         }
         val renderer = outputRenderer ?: return
         if (!renderer.isInitialized) {
+            Log.w(TAG, "renderBufferToOutput: renderer not initialized; frame dropped")
             return
         }
 
@@ -2306,7 +2341,7 @@ class VideoFrameProcessor(
         }
 
         try {
-            renderer.render(pixels, width, height)
+            renderer.render(pixels, width, height, timestampNs)
         } catch (t: Throwable) {
             Log.w(TAG, "Failed to render a frame to the output surface", t)
         }
@@ -2468,6 +2503,15 @@ class VideoFrameProcessor(
             val stats = Statistics(
                 inputFps = inFps,
                 outputFps = outFps,
+                // The instantaneous output rate over the last pair, which is what the encoder has
+                // to be opened at. The windowed average above is smoothed over a second and would
+                // open a 72 fps stream as 60.
+                outputFrameRate = if (lastPairIntervalUs > 0) {
+                    (1_000_000.0 / lastPairIntervalUs.toDouble() *
+                        memcLevelMultiplier.toDouble()).toFloat()
+                } else {
+                    0f
+                },
                 processingTimeMs = lastProcTimeMs,
                 droppedFrames = droppedFrameCount,
                 currentResolution = resStr

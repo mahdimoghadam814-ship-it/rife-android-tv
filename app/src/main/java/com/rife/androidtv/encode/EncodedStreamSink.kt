@@ -25,4 +25,11 @@ interface EncodedStreamSink {
      * sink that keeps the bytes must copy them.
      */
     fun onAccessUnit(data: ByteBuffer, info: MediaCodec.BufferInfo)
+
+    /**
+     * The codec failed. Called instead of further [onAccessUnit] calls; the drain thread is
+     * stopping. A sink that owns resources should release them here, because [HdrHevcEncoder]
+     * will not call anything further once the codec is in an error state.
+     */
+    fun onError(cause: Throwable) {}
 }

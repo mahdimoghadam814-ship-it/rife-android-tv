@@ -314,9 +314,14 @@ internal fun MediaPlayerContent(
                 val source = clipSourceSize
                 val width = source?.first ?: 0
                 val height = source?.second ?: 0
+                // The encoder has to be opened at the rate frames actually leave the pipeline, which
+                // is the source rate times the interpolation ratio - not a constant. A 24 fps source
+                // at 3x is 72 fps, and opening the codec at 60 makes the muxer generate a 60 fps
+                // timeline for a 72 fps stream.
+                val fps = rifeStats.outputFrameRate.takeIf { it > 0f }?.toInt()?.coerceIn(1, 240) ?: 60
                 val path = File(context.filesDir, "phaseD_${System.currentTimeMillis()}.ts")
                 if (width > 0 && height > 0 &&
-                    rifeController.startTestClip(path.absolutePath, width, height, 60)
+                    rifeController.startTestClip(path.absolutePath, width, height, fps)
                 ) {
                     clipRolling = true
                     clipScope.launch {

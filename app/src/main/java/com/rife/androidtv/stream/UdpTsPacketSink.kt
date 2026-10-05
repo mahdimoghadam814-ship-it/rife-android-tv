@@ -55,6 +55,10 @@ class UdpTsPacketSink(
     private val bytesSent = AtomicLong()
     private val datagramsDropped = AtomicLong()
 
+    /** Consecutive send failures, so a dead receiver is visible without logging every packet. */
+    @Volatile
+    private var consecutiveFailures = 0
+
     init {
         require(maxDatagramBytes > 0 && maxDatagramBytes % MpegTsMuxer.TS_PACKET_SIZE == 0) {
             "maxDatagramBytes ($maxDatagramBytes) must be a positive multiple of " +
@@ -119,9 +123,21 @@ class UdpTsPacketSink(
                 socket.send(DatagramPacket(slot.buffer, slot.length, address, port))
                 datagramsSent.incrementAndGet()
                 bytesSent.addAndGet(slot.length.toLong())
-            } catch (closed: Exception) {
-                // Socket closed underneath us while shutting down; anything else is worth saying.
-                if (running) Log.w(TAG, "send failed: ${closed.message}")
+                consecutiveFailures = 0
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            } catch (io: java.io.IOException) {
+                // A transient send failure - an ICMP unreachable, a buffer full during a Wi-Fi
+                // roam - must not kill the sender. The drain thread keeps producing into a queue
+                // that is never drained, fills it, and drops every datagram from there on, which
+                // looks exactly like a dead stream. Count and carry on.
+                consecutiveFailures++
+                if (consecutiveFailures == 1 || consecutiveFailures % 100 == 0) {
+                    Log.w(TAG, "send failed ($consecutiveFailures in a row): ${io.message}")
+                }
+            } catch (other: Exception) {
+                if (running) Log.w(TAG, "send failed: ${other.message}")
                 break
             } finally {
                 slot.length = 0
@@ -164,7 +180,12 @@ class UdpTsPacketSink(
          */
         const val DEFAULT_QUEUE_CAPACITY = 512
 
-        private const val POLL_INTERVAL_MS = 20L
+        /**
+         * How long the sender parks between datagrams. Two milliseconds, not twenty: the whole
+         * frame budget at 4K60 is 16.6 ms, and a 20 ms poll is a full frame of added latency on a
+         * stream whose entire reason for existing is to be live.
+         */
+        private const val POLL_INTERVAL_MS = 2L
         private const val JOIN_TIMEOUT_MS = 500L
     }
 }

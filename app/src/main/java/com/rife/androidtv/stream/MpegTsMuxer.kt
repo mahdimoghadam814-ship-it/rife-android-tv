@@ -320,8 +320,20 @@ class MpegTsMuxer(
         section[n++] = 0x00.toByte()
         section[n++] = (0xE0 or ((videoPid shr 8) and 0x1F)).toByte() // reserved | PCR_PID
         section[n++] = (videoPid and 0xFF).toByte()
-        section[n++] = 0xF0.toByte() // reserved | program_info_length = 0
+        // A registration_descriptor naming the codec. Several TV-box firmwares will not identify an
+        // HEVC elementary stream without it, and the four bytes cost nothing.
+        section[n++] = 0xF0.toByte() // reserved | program_info_length, patched below
         section[n++] = 0x00.toByte()
+        section[n++] = 0x05.toByte() // descriptor_tag: registration_descriptor
+        section[n++] = 0x04.toByte() // descriptor_length
+        section[n++] = 0x48.toByte() // 'H'
+        section[n++] = 0x45.toByte() // 'E'
+        section[n++] = 0x56.toByte() // 'V'
+        section[n++] = 0x43.toByte() // 'C'
+        // program_info_length is the 12-bit field two bytes above the descriptor tag; it was
+        // written as a placeholder and is only knowable once the descriptor exists.
+        section[10] = (0xF0 or ((5 shr 8) and 0x0F)).toByte()
+        section[11] = 0x05.toByte()
         section[n++] = STREAM_TYPE_HEVC.toByte()
         section[n++] = (0xE0 or ((videoPid shr 8) and 0x1F)).toByte() // reserved | elementary_PID
         section[n++] = (videoPid and 0xFF).toByte()

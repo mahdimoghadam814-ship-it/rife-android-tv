@@ -4,6 +4,7 @@ import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
+import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES20
 import android.util.Log
@@ -410,6 +411,17 @@ class GlOutputRenderer {
     private var nsSwap = 0L
     private var renderCalls = 0L
 
+    /**
+     * The presentation time the next [eglSwapBuffers] must carry, in nanoseconds. Set by the
+     * caller before every render. Zero means "untimed" and the swap is issued without a timestamp.
+     *
+     * Without this the encoder reports `presentationTimeUs == 0` for every frame, the muxer falls
+     * back to a generated timeline at the *configured* frame rate, and a 24 fps source at 3x is
+     * streamed as 60 fps. The value is the frame's own presentation time, so the stream carries
+     * the real media timeline.
+     */
+    var outputTimestampNs: Long = 0L
+
     private val vertexBuffer: FloatBuffer = ByteBuffer
         .allocateDirect(FULL_QUAD_VERTICES.size * 4)
         .order(ByteOrder.nativeOrder())
@@ -684,6 +696,21 @@ class GlOutputRenderer {
         )
         var created = createWindowSurface(display, surface, strict)
         if (created == null) {
+            // A Main10 encoder's input surface is a 10-bit buffer, and an 8-bit config cannot
+            // match it. RGB10_A2 is the 10-bit layout every GLES2 driver exposes; if the surface
+            // is 8-bit this query simply fails and the relaxed fallback below takes over.
+            val hdr = intArrayOf(
+                EGL14.EGL_RED_SIZE, 10,
+                EGL14.EGL_GREEN_SIZE, 10,
+                EGL14.EGL_BLUE_SIZE, 10,
+                EGL14.EGL_ALPHA_SIZE, 2,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_NONE
+            )
+            created = createWindowSurface(display, surface, hdr)
+        }
+        if (created == null) {
             // The display surface has always matched RGBA8888, but a MediaCodec encoder input
             // surface is allocated by the codec and may be 10-bit (RGBA_1010102). An
             // EGL_BAD_MATCH from eglCreateWindowSurface is the only signal that gives us, and
@@ -811,19 +838,41 @@ class GlOutputRenderer {
     }
 
     /**
+     * Swaps the current window surface, stamping it with [outputTimestampNs] first.
+     *
+     * `eglPresentationTimeANDROID` is what hands the frame's presentation time to a Surface-input
+     * MediaCodec. It must be called on the thread that owns the EGL context, immediately before
+     * the swap, with the surface current - which is exactly where every render path ends up.
+     */
+    private fun swapBuffers(eglDisplay: EGLDisplay, eglSurface: EGLSurface, label: String) {
+        if (outputTimestampNs != 0L) {
+            EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, outputTimestampNs)
+        }
+        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+        val swapError = EGL14.eglGetError()
+        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
+            Log.d(TAG, "eglSwapBuffers ($label): result=$swapResult error=0x${swapError.toString(16)}")
+        }
+    }
+
+    /**
      * Uploads [buffer] (exactly [width] x [height] RGBA bytes, top row first) and presents it.
      * Must be called with the worker's EGL context current.
+     *
+     * [timestampNs] is the frame's presentation time; see [outputTimestampNs].
      */
-    fun render(buffer: ByteBuffer, width: Int, height: Int) {
+    fun render(buffer: ByteBuffer, width: Int, height: Int, timestampNs: Long = 0L) {
         val eglDisplay = display
         val eglContext = context
         val eglSurface = windowSurface
         if (program == 0 || textureId == 0 || eglDisplay == null ||
             eglContext == null || eglSurface == null
         ) {
+            Log.w(TAG, "render(): renderer not ready (program=$program texture=$textureId); frame dropped")
             return
         }
         if (width <= 0 || height <= 0) {
+            Log.w(TAG, "render(): bad size ${width}x${height}; frame dropped")
             return
         }
 
@@ -947,13 +996,10 @@ class GlOutputRenderer {
         // DIAGNOSTICS: Check eglSwapBuffers result and error. Successful swaps are silent: this
         // line fires twice per interpolated pair and is pure overhead at the frame rate we need.
         tPhase = System.nanoTime()
-        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
-        val swapError = EGL14.eglGetError()
+        outputTimestampNs = timestampNs
+        swapBuffers(eglDisplay, eglSurface, "")
         nsSwap += System.nanoTime() - tPhase
         renderCalls++
-        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
-            Log.d(TAG, "eglSwapBuffers: result=$swapResult error=0x${swapError.toString(16)}")
-        }
     }
 
     /**
@@ -979,10 +1025,11 @@ class GlOutputRenderer {
         srcHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-        timestep: Float
+        timestep: Float,
+        timestampNs: Long = 0L
     ): Boolean = renderWarp(
         frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight,
-        floatArrayOf(timestep)
+        floatArrayOf(timestep), longArrayOf(timestampNs)
     )
 
     /**
@@ -990,6 +1037,9 @@ class GlOutputRenderer {
      * above 2x needs several interpolations of the same two frames, and re-uploading them per
      * timestep would pay the readback-sized transfer again for data that has not changed; only
      * the draw - one uniform and one swap per timestep - is repeated.
+     *
+     * [timestamps] is parallel to [timesteps]: the presentation time each interpolated frame
+     * must carry, in nanoseconds. See [outputTimestampNs].
      */
     fun renderWarp(
         frame0: ByteBuffer,
@@ -999,7 +1049,8 @@ class GlOutputRenderer {
         srcHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-        timesteps: FloatArray
+        timesteps: FloatArray,
+        timestamps: LongArray = LongArray(0)
     ): Boolean {
         if (timesteps.isEmpty()) {
             return false
@@ -1260,9 +1311,11 @@ class GlOutputRenderer {
         srcHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-        timestep: Float
+        timestep: Float,
+        timestampNs: Long = 0L
     ): Boolean = renderWarpFromDen(
-        motion, srcWidth, srcHeight, targetWidth, targetHeight, floatArrayOf(timestep)
+        motion, srcWidth, srcHeight, targetWidth, targetHeight, floatArrayOf(timestep),
+        longArrayOf(timestampNs)
     )
 
     /** See [renderWarp]; the denoised pair is uploaded once and drawn once per timestep. */
@@ -1272,7 +1325,8 @@ class GlOutputRenderer {
         srcHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-        timesteps: FloatArray
+        timesteps: FloatArray,
+        timestamps: LongArray = LongArray(0)
     ): Boolean {
         val frame0 = denPair0
         val frame1 = denPair1
@@ -1357,11 +1411,16 @@ class GlOutputRenderer {
         targetHeight: Int,
         gridW: Int,
         gridH: Int,
-        timesteps: FloatArray
+        timesteps: FloatArray,
+        timestamps: LongArray = LongArray(0)
     ): Boolean {
-        for (timestep in timesteps) {
+        for (index in timesteps.indices) {
+            val timestep = timesteps[index]
             if (timestep < 0.0f || timestep > 1.0f) {
                 return false
+            }
+            if (timestamps.isNotEmpty() && index < timestamps.size) {
+                outputTimestampNs = timestamps[index]
             }
             val ok = drawWarp(
                 eglDisplay, eglSurface, frame0, frame1, srcWidth, srcHeight,
@@ -1379,7 +1438,7 @@ class GlOutputRenderer {
      * [render] scales the frame it was handed. Exists so the denoise-only path can present without
      * a readback: the frame is already a texture.
      */
-    fun presentDenoised(width: Int, height: Int): Boolean {
+    fun presentDenoised(width: Int, height: Int, timestampNs: Long = 0L): Boolean {
         val eglDisplay = display
         val eglContext = context
         val eglSurface = windowSurface
@@ -1520,14 +1579,10 @@ class GlOutputRenderer {
         nsDraw += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
-        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
-        val swapError = EGL14.eglGetError()
+        swapBuffers(eglDisplay, eglSurface, "warp")
         nsSwap += System.nanoTime() - tPhase
         renderCalls++
         warpDrawCalls++
-        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
-            Log.d(TAG, "eglSwapBuffers (warp): result=$swapResult error=0x${swapError.toString(16)}")
-        }
         return true
     }
 

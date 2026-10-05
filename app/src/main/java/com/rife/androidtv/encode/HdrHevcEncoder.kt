@@ -35,7 +35,12 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
         val frameRate: Int,
         /** 0 selects [autoBitrate] for the resolution; anything else is used verbatim. */
         val bitrateBps: Int = 0,
-        val iFrameIntervalSec: Int = 2,
+        /**
+         * Seconds between key frames. One second, not two: this stream goes over UDP, where a
+         * dropped datagram corrupts everything up to the next key frame, and at 4K a two-second GOP
+         * is two seconds of frozen picture after a single loss.
+         */
+        val iFrameIntervalSec: Int = 1,
         /**
          * B-frames are off by default and that is load bearing, not a performance preference:
          * the MPEG-TS muxer writes PTS only, which is correct exactly when decode order equals
@@ -97,10 +102,14 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
          * ~0.1 bit per pixel, which lands near 50 Mbps for 4K60 and near 5 Mbps for 1080p24 -
          * the bottom of the 40-80 Mbps band the plan asks to start testing in, deliberately below
          * the ~180-200 Mbps practical UDP ceiling so the first measurements are network-stable.
+         *
+         * The ceiling matters more than the target: a 4K60 stream at the uncapped ~500 Mbps would
+         * saturate a Wi-Fi link and turn the sink's drop-newest policy into a drop-everything
+         * policy. 80 Mbps is visually transparent for HEVC Main10 and leaves the link headroom.
          */
         private fun autoBitrate(width: Int, height: Int, frameRate: Int): Int {
             val bps = width.toLong() * height * frameRate / 10L
-            return bps.coerceIn(1_000_000L, 200_000_000L).toInt()
+            return bps.coerceIn(1_000_000L, 80_000_000L).toInt()
         }
 
         /** Every encoder in the system that can take `video/hevc`, in preference order. */
@@ -191,10 +200,13 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
                 setInteger(MediaFormat.KEY_LEVEL, config.level)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, config.maxBFrames)
+                // Realtime, zero-latency: without these the codec is free to buffer frames and add
+                // a frame of latency the network does not need.
+                setInteger(MediaFormat.KEY_LATENCY, 0)
+                setInteger(MediaFormat.KEY_PRIORITY, 0)
                 if (config.hdr10) {
                     setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
                     setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_ST2084)
-                    setInteger(MediaFormat.KEY_COLOR_TRANSFER_REQUEST, MediaFormat.COLOR_TRANSFER_ST2084)
                     setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
                     config.hdrStaticInfo?.let { info ->
                         // Rewound so the codec reads the whole payload; Media3 hands these over at
@@ -220,6 +232,9 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
     private var input: Surface? = null
 
     private var config: Config? = null
+
+    /** The drain thread, read by [signalEndOfStream] outside the monitor, so it must be volatile. */
+    @Volatile
     private var drain: Thread? = null
 
     /** Set by signalEndOfStream() and read by the drain thread, so it must be volatile. */
@@ -309,6 +324,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                 c.dequeueOutputBuffer(info, CODEC_TIMEOUT_US)
             } catch (t: Throwable) {
                 Log.e(TAG, "dequeueOutputBuffer failed", t)
+                sink.onError(t)
                 return
             }
             when {
@@ -337,6 +353,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                         c.getOutputBuffer(index)
                     } catch (t: Throwable) {
                         Log.e(TAG, "getOutputBuffer($index) failed", t)
+                        sink.onError(t)
                         return
                     }
                     if (buf == null) {
@@ -368,6 +385,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                         c.releaseOutputBuffer(index, false)
                     } catch (t: Throwable) {
                         Log.e(TAG, "releaseOutputBuffer($index) failed", t)
+                        sink.onError(t)
                         return
                     }
                     if (eos) {
@@ -383,7 +401,6 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
      * Asks the codec to finish. Frames still in flight are drained before the loop exits; returns
      * once the drain thread has stopped or [timeoutMs] has elapsed.
      */
-    @Synchronized
     fun signalEndOfStream(timeoutMs: Long = 5_000L): Boolean {
         val c = codec ?: return true
         if (!eosRequested) {
@@ -396,6 +413,8 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                 Log.e(TAG, "signalEndOfInputStream failed", t)
             }
         }
+        // Joined outside the monitor: the drain thread can be blocked in a sink callback, and a
+        // join that holds the lock would stall every other caller behind a sink that never returns.
         val thread = drain ?: return true
         thread.join(timeoutMs)
         return !thread.isAlive
