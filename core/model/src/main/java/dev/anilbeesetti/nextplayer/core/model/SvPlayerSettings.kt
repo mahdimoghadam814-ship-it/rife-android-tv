@@ -24,12 +24,17 @@ enum class SvBlockSizeSetting {
 
 /**
  * Temporal blend offered by [SvPlayerSettings.blendAlgorithm], mirroring the SVP `algo` switch.
- * The rungs are cumulative, so each one keeps everything the one below it did:
- * BIDIRECTIONAL is the plain forward/backward average (`algo 11`), MEDIAN additionally takes the
- * per-pixel median so a single wrong vector cannot pull the result (`algo 13`, SVP's
- * minimum-artifact setting), and COVER additionally weights the two directions by their
- * cover/uncover masks so an uncovered region follows the frame that actually contains it
- * (`algo 21`).
+ *
+ * The three are alternatives rather than cumulative rungs - SVP's own documentation lists 21 as
+ * "11th plus additional cover/uncover masking", not as 13 with a mask added - so each one keeps
+ * exactly what it is named after and drops the other: BIDIRECTIONAL is the plain time weighted
+ * blend of forward and backward partial motion compensations (`algo 11`, "Simple Lite"),
+ * MEDIAN additionally takes the per-pixel median of both warps and the plain unwarped crossfade
+ * (`algo 13`, "Standard", SVP's own default, documented as producing minimum artifacts but with
+ * noticeable halos around moving objects), and COVER instead weights the two directions by their
+ * cover/uncover masks (`algo 21`, "Simple", which minimizes those halos and improves frame
+ * edges). The reference also offers a 23 - 21 plus extra vectors from the adjacent frames - which
+ * this surface does not model.
  */
 @Serializable
 enum class SvBlendAlgorithmSetting {

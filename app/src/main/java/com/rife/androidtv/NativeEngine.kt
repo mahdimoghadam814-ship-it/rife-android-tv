@@ -105,6 +105,18 @@ object NativeEngine {
     @JvmStatic
     external fun motionFieldStep(): Int
 
+    /**
+     * Which of SVP's renderers the warp blends with: 0 is the plain forward/backward time blend
+     * (`algo 11`), 1 adds the dynamic median (`algo 13`, SVP's own default), 2 adds cover/uncover
+     * (`algo 21`). The three are alternatives rather than cumulative rungs.
+     *
+     * Read from the interpolator rather than from the settings so that the CPU fallback and the
+     * GL shader cannot disagree, and so that it reads 2 for every algorithm but SVPlayer - a
+     * user who picks MEDIAN and then switches back to MEMC must not move MEMC with it.
+     */
+    @JvmStatic
+    external fun motionFieldBlendMode(): Int
+
     @JvmStatic
     external fun setSvPlayerSettings(
         performanceQuality: Float,

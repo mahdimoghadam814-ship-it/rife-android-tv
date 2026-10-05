@@ -162,6 +162,17 @@ public:
     // has to agree with this to the pixel: gridW is ceil(width / blockStep()), not ceil(/16).
     int blockStep() const;
 
+    // Which of SVP's renderers to blend with: 0 = algo 11 (plain forward/backward time blend),
+    // 1 = algo 13 (plus the dynamic median), 2 = algo 21 (plus cover/uncover). They are
+    // alternatives in SVP, not cumulative rungs - 21 does not include the median - and the
+    // reference ships 13.
+    //
+    // MEMC has no SvConfig of its own and must keep the path it has always taken, so this reads
+    // as 2 for every algorithm but SVPlayer. Both the CPU warp and the GL shader take their mode
+    // from here rather than from the raw setting, which is what stops a user who picks MEDIAN and
+    // then switches to MEMC from moving MEMC.
+    int blendMode() const;
+
     void reset();
 
     // Sizing of the persistent worker pool. Creating std::threads per parallel region

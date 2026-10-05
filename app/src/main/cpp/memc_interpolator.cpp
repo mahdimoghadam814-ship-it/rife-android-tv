@@ -241,6 +241,19 @@ static inline uint8x8_t blend256(uint8x8_t a, uint8x8_t b, int k) {
     return vmovn_u16(v);
 }
 
+// Per-lane median of three bytes, as a + b + c - min - max. This is what SVPlayer's algo 13 adds
+// to algo 11: the third candidate is the plain unwarped crossfade, so at t = 0 two of the three
+// coincide with in0 and at t = 1 two of them coincide with in1, which keeps the median pinned to
+// the source frame at both ends of the interval; in between it discards whichever candidate is
+// the outlier, which is what removes the artifacts and what leaves the halos around moving
+// objects the reference implementation is documented to show.
+static inline uint8x8_t median3u8(uint8x8_t a, uint8x8_t b, uint8x8_t c) {
+    const uint8x8_t lo = vmin_u8(vmin_u8(a, b), c);
+    const uint8x8_t hi = vmax_u8(vmax_u8(a, b), c);
+    const uint16x8_t sum = vaddw_u8(vaddw_u8(vmovl_u8(a), b), c);
+    return vmovn_u16(vsubq_u16(sum, vaddl_u8(lo, hi)));
+}
+
 // CPU time actually consumed by the calling thread, excluding time spent descheduled.
 // Comparing this against wall time separates "the core is too slow" from "the thread
 // is being starved by MediaCodec / GL / SurfaceFlinger sharing the same four cores".
@@ -988,6 +1001,11 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     const int step = blockStep();
     const int bwx = (w + step - 1) / step;
     const int bwy = (h + step - 1) / step;
+    // SVP's three renderers are alternatives, not a ladder: 0 (algo 11) is the plain time blend,
+    // 1 (algo 13) adds the dynamic median, 2 (algo 21) adds cover/uncover instead. Everything
+    // below this line keys off that one number, and blendMode() pins it to 2 for MEMC, so the
+    // baseline keeps taking the branch it has always taken.
+    const int blendMode = this->blendMode();
     const float t = timestep;
     const float u = 1.0f - t;
     // Final time blend as a 1/256 weight on in1: (a*(256-k) + b*k + 128) >> 8 is an exact,
@@ -1086,11 +1104,27 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
 
                     const int mf = (rmf0 * wx0 + rmf1 * wx1 + 128) >> 8;
                     const int mb = (rmb0 * wx0 + rmb1 * wx1 + 128) >> 8;
-                    if ((mf | mb) == 0) {
-                        // The unoccluded case - and the only case a uniform field ever
-                        // produces - stays on the original path, byte for byte.
+                    if (blendMode != 2 || (mf | mb) == 0) {
+                        // Algo 11, plus algo 13's median when that is the selected renderer.
+                        // This is also the only branch MEMC and algo 21's unoccluded case ever
+                        // reach, so both of them stay byte for byte where they were.
                         uint32_t px = 0;
-                        vst1_lane_u32(&px, vreinterpret_u32_u8(blend256(ca, cb, wt)), 0);
+                        if (blendMode == 1) {
+                            const uint8_t* pu0 = in0 + (outRow + static_cast<size_t>(x)) * 4;
+                            const uint8_t* pu1 = in1 + (outRow + static_cast<size_t>(x)) * 4;
+                            // The third candidate is the plain unwarped crossfade. It is read
+                            // as four scalars into an 8-byte scratch rather than with vld1_u8:
+                            // a frame buffer is exactly w*h*4 bytes, so a vector load at the
+                            // last pixel would run off the end of the allocation - which, for a
+                            // buffer that happens to fill whole pages, is a fault and not merely
+                            // a read of whatever the allocator left there.
+                            uint8_t t0[8] = {pu0[0], pu0[1], pu0[2], pu0[3], 0, 0, 0, 0};
+                            uint8_t t1[8] = {pu1[0], pu1[1], pu1[2], pu1[3], 0, 0, 0, 0};
+                            const uint8x8_t plain = blend256(vld1_u8(t0), vld1_u8(t1), wt);
+                            vst1_lane_u32(&px, vreinterpret_u32_u8(median3u8(ca, cb, plain)), 0);
+                        } else {
+                            vst1_lane_u32(&px, vreinterpret_u32_u8(blend256(ca, cb, wt)), 0);
+                        }
                         *po = px | 0xFF000000u;
                         continue;
                     }
@@ -1378,6 +1412,12 @@ int MemcInterpolator::blockStep() const {
     if (overlapPx <= 0) return kBlock;
     const int step = kBlock - overlapPx;
     return step < 8 ? 8 : step;
+}
+
+int MemcInterpolator::blendMode() const {
+    if (algorithm() != static_cast<int>(InterpolationAlgorithm::SVPLAYER)) return 2;
+    const int mode = sv_config_.blendAlgorithm;
+    return (mode == 0 || mode == 1) ? mode : 2;
 }
 
 size_t MemcInterpolator::motionFieldBytes(int targetWidth, int targetHeight, int step) {

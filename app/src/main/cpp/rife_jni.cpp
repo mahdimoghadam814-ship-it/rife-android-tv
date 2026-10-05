@@ -106,6 +106,15 @@ Java_com_rife_androidtv_NativeEngine_motionFieldStep(JNIEnv*, jclass) {
     return static_cast<jint>(g_memc.blockStep());
 }
 
+// Which of SVP's three renderers the warp should blend with: 0 = algo 11, 1 = algo 13, 2 = algo
+// 21. Taken from the interpolator rather than from the raw setting because blendMode() pins it
+// to 2 for every algorithm except SVPlayer - the CPU warp already reads it there, and the shader
+// has to make the same choice or the two paths would disagree about what they are rendering.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rife_androidtv_NativeEngine_motionFieldBlendMode(JNIEnv*, jclass) {
+    return static_cast<jint>(g_memc.blendMode());
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_rife_androidtv_NativeEngine_setSvPlayerSettings(
     JNIEnv* env, jclass clazz,

@@ -105,6 +105,14 @@ class GlOutputRenderer {
          * warp; if both are covered the pair collapses to a plain crossfade. The `occ == 0`
          * branch is the overwhelmingly common one and reproduces `mix(ca, cb, t)` exactly, so an
          * unoccluded frame costs two texture fetches more than it did before the masks existed.
+         * The fetch is inside `uBlendMode == 2`, because algo 11 and algo 13 deliberately do not
+         * read the masks at all.
+         *
+         * `uBlendMode` selects between those three: 0 is algo 11 (the plain time blend), 1 is
+         * algo 13 (plus the dynamic median), 2 is algo 21 (plus cover/uncover). SVP documents
+         * them as alternatives - 21 does not include the median - and ships 13; MEMC is pinned
+         * to 2 by `NativeEngine.motionFieldBlendMode()` so that picking a different renderer
+         * cannot move it.
          */
         private const val WARP_FRAGMENT_SHADER = """
             #ifdef GL_FRAGMENT_PRECISION_HIGH
@@ -121,6 +129,15 @@ class GlOutputRenderer {
             uniform vec2 uMotionGrid;
             uniform vec2 uMotionOffset;
             uniform float uTimestep;
+            // 0 = algo 11, 1 = algo 13, 2 = algo 21 - SVP's three renderers, which are
+            // alternatives rather than cumulative rungs. It comes from
+            // NativeEngine.motionFieldBlendMode(), the same accessor the CPU warp uses, so the
+            // fallback path and this one can never disagree about what they are rendering.
+            uniform int uBlendMode;
+            // Per-channel median of three, as a + b + c - min - max.
+            vec3 median3(vec3 a, vec3 b, vec3 c) {
+                return a + b + c - min(min(a, b), c) - max(max(a, b), c);
+            }
             void main() {
                 vec2 p = vTextureCoord * uTargetSize - 0.5;
                 vec2 g = (p + uMotionOffset) / uMotionGrid;
@@ -131,23 +148,39 @@ class GlOutputRenderer {
                 vec2 pb = p - mvb * (1.0 - uTimestep);
                 vec3 ca = texture2D(uFrame0, (pa + 0.5) / uTargetSize).rgb;
                 vec3 cb = texture2D(uFrame1, (pb + 0.5) / uTargetSize).rgb;
-                vec2 occ = texture2D(uMask, g).rg;
-                vec3 termF = ca;
-                vec3 termB = cb;
-                if (occ.r > 0.0 || occ.g > 0.0) {
+                vec3 blended;
+                if (uBlendMode == 1) {
+                    // Algo 13. The third candidate is the plain unwarped crossfade: two of the
+                    // three coincide with in0 at t = 0 and with in1 at t = 1, so the median is
+                    // still the source frame at both ends of the interval; in between it throws
+                    // away whichever candidate is the outlier, which is what buys the minimum
+                    // artifacts and what costs the halos around moving objects.
                     vec2 raw = (p + 0.5) / uTargetSize;
-                    vec3 innerF = ca;
-                    if (occ.r > 0.0) {
-                        innerF = mix(ca, texture2D(uFrame1, raw).rgb, occ.r);
+                    vec3 plain = mix(texture2D(uFrame0, raw).rgb,
+                                     texture2D(uFrame1, raw).rgb, uTimestep);
+                    blended = median3(ca, cb, plain);
+                } else {
+                    vec3 termF = ca;
+                    vec3 termB = cb;
+                    if (uBlendMode == 2) {
+                        vec2 occ = texture2D(uMask, g).rg;
+                        if (occ.r > 0.0 || occ.g > 0.0) {
+                            vec2 raw = (p + 0.5) / uTargetSize;
+                            vec3 innerF = ca;
+                            if (occ.r > 0.0) {
+                                innerF = mix(ca, texture2D(uFrame1, raw).rgb, occ.r);
+                            }
+                            vec3 innerB = cb;
+                            if (occ.g > 0.0) {
+                                innerB = mix(cb, texture2D(uFrame0, raw).rgb, occ.g);
+                            }
+                            termF = mix(ca, innerB, occ.r);
+                            termB = mix(cb, innerF, occ.g);
+                        }
                     }
-                    vec3 innerB = cb;
-                    if (occ.g > 0.0) {
-                        innerB = mix(cb, texture2D(uFrame0, raw).rgb, occ.g);
-                    }
-                    termF = mix(ca, innerB, occ.r);
-                    termB = mix(cb, innerF, occ.g);
+                    blended = mix(termF, termB, uTimestep);
                 }
-                gl_FragColor = vec4(mix(termF, termB, uTimestep), 1.0);
+                gl_FragColor = vec4(blended, 1.0);
             }
         """
 
@@ -269,6 +302,7 @@ class GlOutputRenderer {
     private var warpUTargetSize = -1
     private var warpUMotionGrid = -1
     private var warpUMotionOffset = -1
+    private var warpUBlendMode = -1
     private var warpUTimestep = -1
     private var warpTex0 = 0
     private var warpTex1 = 0
@@ -283,6 +317,8 @@ class GlOutputRenderer {
     // Pitch the motion texture above was uploaded at, so drawWarp() can build the same
     // uMotionGrid/uMotionOffset pair the native side packed the field with.
     private var warpGridStep = 16
+    // Renderer drawWarp() should blend with, read from the same accessor the CPU warp uses.
+    private var warpBlendMode = 2
     private var warpDrawCalls = 0L
 
     // ---- Temporal denoiser (see DENOISE_FRAGMENT_SHADER) ----
@@ -507,11 +543,13 @@ class GlOutputRenderer {
         warpUTargetSize = GLES20.glGetUniformLocation(newProgram, "uTargetSize")
         warpUMotionGrid = GLES20.glGetUniformLocation(newProgram, "uMotionGrid")
         warpUMotionOffset = GLES20.glGetUniformLocation(newProgram, "uMotionOffset")
+        warpUBlendMode = GLES20.glGetUniformLocation(newProgram, "uBlendMode")
         warpUTimestep = GLES20.glGetUniformLocation(newProgram, "uTimestep")
 
         if (warpAPosition < 0 || warpATexCoord < 0 || warpUContentScale < 0 ||
             warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 || warpUMask < 0 ||
             warpUTargetSize < 0 || warpUMotionGrid < 0 || warpUMotionOffset < 0 ||
+            warpUBlendMode < 0 ||
             warpUTimestep < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
@@ -947,6 +985,7 @@ class GlOutputRenderer {
         warpGridW = gridW
         warpGridH = gridH
         warpGridStep = gridStep
+        warpBlendMode = NativeEngine.motionFieldBlendMode()
         nsUpload += System.nanoTime() - tPhase
 
         return drawWarps(
@@ -1066,6 +1105,7 @@ class GlOutputRenderer {
         warpGridW = gridW
         warpGridH = gridH
         warpGridStep = gridStep
+        warpBlendMode = NativeEngine.motionFieldBlendMode()
         nsUpload += System.nanoTime() - tPhase
 
         // The history read and the history written are never the same texture, so there is no
@@ -1233,6 +1273,7 @@ class GlOutputRenderer {
         warpGridW = gridW
         warpGridH = gridH
         warpGridStep = gridStep
+        warpBlendMode = NativeEngine.motionFieldBlendMode()
         nsUpload += System.nanoTime() - tPhase
 
         return drawWarps(
@@ -1386,6 +1427,7 @@ class GlOutputRenderer {
         )
         val motionOffset = motionOffsetFor(warpGridStep)
         GLES20.glUniform2f(warpUMotionOffset, motionOffset, motionOffset)
+        GLES20.glUniform1i(warpUBlendMode, warpBlendMode)
         GLES20.glUniform1f(warpUTimestep, timestep)
 
         // Always uploaded, never gated on updateContentScale(): each program has its own uniform
@@ -1604,6 +1646,7 @@ class GlOutputRenderer {
             warpGridW = 0
             warpGridH = 0
             warpGridStep = 16
+            warpBlendMode = 2
             GLES20.glDeleteProgram(warpProgram)
             warpProgram = 0
         }
@@ -1651,6 +1694,7 @@ class GlOutputRenderer {
         warpUTargetSize = -1
         warpUMotionGrid = -1
         warpUMotionOffset = -1
+        warpUBlendMode = -1
         warpUTimestep = -1
         aPositionHandle = -1
         aTextureCoordHandle = -1
