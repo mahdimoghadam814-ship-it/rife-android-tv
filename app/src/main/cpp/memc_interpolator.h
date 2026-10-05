@@ -27,20 +27,20 @@ bool producesMotionField(int algorithm);
 // much of the bad-area mask is allowed to suppress a blend.
 struct SvConfig {
     // 0f is the performance end, 1f the quality end.
-    float performanceQuality = 0.6f;
+    float performanceQuality = 1.0f;
     // 0f disables bad-area masking, 1f masks every block the search could not explain.
-    float artifactMaskLevel = 0.5f;
+    float artifactMaskLevel = 1.0f;
     // 0 = derive from performanceQuality, otherwise 16x8 / 32x8 / 32x16 by index.
-    int blockSize = 0;
+    int blockSize = 3;
     // Pixels; 0 derives it from local contrast, which is SVP's negative search distance.
-    int searchDistance = 0;
+    int searchDistance = 16;
     // 1 = whole pixel, 2 = half pixel.
     int subpel = 2;
     // Quarter-blocks of overlap between neighbours: 0, 1 or 2.
     int overlap = 2;
-    float penaltyLambda = 10.0f;
+    float penaltyLambda = 30.0f;
     // 0 = forward/backward average, 1 = plus per-pixel median, 2 = plus cover/uncover.
-    int blendAlgorithm = 1;
+    int blendAlgorithm = 2;
     int sceneAdaptive = 1;
     // Luma downscale the search runs at: 1 full, 2 half.
     int meScale = 1;
