@@ -9,25 +9,6 @@ import android.view.Surface
 import java.nio.ByteBuffer
 
 /**
- * Receives everything a [HdrHevcEncoder] produces.
- *
- * Both callbacks are invoked on the encoder's drain thread and must not block: the codec stops
- * producing as soon as the caller stops consuming, and a stalled drain thread stalls the whole
- * pipeline behind the encoder.
- */
-interface EncodedStreamSink {
-    /** Called once, when the codec reports its real output [MediaFormat]. */
-    fun onOutputFormat(format: MediaFormat)
-
-    /**
-     * One encoded access unit, [MediaCodec.BufferInfo.size] bytes starting at
-     * `data.arrayOffset() + data.position()`. Reused by the codec after the call returns, so a
-     * sink that keeps the bytes must copy them.
-     */
-    fun onAccessUnit(data: ByteBuffer, info: MediaCodec.BufferInfo)
-}
-
-/**
  * The hardware HEVC Main10 HDR encoder of Phase C: `MediaCodec` in, encoded H.265 access units
  * out, GPU-resident on the input side.
  *

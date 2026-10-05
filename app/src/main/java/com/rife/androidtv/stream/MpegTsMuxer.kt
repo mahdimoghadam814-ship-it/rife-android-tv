@@ -208,7 +208,12 @@ class MpegTsMuxer(
      * players drop frames or exit, and reporting that once is more useful than a silent repair.
      */
     private fun nextPtsUs(rawUs: Long): Long {
-        val usable = rawUs > 0 && (lastPtsUs == Long.MIN_VALUE || rawUs > lastPtsUs)
+        // Zero is a perfectly good timestamp for the first frame, so the test is not "greater
+        // than zero" but "non-negative and increasing". Once the timeline has been taken over it
+        // stays taken over: a stream that switches back to codec timestamps mid-play is the
+        // discontinuity this fallback exists to avoid.
+        val usable = !fallbackActive && rawUs >= 0 &&
+            (lastPtsUs == Long.MIN_VALUE || rawUs > lastPtsUs)
         val pts = if (usable) {
             rawUs
         } else {
@@ -229,7 +234,12 @@ class MpegTsMuxer(
     private fun toTicks(ptsUs: Long): Long = (ptsUs * 90L / 1000L) and PTS_MASK
 
     private fun pcrDue(pts90: Long): Boolean {
-        if (lastPcr90 == Long.MIN_VALUE) return true
+        if (lastPcr90 == Long.MIN_VALUE) {
+            // Record it. Returning without recording leaves the sentinel in place forever, which
+            // puts a PCR on every single access unit instead of every PCR_INTERVAL_90KHZ.
+            lastPcr90 = pts90
+            return true
+        }
         val since = (pts90 - lastPcr90) and PTS_MASK
         if (since >= PCR_INTERVAL_90KHZ) {
             lastPcr90 = pts90
