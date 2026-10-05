@@ -81,7 +81,11 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_rife_androidtv_NativeEngine_setInterpolationAlgorithm(
     JNIEnv* env, jclass clazz, jint algorithm
 ) {
-    g_interp_algorithm.store(static_cast<int>(algorithm), std::memory_order_relaxed);
+    const int value = static_cast<int>(algorithm);
+    g_interp_algorithm.store(value, std::memory_order_relaxed);
+    // The interpolator keeps its own copy: the search is a member function and reads settings
+    // through `this`, where the file-scope atomic is not in scope.
+    g_memc.setAlgorithm(value);
 }
 
 extern "C" JNIEXPORT void JNICALL

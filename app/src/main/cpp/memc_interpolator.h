@@ -157,6 +157,11 @@ public:
     void setSvConfig(const SvConfig& config) { sv_config_ = config; }
     const SvConfig& svConfig() const { return sv_config_; }
 
+    // Which InterpolationAlgorithm is in force. The search reads this rather than a flag so the
+    // SVPlayer tuning never leaks into the plain MEMC baseline the user is comparing against.
+    void setAlgorithm(int algorithm) { algorithm_.store(algorithm, std::memory_order_relaxed); }
+    int algorithm() const { return algorithm_.load(std::memory_order_relaxed); }
+
     // Wall-clock duration of the most recent interpolate() call, for diagnostics.
     double lastDurationMs() const { return last_ms_.load(std::memory_order_relaxed); }
 
@@ -259,6 +264,7 @@ private:
 
     std::atomic<int> threads_{1};
     std::atomic<double> last_ms_{0.0};
+    std::atomic<int> algorithm_{0};
     SvConfig sv_config_{};
 
     // Per-stage accumulation for diagnostics. Only touched by the pipeline worker thread

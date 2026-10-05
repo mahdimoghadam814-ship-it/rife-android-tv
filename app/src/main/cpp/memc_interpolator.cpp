@@ -63,6 +63,26 @@ static inline int sad8x8(const uint8_t* a, const uint8_t* b, int stride) {
     return static_cast<int>(vget_lane_u32(q, 0));
 }
 
+// SAD over an arbitrary bw x bh window, tiled in 8x8 units so every row and column stays on the
+// NEON path sad8x8() uses. The matching window is the SVPlayer `block.w` / `block.h` knob: a
+// wider or taller window averages over more picture, so noise and repeating texture have a
+// harder time faking a match - which is the trade SVP states as "larger blocks less sensitive
+// to noise, smaller blocks produce more wavy picture". bw and bh must be multiples of 8 and at
+// least 8; callers reach that by rounding their window down to a whole tile.
+static inline int sadWin(const uint8_t* a, const uint8_t* b, int stride, int bw, int bh) {
+    if (bw == 16 && bh == 16) return sad16x16(a, b, stride);
+    if (bw == 8 && bh == 8) return sad8x8(a, b, stride);
+    int s = 0;
+    for (int y = 0; y + 8 <= bh; y += 8) {
+        const uint8_t* ra = a + y * stride;
+        const uint8_t* rb = b + y * stride;
+        for (int x = 0; x + 8 <= bw; x += 8) {
+            s += sad8x8(ra + x, rb + x, stride);
+        }
+    }
+    return s;
+}
+
 
 // MV coherence penalties, in SAD counts per full-resolution pixel of deviation. These are the
 // block-matching counterpart of SVP's penalty.* settings and they are what keeps a per-block
@@ -541,8 +561,45 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
     std::fill(mvy, mvy + nblocks, 0);
     if (w < kBlock || h < kBlock) return 0;   // no full 16x16 window exists; MVs stay zero
 
-    // Sum of the accepted vectors' plain SAD at the finest level, in luma counts over whole
-    // blocks. One fetch_add per parallel work unit, so the reduction costs nothing measurable.
+    // The SVPlayer tuning only applies when that backend is the one selected. MEMC keeps the
+    // measured baseline above unchanged so the two stay comparable from run to run.
+    const bool sv = algorithm() == static_cast<int>(InterpolationAlgorithm::SVPLAYER);
+    int coarseBase = kCoarseRange;
+    int fineBase = kFineRange;
+    int newLambdaBase = kPenaltyNew;
+    int zeroLambdaBase = kPenaltyZero;
+    int searchDistance = 0;
+    int winW = kBlock;
+    int winH = kBlock;
+    if (sv) {
+        const SvConfig& c = sv_config_;
+        const float q = c.performanceQuality < 0.0f ? 0.0f
+                      : (c.performanceQuality > 1.0f ? 1.0f : c.performanceQuality);
+        // The performance bar is one ladder read three ways: how far the search looks, how hard
+        // the penalties pull it back together, and how much picture each match averages over.
+        coarseBase = 4 + static_cast<int>(q * 8.0f + 0.5f);
+        fineBase = 1 + static_cast<int>(q * 2.0f + 0.5f);
+        newLambdaBase = static_cast<int>(c.penaltyLambda + 0.5f);
+        zeroLambdaBase = static_cast<int>(c.penaltyLambda * 0.25f + 0.5f);
+        searchDistance = c.searchDistance > 0 ? c.searchDistance : 0;
+        switch (c.blockSize) {
+            case 1: winW = 16; winH = 8;   break;
+            case 2: winW = 32; winH = 8;   break;
+            case 3: winW = 32; winH = 16;  break;
+            default:
+                // AUTO: the quality bar picks the rung, so the two controls never fight over it.
+                if (q < 0.4f)       { winW = 16; winH = 8;  }
+                else if (q < 0.75f) { winW = 32; winH = 8;  }
+                else                { winW = 32; winH = 16; }
+                break;
+        }
+    }
+
+    // Sum of the accepted vectors' plain 16x16 whole-pixel SAD at the finest level, in luma
+    // counts over whole blocks. One fetch_add per parallel work unit, so the reduction costs
+    // nothing measurable. Measured with a fixed window regardless of what the search scored
+    // with, which is what keeps the scene-change threshold meaningful when the matching window
+    // changes.
     std::atomic<long long> sadAcc{0};
 
     // Coarse -> fine. One search at level l covers a `group x group` set of
@@ -560,16 +617,32 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         const int groupsX = (bwx + div - 1) / div;
         const int lrows = std::min((lh + kBlock - 1) / kBlock, groupsY);
         const int lcols = std::min((lw + kBlock - 1) / kBlock, groupsX);
-        const int range = (l == kLevels - 1) ? kCoarseRange : kFineRange;
         const int group = div;                      // full-res blocks per side
+
+        int base;
+        if (!sv) {
+            base = (l == kLevels - 1) ? kCoarseRange : kFineRange;
+        } else if (searchDistance > 0) {
+            // An explicit distance is a reach in full-resolution pixels. The pyramid spends it
+            // where it can afford it - the coarse level, which is what sets the prediction -
+            // and the fine level stays inside its quality budget, so a wide setting widens the
+            // search instead of blowing the frame budget.
+            const int cap = (l == kLevels - 1) ? 16 : fineBase;
+            base = clampi(searchDistance >> l, 0, cap);
+        } else {
+            base = (l == kLevels - 1) ? coarseBase : fineBase;
+        }
+
         // Both penalties are scaled by div so they are charged per full-resolution pixel and
         // their strength is the same at every level. The coarsest level is seeded from an
         // all-zero field, so kPenaltyNew is switched off there - otherwise it would only be
         // charging the search for finding motion at all.
-        const int newLambda = (l == kLevels - 1) ? 0 : kPenaltyNew * div;
-        const int zeroLambda = kPenaltyZero * div;
+        const int newLambda = (l == kLevels - 1) ? 0 : newLambdaBase * div;
+        const int zeroLambda = zeroLambdaBase * div;
         const uint8_t* tgt = tgtPyr[l];
         const uint8_t* ref = refPyr[l];
+        // Shown to the SAD only through `range`, so it can be read once per level.
+        const bool adaptive = sv && searchDistance == 0 && base > 1;
 
         parallelFor(0, lrows, [&](int r0, int r1) {
             long long localSad = 0;
@@ -586,6 +659,26 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                     const int gy = mvy[idx] / div;
 
                     const uint8_t* tb = tgt + by * lw + bx;
+                    // The matching window for this block, rounded down to a whole 8x8 tile so
+                    // the NEON path stays intact, and never past the edge of the level.
+                    const int bw = clampi((std::min(winW, lw - bx)) & ~7, 8, winW);
+                    const int bh = clampi((std::min(winH, lh - by)) & ~7, 8, winH);
+
+                    int range = base;
+                    if (adaptive) {
+                        // SVP's negative search distance: derive the reach from how well the
+                        // block already explains itself. A block that does not match at zero
+                        // shift has real motion to chase and gets the full reach; one that
+                        // already lines up only has to confirm it. Averaged over a frame this
+                        // lands near a third of nominal, which is where SVP reports the
+                        // adaptive setting sitting - and a short look in the flat areas is
+                        // what stops a repeating texture from pulling the vector around.
+                        const int zero = sadWin(tb, ref + by * lw + bx, lw, bw, bh);
+                        const int span = 32 * bw * bh;   // 32 per pixel = clearly unmatched
+                        const int hit = clampi(zero, 0, span);
+                        range = base / 3 + ((base - base / 3) * hit) / span;
+                    }
+
                     int best = 0x7FFFFFFF;
                     int bestDx = gx, bestDy = gy;
                     // Plain SAD of the winning candidate, without the penalties: that is the
@@ -594,12 +687,12 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
 
                     for (int dy = -range; dy <= range; dy++) {
                         const int yy = by + gy + dy;
-                        if (yy < 0 || yy + kBlock > lh) continue;
+                        if (yy < 0 || yy + bh > lh) continue;
                         const uint8_t* row = ref + yy * lw;
                         for (int dx = -range; dx <= range; dx++) {
                             const int xx = bx + gx + dx;
-                            if (xx < 0 || xx + kBlock > lw) continue;
-                            const int s = sad16x16(tb, row + xx, lw);
+                            if (xx < 0 || xx + bw > lw) continue;
+                            const int s = sadWin(tb, row + xx, lw, bw, bh);
                             int score = s;
                             score += newLambda * (std::abs(dx) + std::abs(dy));
                             score += zeroLambda * (std::abs(gx + dx) + std::abs(gy + dy));
@@ -611,7 +704,22 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                             }
                         }
                     }
-                    if (l == 0 && bestPlain >= 0) localSad += bestPlain;
+                    if (l == 0 && bestPlain >= 0) {
+                        int gateSad = bestPlain;
+                        if (bw != kBlock || bh != kBlock) {
+                            // The gate wants a whole 16x16 whole-pixel SAD. Where the matching
+                            // window is not that shape, re-measure the winner at 16x16, and
+                            // fall back to the zero-shift match if the winner runs off the
+                            // level - a partial window would otherwise read a different
+                            // number of pixels and rescale the threshold.
+                            const int wx = bx + bestDx;
+                            const int wy = by + bestDy;
+                            gateSad = (wx >= 0 && wy >= 0 && wx + kBlock <= lw && wy + kBlock <= lh)
+                                ? sad16x16(tb, ref + wy * lw + wx, lw)
+                                : sad16x16(tb, ref + by * lw + bx, lw);
+                        }
+                        localSad += gateSad;
+                    }
 
                     const int32_t mvFullX = static_cast<int32_t>(bestDx * div);
                     const int32_t mvFullY = static_cast<int32_t>(bestDy * div);
@@ -754,6 +862,24 @@ void MemcInterpolator::buildOcclusionMasks(int w, int h) {
     };
     fill(mvf_x_.data(), mvf_y_.data(), maskf_.data());
     fill(mvb_x_.data(), mvb_y_.data(), maskb_.data());
+
+    // How much of a fold the blend is still allowed to trust. Zero hands every sample back to
+    // the motion field unchallenged; one keeps the raw divergence measure. Scaled here rather
+    // than where the field is packed, so the CPU warp and the shader see the same mask. This is
+    // the SVPlayer artifact-masking bar, and only it - the MEMC path always ran at full mask.
+    if (algorithm() == static_cast<int>(InterpolationAlgorithm::SVPLAYER)) {
+        const float scale = sv_config_.artifactMaskLevel;
+        if (scale < 1.0f) {
+            const int cap = scale < 0.0f ? 0 : static_cast<int>(scale * 255.0f + 0.5f);
+            auto rescale = [&](uint8_t* m) {
+                for (size_t i = 0; i < nblocks; i++) {
+                    m[i] = static_cast<uint8_t>((m[i] * cap + 127) / 255);
+                }
+            };
+            rescale(maskf_.data());
+            rescale(maskb_.data());
+        }
+    }
 }
 
 void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
@@ -1061,7 +1187,12 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     const int bwx = (w + kBlock - 1) / kBlock;
     const int bwy = (h + kBlock - 1) / kBlock;
     const double nblocks = static_cast<double>(bwx) * bwy;
-    if (nblocks > 0.0) {
+    // The scene gate is the user's to switch off. With it off the warp always runs, even where
+    // the two frames have nothing to do with each other - which is what the switch promises -
+    // and the search is left to explain the picture on its own.
+    const bool gateScenes = algorithm() != static_cast<int>(InterpolationAlgorithm::SVPLAYER) ||
+                            sv_config_.sceneAdaptive;
+    if (gateScenes && nblocks > 0.0) {
         const double scale = 1.0 / (nblocks * kBlock * kBlock);
         const double meanFwd = static_cast<double>(sadFwd) * scale;
         // With the backward search skipped there is only one signal to judge, and requiring both
