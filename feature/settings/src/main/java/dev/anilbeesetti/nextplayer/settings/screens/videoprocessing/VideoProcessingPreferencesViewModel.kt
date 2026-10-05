@@ -8,6 +8,7 @@ import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
+import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.core.ui.base.MviViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -52,6 +53,7 @@ class VideoProcessingPreferencesViewModel(
             is VideoProcessingPreferencesUiEvent.UpdateInterpolationAlgorithm -> updateInterpolationAlgorithm(action.value)
             is VideoProcessingPreferencesUiEvent.UpdateMemcLevel -> updateMemcLevel(action.value)
             is VideoProcessingPreferencesUiEvent.UpdateDenoiseLevel -> updateDenoiseLevel(action.value)
+            is VideoProcessingPreferencesUiEvent.UpdateSvPlayerSettings -> updateSvPlayerSettings(action.value)
         }
     }
 
@@ -108,6 +110,14 @@ class VideoProcessingPreferencesViewModel(
             }
         }
     }
+
+    private fun updateSvPlayerSettings(value: SvPlayerSettings) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences {
+                it.copy(svPlayerSettings = value)
+            }
+        }
+    }
 }
 
 @Stable
@@ -132,4 +142,5 @@ sealed interface VideoProcessingPreferencesUiEvent {
     data class UpdateInterpolationAlgorithm(val value: InterpolationAlgorithmSetting) : VideoProcessingPreferencesUiEvent
     data class UpdateMemcLevel(val value: MemcLevelSetting) : VideoProcessingPreferencesUiEvent
     data class UpdateDenoiseLevel(val value: DenoiseLevelSetting) : VideoProcessingPreferencesUiEvent
+    data class UpdateSvPlayerSettings(val value: SvPlayerSettings) : VideoProcessingPreferencesUiEvent
 }

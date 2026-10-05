@@ -94,6 +94,20 @@ object NativeEngine {
     external fun setMemcThreadCount(threads: Int)
 
     @JvmStatic
+    external fun setSvPlayerSettings(
+        performanceQuality: Float,
+        artifactMaskLevel: Float,
+        blockSize: Int,
+        searchDistance: Int,
+        subpel: Int,
+        overlap: Int,
+        penaltyLambda: Float,
+        blendAlgorithm: Int,
+        sceneAdaptive: Int,
+        meScale: Int,
+    )
+
+    @JvmStatic
     external fun resetMemcState()
 
     @JvmStatic

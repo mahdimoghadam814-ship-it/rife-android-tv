@@ -2,6 +2,7 @@ package dev.anilbeesetti.nextplayer.feature.player.rife
 
 import android.view.Surface
 import androidx.media3.common.SurfaceInfo
+import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import kotlinx.coroutines.flow.StateFlow
 
 /**
@@ -21,6 +22,7 @@ enum class RifeResolution {
 enum class InterpolationAlgorithm {
     RIFE,
     MEMC,
+    SVPLAYER,
 }
 
 /**
@@ -97,6 +99,13 @@ interface RifeController {
      * into a blur.
      */
     fun setDenoiseLevel(strength: Float)
+
+    /**
+     * Publishes the SVPlayer tuning surface: the performance versus quality bar, the artifact
+     * masking level and the expert overrides beneath them. Ignored unless the selected
+     * algorithm is [InterpolationAlgorithm.SVPLAYER]; taking effect on the next frame pair.
+     */
+    fun setSvPlayerSettings(settings: SvPlayerSettings)
 
     /** Records the decoded frame size reported by `Player.Listener.onVideoSizeChanged`. */
     fun setInputFrameSize(width: Int, height: Int)

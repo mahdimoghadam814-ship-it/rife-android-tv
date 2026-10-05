@@ -92,6 +92,27 @@ Java_com_rife_androidtv_NativeEngine_setMemcThreadCount(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_com_rife_androidtv_NativeEngine_setSvPlayerSettings(
+    JNIEnv* env, jclass clazz,
+    jfloat performanceQuality, jfloat artifactMaskLevel,
+    jint blockSize, jint searchDistance, jint subpel, jint overlap,
+    jfloat penaltyLambda, jint blendAlgorithm, jint sceneAdaptive, jint meScale
+) {
+    rife::SvConfig config;
+    config.performanceQuality = static_cast<float>(performanceQuality);
+    config.artifactMaskLevel = static_cast<float>(artifactMaskLevel);
+    config.blockSize = static_cast<int>(blockSize);
+    config.searchDistance = static_cast<int>(searchDistance);
+    config.subpel = static_cast<int>(subpel);
+    config.overlap = static_cast<int>(overlap);
+    config.penaltyLambda = static_cast<float>(penaltyLambda);
+    config.blendAlgorithm = static_cast<int>(blendAlgorithm);
+    config.sceneAdaptive = static_cast<int>(sceneAdaptive);
+    config.meScale = static_cast<int>(meScale);
+    g_memc.setSvConfig(config);
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_com_rife_androidtv_NativeEngine_resetMemcState(JNIEnv* env, jclass clazz) {
     g_memc.reset();
 }
@@ -201,10 +222,10 @@ Java_com_rife_androidtv_NativeEngine_computeMotionField(
     if (!in0Ptr || !in1Ptr || !mvPtr) {
         return false;
     }
-    // The field only exists for the block-matching algorithm. In RIFE mode there is nothing to
+    // The field only exists for the block-matching algorithms. In RIFE mode there is nothing to
     // hand to the shader, so report failure and let the caller take its CPU path instead.
-    if (g_interp_algorithm.load(std::memory_order_relaxed) !=
-        static_cast<int>(rife::InterpolationAlgorithm::MEMC)) {
+    if (!rife::producesMotionField(
+            g_interp_algorithm.load(std::memory_order_relaxed))) {
         return false;
     }
     const jlong mvCapacity = env->GetDirectBufferCapacity(mvBuffer);
@@ -256,8 +277,8 @@ Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
         return false;
     }
 
-    if (g_interp_algorithm.load(std::memory_order_relaxed) ==
-        static_cast<int>(rife::InterpolationAlgorithm::MEMC)) {
+    if (rife::producesMotionField(
+            g_interp_algorithm.load(std::memory_order_relaxed))) {
         return g_memc.interpolate(
             in0Ptr, in1Ptr,
             srcWidth, srcHeight,

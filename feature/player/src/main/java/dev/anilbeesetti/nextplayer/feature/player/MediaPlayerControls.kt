@@ -205,6 +205,7 @@ internal fun MediaPlayerControls(
                 onAlgorithmSelected = { onAction(PlayerAction.SetInterpolationAlgorithm(it)) },
                 onMemcLevelSelected = { onAction(PlayerAction.SetMemcLevel(it)) },
                 onDenoiseLevelSelected = { onAction(PlayerAction.SetDenoiseLevel(it)) },
+                onSvSettingsChanged = { onAction(PlayerAction.SetSvPlayerSettings(it)) },
             )
         }
     }

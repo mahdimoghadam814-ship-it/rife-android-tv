@@ -10,6 +10,7 @@ import com.rife.androidtv.NativeEngine
 import com.rife.androidtv.RifeDiagnosticResult
 import com.rife.androidtv.DeviceProfile
 import com.rife.androidtv.VulkanCapabilities
+import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
 import dev.anilbeesetti.nextplayer.feature.player.rife.InterpolationAlgorithm as FeatureInterpolationAlgorithm
@@ -136,10 +137,10 @@ class RifeEngineController(
      */
     override fun setInterpolationAlgorithm(algorithm: FeatureInterpolationAlgorithm) {
         interpolationAlgorithm = algorithm
-        NativeEngine.setInterpolationAlgorithm(
-            if (algorithm == FeatureInterpolationAlgorithm.MEMC) 1 else 0,
-        )
-        if (algorithm == FeatureInterpolationAlgorithm.MEMC) {
+        // The Kotlin ordinals are the native InterpolationAlgorithm values: RIFE 0, MEMC 1,
+        // SVPLAYER 2, so the engine can tell the two block-matching backends apart.
+        NativeEngine.setInterpolationAlgorithm(algorithm.ordinal)
+        if (algorithm != FeatureInterpolationAlgorithm.RIFE) {
             // Measured optimum: the ME/MC loops are memory-bound, so going wider than 4 only
             // adds contention (8 threads was ~2x slower than 4 on an 8-core big.LITTLE device).
             NativeEngine.setMemcThreadCount(4)
@@ -164,6 +165,27 @@ class RifeEngineController(
     override fun setDenoiseLevel(strength: Float) {
         processor.setDenoiseLevel(strength)
         Log.i(TAG_LIFECYCLE, "Denoise level: $strength")
+    }
+
+    override fun setSvPlayerSettings(settings: SvPlayerSettings) {
+        NativeEngine.setSvPlayerSettings(
+            settings.performanceQuality,
+            settings.artifactMaskLevel,
+            settings.blockSize.ordinal,
+            settings.searchDistance,
+            settings.subpel,
+            settings.overlap,
+            settings.penaltyLambda,
+            settings.blendAlgorithm.ordinal,
+            if (settings.sceneAdaptive) 1 else 0,
+            settings.meScale,
+        )
+        Log.i(
+            TAG_LIFECYCLE,
+            "SVPlayer settings: pq=${settings.performanceQuality} " +
+                "mask=${settings.artifactMaskLevel} subpel=${settings.subpel} " +
+                "overlap=${settings.overlap} lambda=${settings.penaltyLambda}"
+        )
     }
 
     /**

@@ -224,6 +224,7 @@ internal fun MediaPlayerContent(
         playerPreferences.interpolationAlgorithm,
         playerPreferences.memcLevel,
         playerPreferences.denoiseLevel,
+        playerPreferences.svPlayerSettings,
     ) {
         // Order matters: the algorithm has to be known before setRifeEnabled decides whether
         // the RIFE model is worth loading at all.
@@ -235,6 +236,7 @@ internal fun MediaPlayerContent(
         rifeController.setResolution(playerPreferences.rifeResolution.toRifeResolution())
         rifeController.setMemcLevel(playerPreferences.memcLevel.multiplier)
         rifeController.setDenoiseLevel(playerPreferences.denoiseLevel.strength)
+        rifeController.setSvPlayerSettings(playerPreferences.svPlayerSettings)
         // The settings entry wants the engine status to be visible immediately after a change,
         // even when the controls are already visible.
         rifeStatusTrigger++
@@ -408,4 +410,5 @@ private fun InterpolationAlgorithmSetting.toInterpolationAlgorithm(): Interpolat
     when (this) {
         InterpolationAlgorithmSetting.RIFE -> InterpolationAlgorithm.RIFE
         InterpolationAlgorithmSetting.MEMC -> InterpolationAlgorithm.MEMC
+        InterpolationAlgorithmSetting.SVPLAYER -> InterpolationAlgorithm.SVPLAYER
     }

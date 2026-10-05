@@ -38,8 +38,12 @@ import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
+import dev.anilbeesetti.nextplayer.core.model.SvBlockSizeSetting
+import dev.anilbeesetti.nextplayer.core.model.SvBlendAlgorithmSetting
+import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.core.ui.R
 import dev.anilbeesetti.nextplayer.core.ui.components.NextSwitch
+import dev.anilbeesetti.nextplayer.core.ui.components.PreferenceSlider
 
 /**
  * The six video-processing controls, offered from the player itself so a setting can be changed
@@ -60,6 +64,7 @@ fun BoxScope.ProcessingSettingsView(
     onAlgorithmSelected: (InterpolationAlgorithmSetting) -> Unit,
     onMemcLevelSelected: (MemcLevelSetting) -> Unit,
     onDenoiseLevelSelected: (DenoiseLevelSetting) -> Unit,
+    onSvSettingsChanged: (SvPlayerSettings) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     OverlayView(
@@ -103,6 +108,12 @@ fun BoxScope.ProcessingSettingsView(
                 label = { it.memcLevelLabel() },
                 onSelected = onMemcLevelSelected,
             )
+            if (playerPreferences.interpolationAlgorithm == InterpolationAlgorithmSetting.SVPLAYER) {
+                SvSettingsSection(
+                    settings = playerPreferences.svPlayerSettings,
+                    onSettingsChanged = onSvSettingsChanged,
+                )
+            }
             HorizontalDivider()
             ToggleRow(
                 title = stringResource(R.string.fastdvdnet),
@@ -221,6 +232,166 @@ private fun <T> OptionGroup(
     }
 }
 
+/**
+ * The two ends of a bar, so the direction the slider moves in is legible without a paragraph.
+ */
+@Composable
+private fun BarEndLabels(start: String, end: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Text(
+            text = start,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Text(
+            text = end,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/**
+ * The SVPlayer tuning surface: the two bars that carry the design, then the expert rungs of the
+ * same ladder for a user who wants to set one by hand. Everything writes through
+ * [onSettingsChanged] as a whole object so the panel never has to know which fields the engine
+ * has started reading yet.
+ */
+@Composable
+private fun SvSettingsSection(
+    settings: SvPlayerSettings,
+    onSettingsChanged: (SvPlayerSettings) -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = stringResource(R.string.sv_settings),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        PreferenceSlider(
+            title = stringResource(R.string.sv_performance_quality),
+            description = stringResource(R.string.sv_performance_quality_description),
+            value = settings.performanceQuality,
+            valueRange = 0f..1f,
+            onValueChange = { onSettingsChanged(settings.copy(performanceQuality = it)) },
+        )
+        BarEndLabels(
+            start = stringResource(R.string.sv_performance_end),
+            end = stringResource(R.string.sv_quality_end),
+        )
+        PreferenceSlider(
+            title = stringResource(R.string.sv_artifact_mask),
+            description = stringResource(R.string.sv_artifact_mask_description),
+            value = settings.artifactMaskLevel,
+            valueRange = 0f..1f,
+            onValueChange = { onSettingsChanged(settings.copy(artifactMaskLevel = it)) },
+        )
+        BarEndLabels(
+            start = stringResource(R.string.sv_artifact_mask_off),
+            end = stringResource(R.string.sv_artifact_mask_strong),
+        )
+        HorizontalDivider()
+        Text(
+            text = stringResource(R.string.sv_expert),
+            style = MaterialTheme.typography.titleSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        OptionGroup(
+            title = stringResource(R.string.sv_subpel),
+            options = listOf(1, 2),
+            selected = settings.subpel,
+            label = {
+                stringResource(if (it == 2) R.string.sv_subpel_2 else R.string.sv_subpel_1)
+            },
+            onSelected = { onSettingsChanged(settings.copy(subpel = it)) },
+        )
+        OptionGroup(
+            title = stringResource(R.string.sv_overlap),
+            options = listOf(0, 1, 2),
+            selected = settings.overlap,
+            label = {
+                stringResource(
+                    when (it) {
+                        1 -> R.string.sv_overlap_1
+                        2 -> R.string.sv_overlap_2
+                        else -> R.string.sv_overlap_0
+                    }
+                )
+            },
+            onSelected = { onSettingsChanged(settings.copy(overlap = it)) },
+        )
+        OptionGroup(
+            title = stringResource(R.string.sv_block_size),
+            options = SvBlockSizeSetting.entries,
+            selected = settings.blockSize,
+            label = {
+                stringResource(
+                    when (it) {
+                        SvBlockSizeSetting.AUTO -> R.string.sv_block_auto
+                        SvBlockSizeSetting.BLOCK_16X8 -> R.string.sv_block_16x8
+                        SvBlockSizeSetting.BLOCK_32X8 -> R.string.sv_block_32x8
+                        SvBlockSizeSetting.BLOCK_32X16 -> R.string.sv_block_32x16
+                    }
+                )
+            },
+            onSelected = { onSettingsChanged(settings.copy(blockSize = it)) },
+        )
+        OptionGroup(
+            title = stringResource(R.string.sv_me_scale),
+            options = listOf(1, 2),
+            selected = settings.meScale,
+            label = {
+                stringResource(if (it == 2) R.string.sv_me_scale_2 else R.string.sv_me_scale_1)
+            },
+            onSelected = { onSettingsChanged(settings.copy(meScale = it)) },
+        )
+        OptionGroup(
+            title = stringResource(R.string.sv_search_distance),
+            options = listOf(0, 8, 16, 32),
+            selected = settings.searchDistance,
+            label = {
+                if (it == 0) {
+                    stringResource(R.string.sv_search_distance_adaptive)
+                } else {
+                    "$it px"
+                }
+            },
+            onSelected = { onSettingsChanged(settings.copy(searchDistance = it)) },
+        )
+        PreferenceSlider(
+            title = stringResource(R.string.sv_penalty_lambda),
+            description = null,
+            value = settings.penaltyLambda,
+            valueRange = 0f..30f,
+            onValueChange = { onSettingsChanged(settings.copy(penaltyLambda = it)) },
+        )
+        OptionGroup(
+            title = stringResource(R.string.sv_blend_algorithm),
+            options = SvBlendAlgorithmSetting.entries,
+            selected = settings.blendAlgorithm,
+            label = {
+                stringResource(
+                    when (it) {
+                        SvBlendAlgorithmSetting.BIDIRECTIONAL -> R.string.sv_blend_bidirectional
+                        SvBlendAlgorithmSetting.MEDIAN -> R.string.sv_blend_median
+                        SvBlendAlgorithmSetting.COVER -> R.string.sv_blend_cover
+                    }
+                )
+            },
+            onSelected = { onSettingsChanged(settings.copy(blendAlgorithm = it)) },
+        )
+        ToggleRow(
+            title = stringResource(R.string.sv_scene_adaptive),
+            description = stringResource(R.string.sv_scene_adaptive_description),
+            checked = settings.sceneAdaptive,
+            onToggle = { onSettingsChanged(settings.copy(sceneAdaptive = !settings.sceneAdaptive)) },
+        )
+    }
+}
+
 @Composable
 private fun RifeResolutionSetting.resolutionLabel(): String = stringResource(
     when (this) {
@@ -237,6 +408,7 @@ private fun InterpolationAlgorithmSetting.algorithmLabel(): String = stringResou
     when (this) {
         InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_algorithm_rife
         InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_algorithm_memc
+        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_algorithm_svplayer
     },
 )
 
@@ -245,6 +417,7 @@ private fun InterpolationAlgorithmSetting.interpolationDescription(): String = s
     when (this) {
         InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_description_rife
         InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_description_memc
+        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_description_svplayer
     },
 )
 

@@ -54,6 +54,7 @@ data class PlayerPreferences(
     val memcLevel: MemcLevelSetting = MemcLevelSetting.TWO_X,
     val fastDvdNetEnabled: Boolean = false,
     val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.BALANCED,
+    val svPlayerSettings: SvPlayerSettings = SvPlayerSettings(),
 
     // Subtitle Preferences
     val useSystemCaptionStyle: Boolean = false,

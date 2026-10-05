@@ -12,6 +12,7 @@ import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
+import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.core.model.VideoContentScale
 import dev.anilbeesetti.nextplayer.feature.player.extensions.noRippleClickable
 import dev.anilbeesetti.nextplayer.feature.player.state.SubtitleOptionsEvent
@@ -41,6 +42,7 @@ fun BoxScope.OverlayShowView(
     onAlgorithmSelected: (InterpolationAlgorithmSetting) -> Unit = {},
     onMemcLevelSelected: (MemcLevelSetting) -> Unit = {},
     onDenoiseLevelSelected: (DenoiseLevelSetting) -> Unit = {},
+    onSvSettingsChanged: (SvPlayerSettings) -> Unit = {},
 ) {
     Box(
         modifier = Modifier
@@ -110,6 +112,7 @@ fun BoxScope.OverlayShowView(
         onAlgorithmSelected = onAlgorithmSelected,
         onMemcLevelSelected = onMemcLevelSelected,
         onDenoiseLevelSelected = onDenoiseLevelSelected,
+        onSvSettingsChanged = onSvSettingsChanged,
     )
 }
 

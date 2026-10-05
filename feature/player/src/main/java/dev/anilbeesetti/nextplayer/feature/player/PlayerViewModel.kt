@@ -12,6 +12,7 @@ import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.LoopMode
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
 import dev.anilbeesetti.nextplayer.core.model.PlayerPreferences
+import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.core.model.Video
 import dev.anilbeesetti.nextplayer.core.model.VideoContentScale
 import dev.anilbeesetti.nextplayer.core.ui.base.MviViewModel
@@ -79,6 +80,7 @@ class PlayerViewModel(
             is PlayerAction.SetInterpolationAlgorithm -> updateInterpolationAlgorithm(action.algorithm)
             is PlayerAction.SetMemcLevel -> updateMemcLevel(action.level)
             is PlayerAction.SetDenoiseLevel -> updateDenoiseLevel(action.level)
+            is PlayerAction.SetSvPlayerSettings -> updateSvPlayerSettings(action.settings)
             is PlayerAction.ToggleTimeDisplay -> toggleTimeDisplay()
             is PlayerAction.OnVideoZoomEvent -> onVideoZoomEvent(action.event)
             is PlayerAction.OnSubtitleOptionEvent -> onSubtitleOptionEvent(action.event)
@@ -149,6 +151,12 @@ class PlayerViewModel(
         }
     }
 
+    private fun updateSvPlayerSettings(settings: SvPlayerSettings) {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences { it.copy(svPlayerSettings = settings) }
+        }
+    }
+
     private fun toggleTimeDisplay() {
         viewModelScope.launch {
             preferencesRepository.updatePlayerPreferences { it.copy(showRemainingTime = !it.showRemainingTime) }
@@ -215,6 +223,7 @@ sealed interface PlayerAction {
     data class SetInterpolationAlgorithm(val algorithm: InterpolationAlgorithmSetting) : PlayerAction
     data class SetMemcLevel(val level: MemcLevelSetting) : PlayerAction
     data class SetDenoiseLevel(val level: DenoiseLevelSetting) : PlayerAction
+    data class SetSvPlayerSettings(val settings: SvPlayerSettings) : PlayerAction
     data object ToggleTimeDisplay : PlayerAction
     data class OnVideoZoomEvent(val event: VideoZoomEvent) : PlayerAction
     data class OnSubtitleOptionEvent(val event: SubtitleOptionsEvent) : PlayerAction

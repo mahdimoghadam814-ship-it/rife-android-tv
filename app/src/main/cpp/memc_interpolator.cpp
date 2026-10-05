@@ -18,6 +18,12 @@
 #define LOGI_MEMC(...) __android_log_print(ANDROID_LOG_INFO, "RIFE-MEMC", __VA_ARGS__)
 
 namespace rife {
+
+bool producesMotionField(int algorithm) {
+    return algorithm == static_cast<int>(InterpolationAlgorithm::MEMC) ||
+           algorithm == static_cast<int>(InterpolationAlgorithm::SVPLAYER);
+}
+
 namespace {
 
 // BT.601 luma from 8-bit RGBA. Keeps the search on 1 byte/pixel instead of 4.

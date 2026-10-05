@@ -10,6 +10,7 @@ fun InterpolationAlgorithmSetting.name(): String {
     val stringRes = when (this) {
         InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_algorithm_rife
         InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_algorithm_memc
+        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_algorithm_svplayer
     }
 
     return stringResource(stringRes)
@@ -20,6 +21,7 @@ fun InterpolationAlgorithmSetting.description(): String {
     val stringRes = when (this) {
         InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_description_rife
         InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_description_memc
+        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_description_svplayer
     }
 
     return stringResource(stringRes)

@@ -23,10 +23,12 @@ import dev.anilbeesetti.nextplayer.core.model.DenoiseLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.model.MemcLevelSetting
 import dev.anilbeesetti.nextplayer.core.model.RifeResolutionSetting
+import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.core.ui.R
 import dev.anilbeesetti.nextplayer.core.ui.components.ClickablePreferenceItem
 import dev.anilbeesetti.nextplayer.core.ui.components.ListSectionTitle
 import dev.anilbeesetti.nextplayer.core.ui.components.NextTopAppBar
+import dev.anilbeesetti.nextplayer.core.ui.components.PreferenceSlider
 import dev.anilbeesetti.nextplayer.core.ui.components.PreferenceSwitch
 import dev.anilbeesetti.nextplayer.core.ui.components.RadioTextButton
 import dev.anilbeesetti.nextplayer.core.ui.components.tvFocusDown
@@ -122,6 +124,35 @@ private fun VideoProcessingPreferencesScreenContent(
                         onAction(VideoProcessingPreferencesUiEvent.ShowDialog(VideoProcessingDialog.MemcLevelDialog))
                     },
                 )
+                if (state.preferences.interpolationAlgorithm == InterpolationAlgorithmSetting.SVPLAYER) {
+                    val svSettings = state.preferences.svPlayerSettings
+                    PreferenceSlider(
+                        title = stringResource(id = R.string.sv_performance_quality),
+                        description = stringResource(id = R.string.sv_performance_quality_description),
+                        value = svSettings.performanceQuality,
+                        valueRange = 0f..1f,
+                        onValueChange = {
+                            onAction(
+                                VideoProcessingPreferencesUiEvent.UpdateSvPlayerSettings(
+                                    svSettings.copy(performanceQuality = it),
+                                ),
+                            )
+                        },
+                    )
+                    PreferenceSlider(
+                        title = stringResource(id = R.string.sv_artifact_mask),
+                        description = stringResource(id = R.string.sv_artifact_mask_description),
+                        value = svSettings.artifactMaskLevel,
+                        valueRange = 0f..1f,
+                        onValueChange = {
+                            onAction(
+                                VideoProcessingPreferencesUiEvent.UpdateSvPlayerSettings(
+                                    svSettings.copy(artifactMaskLevel = it),
+                                ),
+                            )
+                        },
+                    )
+                }
                 PreferenceSwitch(
                     title = stringResource(id = R.string.fastdvdnet),
                     description = stringResource(id = R.string.fastdvdnet_description),

@@ -48,6 +48,7 @@ fun RifeStatusOverlay(
         val algorithmName = when (algorithm) {
             InterpolationAlgorithm.RIFE -> "RIFE"
             InterpolationAlgorithm.MEMC -> "MEMC"
+            InterpolationAlgorithm.SVPLAYER -> "SVPlayer"
         }
         val text = buildString {
             append("Input FPS: ").append("%.1f".format(stats.inputFps))

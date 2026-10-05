@@ -14,6 +14,36 @@ class MemcPool;   // persistent worker threads, defined in memc_interpolator.cpp
 enum class InterpolationAlgorithm : int {
     RIFE = 0,
     MEMC = 1,
+    SVPLAYER = 2,
+};
+
+// True when the selected algorithm is block matching, i.e. it produces a motion field the warp
+// and the denoiser can consume. Both MEMC and SVPLAYER do; only RIFE does not.
+bool producesMotionField(int algorithm);
+
+// Tuning surface of the SVPlayer-shaped search, in the same units as the SVPflow configuration
+// it is modelled on. The two bars in the UI are derived from these rather than stored beside
+// them: performanceQuality selects the rung of the cost ladder, artifactMaskLevel selects how
+// much of the bad-area mask is allowed to suppress a blend.
+struct SvConfig {
+    // 0f is the performance end, 1f the quality end.
+    float performanceQuality = 0.6f;
+    // 0f disables bad-area masking, 1f masks every block the search could not explain.
+    float artifactMaskLevel = 0.5f;
+    // 0 = derive from performanceQuality, otherwise 16x8 / 32x8 / 32x16 by index.
+    int blockSize = 0;
+    // Pixels; 0 derives it from local contrast, which is SVP's negative search distance.
+    int searchDistance = 0;
+    // 1 = whole pixel, 2 = half pixel.
+    int subpel = 2;
+    // Quarter-blocks of overlap between neighbours: 0, 1 or 2.
+    int overlap = 2;
+    float penaltyLambda = 10.0f;
+    // 0 = forward/backward average, 1 = plus per-pixel median, 2 = plus cover/uncover.
+    int blendAlgorithm = 1;
+    int sceneAdaptive = 1;
+    // Luma downscale the search runs at: 1 full, 2 half.
+    int meScale = 1;
 };
 
 // Block-matching motion estimation / motion compensation (MEMC) interpolator.
@@ -121,6 +151,12 @@ public:
     void setThreadCount(int threads);
     int threadCount() const { return threads_.load(std::memory_order_relaxed); }
 
+    // Replaces the SVPlayer tuning surface. Takes effect on the next motionField()/interpolate()
+    // call; the caller only writes it from the pipeline thread while a frame pair is not in
+    // flight, so it needs no lock of its own.
+    void setSvConfig(const SvConfig& config) { sv_config_ = config; }
+    const SvConfig& svConfig() const { return sv_config_; }
+
     // Wall-clock duration of the most recent interpolate() call, for diagnostics.
     double lastDurationMs() const { return last_ms_.load(std::memory_order_relaxed); }
 
@@ -223,6 +259,7 @@ private:
 
     std::atomic<int> threads_{1};
     std::atomic<double> last_ms_{0.0};
+    SvConfig sv_config_{};
 
     // Per-stage accumulation for diagnostics. Only touched by the pipeline worker thread
     // (interpolate() is never re-entered), so no synchronisation is needed.
