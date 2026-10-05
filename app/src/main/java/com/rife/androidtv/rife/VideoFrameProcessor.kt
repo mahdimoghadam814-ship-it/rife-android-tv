@@ -354,6 +354,14 @@ class VideoFrameProcessor(
     private var pendingOutputSurfaceInfo: SurfaceInfo? = null
 
     /**
+     * Non-null while Phase C encoding owns the output window: processed frames are rendered into
+     * the encoder's input Surface instead of the player's, and the display surface kept in
+     * [pendingOutputSurfaceInfo] stays untouched so stopping an encode restores preview exactly
+     * as it was. Null during normal playback, which is the whole time.
+     */
+    private var encodeSurface: Surface? = null
+
+    /**
      * Dataspace the output buffers are tagged with. `0` (UNKNOWN) leaves the platform default,
      * which is what SDR content wants; HDR sources get BT.2020 PQ/HLG so the panel applies the
      * matching transfer curve. Read on the worker thread only.
@@ -729,18 +737,57 @@ class VideoFrameProcessor(
             }
             if (outputSurfaceInfo == null) {
                 Log.i(TAG, "Output surface released")
-                outputRenderer?.setOutputSurface(display, null)
+                if (encodeSurface == null) {
+                    outputRenderer?.setOutputSurface(display, null)
+                }
             } else {
                 Log.i(
                     TAG,
                     "Output surface set: ${outputSurfaceInfo.width}x${outputSurfaceInfo.height} " +
                         "(orientationDegrees=${outputSurfaceInfo.orientationDegrees})"
                 )
-                outputRenderer?.setOutputSurface(display, outputSurfaceInfo.surface)
+                // While an encode owns the window the preview surface is only recorded: swapping
+                // the renderer over to it mid-encode would tear the stream in half.
+                if (encodeSurface == null) {
+                    outputRenderer?.setOutputSurface(display, outputSurfaceInfo.surface)
+                    applyOutputDataSpace()
+                }
+            }
+        }
+    }
+
+    /**
+     * Points the renderer at [surface] (a MediaCodec encoder input Surface) or, when null, back
+     * at whatever surface the player published. Off by default: nothing encodes until this is
+     * called, so normal playback never takes this path.
+     */
+    fun setEncodeSurface(surface: Surface?) {
+        runOnWorker("setEncodeSurface()") {
+            if (encodeSurface == surface) return@runOnWorker
+            encodeSurface = surface
+            val display = bundleDisplay()
+            if (display == null) {
+                Log.w(TAG, "setEncodeSurface(): no input EGL display yet, deferring")
+                return@runOnWorker
+            }
+            val target = activeOutputSurface()
+            Log.i(
+                TAG,
+                if (surface == null) "Encode target cleared, preview restored"
+                else "Encode target set: ${target?.javaClass?.simpleName}"
+            )
+            if (target == null || !target.isValid) {
+                outputRenderer?.setOutputSurface(display, null)
+            } else {
+                outputRenderer?.setOutputSurface(display, target)
                 applyOutputDataSpace()
             }
         }
     }
+
+    /** The surface processed frames are currently drawn into: the encoder while one is active. */
+    private fun activeOutputSurface(): Surface? =
+        encodeSurface ?: pendingOutputSurfaceInfo?.surface
 
     fun setOutputDataSpace(dataSpace: Int) {
         runOnWorker("setOutputDataSpace()") {
@@ -788,7 +835,7 @@ class VideoFrameProcessor(
      * Only valid on the worker thread.
      */
     private fun applyOutputDataSpace() {
-        val surface = pendingOutputSurfaceInfo?.surface
+        val surface = activeOutputSurface()
         if (surface == null || !surface.isValid) return
         probeCodecDataSpace()
         val want = effectiveOutputDataSpace()
@@ -841,7 +888,7 @@ class VideoFrameProcessor(
      */
     private fun reassertOutputDataSpace(reason: String) {
         if (outputDataSpace == 0) return
-        val surface = pendingOutputSurfaceInfo?.surface
+        val surface = activeOutputSurface()
         if (surface == null || !surface.isValid) return
         probeCodecDataSpace()
         val want = effectiveOutputDataSpace()
@@ -1060,6 +1107,9 @@ class VideoFrameProcessor(
 
     private fun releaseStateOnWorker() {
         pendingOutputSurfaceInfo = null
+        // The renderer this pointed at is about to go away; the owner stops the encoder itself,
+        // so dropping the reference here only stops us drawing into a Surface nobody owns.
+        encodeSurface = null
         resetPipelineOnWorker("release")
         outputRenderer?.release()
         outputRenderer = null
@@ -2227,8 +2277,11 @@ class VideoFrameProcessor(
      * this frame.
      */
     private fun renderBufferToOutput(pixels: ByteBuffer, width: Int, height: Int) {
-        val surfaceInfo = pendingOutputSurfaceInfo ?: return
-        if (!surfaceInfo.surface.isValid) {
+        // An encode can run before, or without, any preview surface being published, so the
+        // encoder target counts as a legitimate destination here.
+        if (pendingOutputSurfaceInfo == null && encodeSurface == null) return
+        val surface = activeOutputSurface()
+        if (surface == null || !surface.isValid) {
             return
         }
         val renderer = outputRenderer ?: return

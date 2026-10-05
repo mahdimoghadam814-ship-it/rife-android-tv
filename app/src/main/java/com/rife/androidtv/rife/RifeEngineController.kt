@@ -1,6 +1,8 @@
 package com.rife.androidtv.rife
 
 import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -10,11 +12,15 @@ import com.rife.androidtv.NativeEngine
 import com.rife.androidtv.RifeDiagnosticResult
 import com.rife.androidtv.DeviceProfile
 import com.rife.androidtv.VulkanCapabilities
+import com.rife.androidtv.encode.EncodedStreamSink
+import com.rife.androidtv.encode.HdrHevcEncoder
 import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
 import dev.anilbeesetti.nextplayer.feature.player.rife.InterpolationAlgorithm as FeatureInterpolationAlgorithm
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeStats
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -111,6 +117,7 @@ class RifeEngineController(
      * destroyed.
      */
     override fun stop() {
+        stopEncoding()
         processor.stop()
         _inputSurface.value = null
         _processingEnabled.value = false
@@ -256,6 +263,100 @@ class RifeEngineController(
      * The last native engine status, for the diagnostics dialog.
      */
     fun engineStatus(): RifeDiagnosticResult = NativeEngine.getRifeStatus()
+
+    // --------------------------------------------------------------------------------------
+    // Phase C: the hardware Surface-based HEVC Main10 HDR encoder
+    // --------------------------------------------------------------------------------------
+
+    private var encoder: HdrHevcEncoder? = null
+    private var encodeConfig: HdrHevcEncoder.Config? = null
+    private val encodedUnits = AtomicLong()
+    private val encodedBytes = AtomicLong()
+    private var capabilitiesLogged = false
+
+    /**
+     * Opens the hardware encoder and redirects processed frames into its input Surface.
+     *
+     * Off unless called: normal playback never encodes, and [stopEncoding] puts the renderer
+     * back on the player's surface. Returns false when the device has no usable HEVC encoder, in
+     * which case the preview path is left exactly as it was.
+     */
+    fun startEncoding(config: HdrHevcEncoder.Config): Boolean {
+        if (encoder != null) {
+            Log.w(TAG, "startEncoding(): already encoding")
+            return false
+        }
+        if (!capabilitiesLogged) {
+            capabilitiesLogged = true
+            HdrHevcEncoder.logCapabilities()
+        }
+        val candidate = HdrHevcEncoder(CountingSink())
+        val surface = candidate.open(config)
+        if (surface == null) {
+            candidate.close()
+            return false
+        }
+        encoder = candidate
+        encodeConfig = config
+        encodedUnits.set(0)
+        encodedBytes.set(0)
+        processor.setEncodeSurface(surface)
+        Log.i(
+            TAG,
+            "Encoding started: ${config.width}x${config.height}@${config.frameRate} " +
+                "bitrate=${config.effectiveBitrateBps()} hdr10=${config.hdr10}"
+        )
+        return true
+    }
+
+    /**
+     * Ends the encode: the renderer goes back to the preview surface first, so the stream stops
+     * cleanly without the player ever drawing into a Surface the codec still owns.
+     */
+    fun stopEncoding(): Boolean {
+        val running = encoder ?: return true
+        val cfg = encodeConfig
+        encoder = null
+        encodeConfig = null
+        processor.setEncodeSurface(null)
+        val eos = running.signalEndOfStream()
+        val units = encodedUnits.get()
+        val bytes = encodedBytes.get()
+        running.close()
+        val fps = cfg?.frameRate ?: 0
+        val seconds = if (fps > 0) units.toDouble() / fps else 0.0
+        val avgBitrate = if (seconds > 0.0) (bytes * 8.0 / seconds).toLong() else 0L
+        Log.i(
+            TAG,
+            "Encoding stopped: units=$units bytes=$bytes eos=$eos " +
+                "avgBitrate=$avgBitrate target=${cfg?.effectiveBitrateBps()}"
+        )
+        return eos
+    }
+
+    /** True while a Phase C encode owns the output window. */
+    val isEncoding: Boolean
+        get() = encoder != null
+
+    private inner class CountingSink : EncodedStreamSink {
+        override fun onOutputFormat(format: MediaFormat) {
+            Log.i(TAG, "Encoder output format: $format")
+        }
+
+        override fun onAccessUnit(data: ByteBuffer, info: MediaCodec.BufferInfo) {
+            val units = encodedUnits.incrementAndGet()
+            encodedBytes.addAndGet(info.size.toLong())
+            // Every 120 units rather than every frame: at 60 fps this is a line a second, which
+            // is the resolution a bitrate graph needs and nothing like the cost of per-frame logs.
+            if (units % 120L == 0L) {
+                Log.i(
+                    TAG,
+                    "Encoded $units units, ${encodedBytes.get()} bytes " +
+                        "(${(info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0})"
+                )
+            }
+        }
+    }
 
     private fun ensureEngineInitialized() {
         if (engineReady || engineInitStarted) {

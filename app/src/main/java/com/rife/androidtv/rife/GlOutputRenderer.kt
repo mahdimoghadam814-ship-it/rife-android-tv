@@ -673,7 +673,7 @@ class GlOutputRenderer {
             return
         }
 
-        val configAttribs = intArrayOf(
+        val strict = intArrayOf(
             EGL14.EGL_RED_SIZE, 8,
             EGL14.EGL_GREEN_SIZE, 8,
             EGL14.EGL_BLUE_SIZE, 8,
@@ -682,30 +682,90 @@ class GlOutputRenderer {
             EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
             EGL14.EGL_NONE
         )
+        var created = createWindowSurface(display, surface, strict)
+        if (created == null) {
+            // The display surface has always matched RGBA8888, but a MediaCodec encoder input
+            // surface is allocated by the codec and may be 10-bit (RGBA_1010102). An
+            // EGL_BAD_MATCH from eglCreateWindowSurface is the only signal that gives us, and
+            // giving up there would leave no path at all, so retry with the component sizes
+            // unconstrained and let the driver pick the format the native window actually is.
+            Log.w(TAG, "RGBA8888 did not match the surface; retrying with the driver's own format")
+            val relaxed = intArrayOf(
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_NONE
+            )
+            created = createWindowSurface(display, surface, relaxed)
+            if (created == null) return
+        }
+
+        this.windowSurface = created
+        updateSurfaceSize()
+        Log.i(
+            TAG,
+            "Output window surface created (${surfaceWidth}x$surfaceHeight, " +
+                "eglConfig=${describeConfig()})"
+        )
+    }
+
+    /** The config the current [windowSurface] was created from; null before the first success. */
+    private var activeConfig: EGLConfig? = null
+
+    /**
+     * Creates the window surface for [surface] under [configAttribs], or null with the reason
+     * logged. The two callers differ only in how fussy the config search is.
+     */
+    private fun createWindowSurface(
+        display: EGLDisplay,
+        surface: Surface,
+        configAttribs: IntArray
+    ): EGLSurface? {
         val configs = arrayOfNulls<EGLConfig>(1)
         val numConfigs = IntArray(1)
         if (!EGL14.eglChooseConfig(display, configAttribs, 0, configs, 0, 1, numConfigs, 0) ||
             numConfigs[0] == 0
         ) {
             Log.e(TAG, "eglChooseConfig failed for the output surface")
-            return
+            return null
         }
-
-        val newWindowSurface = EGL14.eglCreateWindowSurface(
+        val candidate = EGL14.eglCreateWindowSurface(
             display,
             configs[0],
             surface,
             intArrayOf(EGL14.EGL_NONE),
             0
         )
-        if (newWindowSurface == null || newWindowSurface == EGL14.EGL_NO_SURFACE) {
+        if (candidate == null || candidate == EGL14.EGL_NO_SURFACE) {
             Log.e(TAG, "eglCreateWindowSurface failed: 0x${EGL14.eglGetError().toString(16)}")
-            return
+            return null
         }
+        activeConfig = configs[0]
+        return candidate
+    }
 
-        windowSurface = newWindowSurface
-        updateSurfaceSize()
-        Log.i(TAG, "Output window surface created (${surfaceWidth}x$surfaceHeight)")
+    /**
+     * The colour buffer sizes of the config the window surface actually got. Phase B asked for
+     * the exact GPU output format, and this - 8 bits per channel or 10 - is the one number that
+     * says whether the pixels rendered into this surface can carry HDR precision.
+     */
+    private fun describeConfig(): String {
+        val display = this.display ?: return "no display"
+        val config = activeConfig ?: return "no config"
+        val attributes = intArrayOf(
+            EGL14.EGL_RED_SIZE,
+            EGL14.EGL_GREEN_SIZE,
+            EGL14.EGL_BLUE_SIZE,
+            EGL14.EGL_ALPHA_SIZE
+        )
+        val labels = arrayOf("R", "G", "B", "A")
+        val parts = ArrayList<String>(4)
+        for (i in attributes.indices) {
+            val value = IntArray(1)
+            if (EGL14.eglGetConfigAttrib(display, config, attributes[i], value, 0)) {
+                parts += "${labels[i]}=${value[0]}"
+            }
+        }
+        return if (parts.isEmpty()) "unknown" else parts.joinToString(" ")
     }
 
     /**
@@ -1614,6 +1674,7 @@ class GlOutputRenderer {
             EGL14.eglDestroySurface(eglDisplay, eglSurface)
         }
         windowSurface = null
+        activeConfig = null
         outputSurface = null
         surfaceWidth = 0
         surfaceHeight = 0
