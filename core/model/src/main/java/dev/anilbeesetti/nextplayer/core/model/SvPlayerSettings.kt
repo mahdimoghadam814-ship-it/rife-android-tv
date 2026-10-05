@@ -3,13 +3,21 @@ package dev.anilbeesetti.nextplayer.core.model
 import kotlinx.serialization.Serializable
 
 /**
- * Search pattern offered by [SvBlockSizeSetting]. `AUTO` hands the choice to the performance
+ * Search window offered by [SvBlockSizeSetting]. `AUTO` hands the choice to the performance
  * versus quality bar so the two never fight over it.
+ *
+ * The sizes are SVP's `block.w`/`block.h` combinations. Larger windows average more of the
+ * picture into each match, so they are less sensitive to noise but less accurate about where
+ * things actually moved - which is why SVP's own default is 16x16 rather than the biggest
+ * rung, and why the shipped setting is 16x16 as well. A 16x16 window is also what makes
+ * [SvPlayerSettings.overlap] mean what SVP says it means: the window is one block wide, so
+ * the only thing that makes neighbouring matches overlap is a grid pitch below that.
  */
 @Serializable
 enum class SvBlockSizeSetting {
     AUTO,
     BLOCK_16X8,
+    BLOCK_16X16,
     BLOCK_32X8,
     BLOCK_32X16,
 }
@@ -57,12 +65,17 @@ data class SvPlayerSettings(
     val performanceQuality: Float = 1.0f,
     /** 0f disables bad-area masking, 1f masks every block that cannot be explained. */
     val artifactMaskLevel: Float = 1.0f,
-    val blockSize: SvBlockSizeSetting = SvBlockSizeSetting.BLOCK_32X16,
+    val blockSize: SvBlockSizeSetting = SvBlockSizeSetting.BLOCK_16X16,
     /** Search radius in pixels; 0 derives it from local contrast the way SVP's negative range does. */
     val searchDistance: Int = 16,
     /** Samples per pixel: 1 is whole-pixel, 2 is half-pixel. */
     val subpel: Int = 2,
-    /** Overlap between neighbouring blocks in quarter-blocks: 0, 1 or 2. */
+    /**
+     * How far the search window reaches past its own grid cell, after SVP's `block.overlap`:
+     * 0 is none, 1 an eighth of a block, 2 a quarter. It is what shrinks the grid pitch, so a
+     * value of 2 searches 16 px windows at a 12 px pitch - more vectors, overlapping windows,
+     * and a finer field to interpolate from. SVP ships 2.
+     */
     val overlap: Int = 2,
     /** Cost of a vector that disagrees with its neighbours; SVP's `penalty.lambda`. */
     val penaltyLambda: Float = 30f,

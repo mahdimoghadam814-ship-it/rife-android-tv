@@ -1619,8 +1619,9 @@ class VideoFrameProcessor(
             if (fastDvdNetEngine.isEnabled) {
                 // With MEMC off nothing else asks for the field, but the denoiser's whole premise
                 // is that it samples the history where this pair's content moved to, so it computes
-                // one here. computeMotionField() refuses under any algorithm that is not MEMC, so
-                // this fails for a RIFE run and the stage's own implementation takes over.
+                // one here. computeMotionField() only reports success for the block-matching
+                // algorithms, so this fails for a RIFE run and the stage's own implementation
+                // takes over.
                 val motionBuf = cachedMotionBuf
                 var presented = false
                 if (motionBuf != null && outputRenderer?.isDenoiseInitialized == true) {
@@ -1745,9 +1746,11 @@ class VideoFrameProcessor(
 
         // GPU warp: motion estimation still runs on the CPU, because that is what the luma pyramid
         // and the SAD search are, but the per-pixel resample moves into the fragment shader. What
-        // crosses JNI is then the packed field - ceil(w/16) * ceil(h/16) * 8 bytes, tens of kB -
-        // instead of a full RGBA frame. computeMotionField() reports false when the algorithm is
-        // not MEMC, so the RIFE path keeps working without this layer knowing about the switch.
+        // crosses JNI is then the packed field - ceil(w/step) * ceil(h/step) * 8 bytes, tens of
+        // kB - where step is NativeEngine.motionFieldStep(), not necessarily 16: SVPlayer's
+        // overlap setting shrinks the grid pitch so its search windows overlap each other.
+        // computeMotionField() reports false when the algorithm produces no field at all, so
+        // the RIFE path keeps working without this layer knowing about the switch.
         val motionBuf = cachedMotionBuf
         val tJniStart = System.nanoTime()
         var motionReady = false
@@ -2099,8 +2102,9 @@ class VideoFrameProcessor(
             return false
         }
         val requiredBytesInt = requiredBytes.toInt()
-        val gridW = (inputWidth + 15) / 16
-        val gridH = (inputHeight + 15) / 16
+        val gridStep = NativeEngine.motionFieldStep()
+        val gridW = (inputWidth + gridStep - 1) / gridStep
+        val gridH = (inputHeight + gridStep - 1) / gridStep
         // Eight bytes per block: four for the vectors, then two cover/uncover masks, the denoiser's
         // blend weight and its noise floor. Mirrors MemcInterpolator::motionFieldBytes(), which the
         // JNI side re-checks against the buffer capacity before it writes anything.

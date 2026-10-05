@@ -131,7 +131,8 @@ static inline int floorShift8(int32_t v) {
 }
 
 // Round S/16 with round-half-away-from-zero. S is a vector-weighted sum whose denominator is
-// 256 (pitch * pitch), so /16 lands the whole-pixel average on the 1/16 px grid the warp needs.
+// 256 (kBlock * kBlock: both axis weights are rescaled to sum to kBlock), so /16 lands the
+// whole-pixel average on the 1/16 px grid the warp needs.
 static inline int32_t div16r(int32_t v) {
     return v >= 0 ? (v + 8) >> 4 : -(((-v) + 8) >> 4);
 }
@@ -145,25 +146,30 @@ static inline int hpToPx(int hp) {
 }
 
 // Maps a pixel coordinate onto the motion-vector grid, which holds one vector per [pitch] pixels
-// anchored at the block centres. Returns the two bracketing grid indices and the weight of the
-// second in 1/pitch units. Within half a block of a frame border the weight is clamped instead
+// anchored [anchor] pixels into each cell. Returns the two bracketing grid indices and the weight
+// of the second in 1/pitch units. Within one cell of a frame border the weight is clamped instead
 // of extrapolated, so the outermost vector simply stretches to the edge.
-static inline void mvGridAxis(int pos, int blocks, int pitch, int* i0, int* i1, int* w1) {
+//
+// The anchor is the block centre, kBlock/2, not pitch/2: the window that produced a vector is
+// always kBlock wide no matter what the grid pitch is, so its centre is half a window in from
+// the cell origin. At pitch == kBlock the two coincide, which is why the baseline is unchanged.
+static inline void mvGridAxis(int pos, int blocks, int pitch, int anchor,
+                              int* i0, int* i1, int* w1) {
     if (blocks < 2) {
         *i0 = 0;
         *i1 = 0;
         *w1 = 0;
         return;
     }
-    int g = (pos - pitch / 2) / pitch;  // truncates toward zero, which is what we want below 0
+    int g = (pos - anchor) / pitch;  // truncates toward zero, which is what we want below 0
     if (g < 0) g = 0;
     if (g > blocks - 2) g = blocks - 2;
     // frac is measured from the clamped bracket, not from the bracket the raw index landed in.
-    // The last pitch/2 pixels of the frame sit past the final block centre, and measuring them
-    // from the discarded index made them interpolate half-way back into the previous block -
-    // a visible seam along the bottom and right edges. This also reproduces the clamp-to-edge
-    // bilinear the GPU shader uses, so both paths sample the same vector.
-    int frac = pos - (g * pitch + pitch / 2);
+    // The last pixels of the frame sit past the final block centre, and measuring them from the
+    // discarded index made them interpolate half-way back into the previous block - a visible
+    // seam along the bottom and right edges. This also reproduces the clamp-to-edge bilinear the
+    // GPU shader uses, so both paths sample the same vector.
+    int frac = pos - (g * pitch + anchor);
     if (frac < 0) frac = 0;
     if (frac > pitch) frac = pitch;
     *i0 = g;
@@ -468,7 +474,8 @@ void MemcInterpolator::parallelFor(int begin, int end, F&& fn) {
 }
 
 void MemcInterpolator::ensureCapacity(int w, int h) {
-    if (w == work_w_ && h == work_h_) return;
+    const int step = blockStep();
+    if (w == work_w_ && h == work_h_ && step == work_step_) return;
 
     const size_t pixels = static_cast<size_t>(w) * h;
     luma0_.resize(pixels);
@@ -485,8 +492,8 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
         pyr1_[l].resize(static_cast<size_t>(lw) * lh);
     }
 
-    const size_t blocks = static_cast<size_t>((w + kBlock - 1) / kBlock) *
-                          static_cast<size_t>((h + kBlock - 1) / kBlock);
+    const size_t blocks = static_cast<size_t>((w + step - 1) / step) *
+                          static_cast<size_t>((h + step - 1) / step);
     mvf_x_.resize(blocks);
     mvf_y_.resize(blocks);
     mvb_x_.resize(blocks);
@@ -498,8 +505,9 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
 
     work_w_ = w;
     work_h_ = h;
-    LOGI_MEMC("scratch allocated %dx%d (%zu blocks, %d threads)",
-              w, h, blocks, threads_.load(std::memory_order_relaxed));
+    work_step_ = step;
+    LOGI_MEMC("scratch allocated %dx%d (%zu blocks at %d px, %d threads)",
+              w, h, blocks, step, threads_.load(std::memory_order_relaxed));
 }
 
 void MemcInterpolator::extractLuma(const uint8_t* rgba, int w, int h, uint8_t* luma) {
@@ -560,9 +568,13 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                                            int w, int h,
                                            int32_t* mvx, int32_t* mvy) {
     // Ceil grid: the last column/row of blocks is a partial tile covering the
-    // remainder of a frame whose width is not a multiple of 16.
-    const int bwx = (w + kBlock - 1) / kBlock;
-    const int bwy = (h + kBlock - 1) / kBlock;
+    // remainder of a frame whose width is not a multiple of the pitch. The pitch is kBlock
+    // for MEMC and for SVPlayer with overlap off, and smaller when SVP's overlap is on - the
+    // matching window stays kBlock wide regardless, which is what makes it overlap its
+    // neighbours once the pitch drops below that.
+    const int step = blockStep();
+    const int bwx = (w + step - 1) / step;
+    const int bwy = (h + step - 1) / step;
     const size_t nblocks = static_cast<size_t>(bwx) * bwy;
 
     std::fill(mvx, mvx + nblocks, 0);
@@ -593,10 +605,14 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         newLambdaBase = static_cast<int>(c.penaltyLambda + 0.5f);
         zeroLambdaBase = static_cast<int>(c.penaltyLambda * 0.25f + 0.5f);
         searchDistance = c.searchDistance > 0 ? c.searchDistance : 0;
+        // Indexed by SvBlockSizeSetting.ordinal: 16x8, 16x16, 32x8, 32x16. 16x16 is SVP's own
+        // block size and the rung the app ships; the wider windows are there for noisy sources,
+        // where averaging more of the picture into a match beats matching it precisely.
         switch (c.blockSize) {
             case 1: winW = 16; winH = 8;   break;
-            case 2: winW = 32; winH = 8;   break;
-            case 3: winW = 32; winH = 16;  break;
+            case 2: winW = 16; winH = 16;  break;
+            case 3: winW = 32; winH = 8;   break;
+            case 4: winW = 32; winH = 16;  break;
             default:
                 // AUTO: the quality bar picks the rung, so the two controls never fight over it.
                 if (q < 0.4f)       { winW = 16; winH = 8;  }
@@ -626,8 +642,8 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         // threads from writing the same motion-vector cell.
         const int groupsY = (bwy + div - 1) / div;
         const int groupsX = (bwx + div - 1) / div;
-        const int lrows = std::min((lh + kBlock - 1) / kBlock, groupsY);
-        const int lcols = std::min((lw + kBlock - 1) / kBlock, groupsX);
+        const int lrows = std::min((lh + step - 1) / step, groupsY);
+        const int lcols = std::min((lw + step - 1) / step, groupsX);
         const int group = div;                      // full-res blocks per side
 
         int base;
@@ -658,9 +674,9 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         parallelFor(0, lrows, [&](int r0, int r1) {
             long long localSad = 0;
             for (int lr = r0; lr < r1; lr++) {
-                const int by = std::min(lr * kBlock, lh - kBlock);
+                const int by = std::min(lr * step, lh - kBlock);
                 for (int lc = 0; lc < lcols; lc++) {
-                    const int bx = std::min(lc * kBlock, lw - kBlock);
+                    const int bx = std::min(lc * step, lw - kBlock);
 
                     const int fcol = lc * div;
                     const int frow = lr * div;
@@ -821,8 +837,9 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
 void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, int w, int h,
                                        const int32_t* mvx, const int32_t* mvy,
                                        int32_t* outx, int32_t* outy) {
-    const int bwx = (w + kBlock - 1) / kBlock;
-    const int bwy = (h + kBlock - 1) / kBlock;
+    const int step = blockStep();
+    const int bwx = (w + step - 1) / step;
+    const int bwy = (h + step - 1) / step;
     // Same guard as motionEstimate: below one full block there is no field to regularise.
     if (w < kBlock || h < kBlock) return;
 
@@ -848,9 +865,9 @@ void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, i
 
     parallelFor(0, bwy, [&](int r0, int r1) {
         for (int r = r0; r < r1; r++) {
-            const int by = std::min(r * kBlock, h - kBlock);
+            const int by = std::min(r * step, h - kBlock);
             for (int c = 0; c < bwx; c++) {
-                const int bx = std::min(c * kBlock, w - kBlock);
+                const int bx = std::min(c * step, w - kBlock);
                 const size_t idx = static_cast<size_t>(r) * bwx + c;
 
                 const int sx = mvx[idx];
@@ -899,10 +916,20 @@ void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, i
 // and paints the whole cell pair, so a fold marks both blocks it spans and survives the bilinear
 // upsample as a band roughly one block wide instead of a single-cell spike.
 void MemcInterpolator::buildOcclusionMasks(int w, int h) {
-    const int bwx = (w + kBlock - 1) / kBlock;
-    const int bwy = (h + kBlock - 1) / kBlock;
+    const int step = blockStep();
+    const int bwx = (w + step - 1) / step;
+    const int bwy = (h + step - 1) / step;
     const size_t nblocks = static_cast<size_t>(bwx) * bwy;
     if (nblocks == 0) return;
+
+    // The fold is the vector difference between two *adjacent* cells, so it shrinks with the
+    // grid pitch for a field of the same shape. Dividing by step puts the byte back in the
+    // units the threshold was tuned in: 255 is a fold of exactly one block step, whatever the
+    // pitch. At step == kBlock the numerator is a multiple of the divisor, so this is the plain
+    // `fold * kOccScale` the baseline has always used and MEMC's masks are unchanged.
+    auto scaleFold = [step](int fold) {
+        return (fold * kOccScale * kBlock + step / 2) / step;
+    };
 
     auto fill = [&](const int32_t* mx, const int32_t* my, uint8_t* m) {
         std::fill(m, m + nblocks, 0);
@@ -911,7 +938,7 @@ void MemcInterpolator::buildOcclusionMasks(int w, int h) {
             for (int c = 0; c + 1 < bwx; c++) {
                 const int fold = mx[row + c] - mx[row + c + 1];
                 if (fold <= 0) continue;
-                const int v = fold * kOccScale;
+                const int v = scaleFold(fold);
                 const uint8_t b = static_cast<uint8_t>(v > 255 ? 255 : v);
                 if (b > m[row + c]) m[row + c] = b;
                 if (b > m[row + c + 1]) m[row + c + 1] = b;
@@ -923,7 +950,7 @@ void MemcInterpolator::buildOcclusionMasks(int w, int h) {
             for (int c = 0; c < bwx; c++) {
                 const int fold = my[row + c] - my[below + c];
                 if (fold <= 0) continue;
-                const int v = fold * kOccScale;
+                const int v = scaleFold(fold);
                 const uint8_t b = static_cast<uint8_t>(v > 255 ? 255 : v);
                 if (b > m[row + c]) m[row + c] = b;
                 if (b > m[below + c]) m[below + c] = b;
@@ -958,8 +985,9 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                                         const int32_t* mvb_x, const int32_t* mvb_y,
                                         const uint8_t* maskf, const uint8_t* maskb,
                                         uint8_t* out) {
-    const int bwx = (w + kBlock - 1) / kBlock;
-    const int bwy = (h + kBlock - 1) / kBlock;
+    const int step = blockStep();
+    const int bwx = (w + step - 1) / step;
+    const int bwy = (h + step - 1) / step;
     const float t = timestep;
     const float u = 1.0f - t;
     // Final time blend as a 1/256 weight on in1: (a*(256-k) + b*k + 128) >> 8 is an exact,
@@ -975,21 +1003,30 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     // frame narrower than one block has a single pair covering the whole row.
     const int ncol = bwx < 2 ? 1 : bwx - 1;
 
+    // mvGridAxis() reports a weight in 1/step units, but everything downstream - div16r(), and
+    // the mask product that has to land back on 256 - assumes the two axis weights sum to
+    // kBlock. Rescaling to that sum costs one integer divide per call, so it is tabled over
+    // the step+1 positions the axis can actually take and the pixel loop stays divide-free.
+    // At step == kBlock the table is the identity, so the baseline path is bit-identical.
+    int wtab[kBlock + 1];
+    for (int i = 0; i <= step; i++) wtab[i] = (i * kBlock + step / 2) / step;
+
     // Dense per-pixel warp: every output pixel interpolates its own vector from the four nearest
     // block centres, so motion varies continuously across the frame instead of stepping at block
     // edges. Each sample is a 4-tap bilinear read, which is what removes the block seams.
     parallelFor(0, h, [&](int rowBegin, int rowEnd) {
         for (int y = rowBegin; y < rowEnd; y++) {
-            int iy0, iy1, wy1;
-            mvGridAxis(y, bwy, kBlock, &iy0, &iy1, &wy1);
+            int iy0, iy1, wy1r;
+            mvGridAxis(y, bwy, step, kBlock / 2, &iy0, &iy1, &wy1r);
+            const int wy1 = wtab[wy1r];
             const int wy0 = kBlock - wy1;
             const int rowA0 = iy0 * bwx;
             const int rowA1 = iy1 * bwx;
             const size_t outRow = static_cast<size_t>(y) * w;
 
             for (int bc = 0; bc < ncol; bc++) {
-                const int xStart = (bc == 0) ? 0 : bc * kBlock + kBlock / 2;
-                int xEnd = (bc + 2 >= bwx) ? w : bc * kBlock + kBlock / 2 + kBlock;
+                const int xStart = (bc == 0) ? 0 : bc * step + kBlock / 2;
+                int xEnd = (bc + 2 >= bwx) ? w : bc * step + kBlock / 2 + step;
                 if (xEnd > w) xEnd = w;
                 if (xEnd <= xStart) continue;
 
@@ -999,9 +1036,10 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                 const int i11 = (bwx < 2) ? i10 : i10 + 1;
 
                 // Fold the y-axis weight into the vectors once per (row, column), so the inner
-                // loop needs two multiplies per vector instead of four. The result is the vector
-                // sum in units of whole pixels * (wy0 + wy1); div16r() then divides out the
-                // remaining pitch factor and rounds onto the 1/16 px grid.
+                // loop needs two multiplies per vector instead of four. Both axis weights have
+                // been rescaled to sum to kBlock, so the product below is the vector sum in
+                // whole pixels * 16 * 16 and div16r() divides that back out, rounding onto the
+                // 1/16 px grid.
                 const int32_t p0fx = mvf_x[i00] * wy0 + mvf_x[i10] * wy1;
                 const int32_t p1fx = mvf_x[i01] * wy0 + mvf_x[i11] * wy1;
                 const int32_t p0fy = mvf_y[i00] * wy0 + mvf_y[i10] * wy1;
@@ -1017,12 +1055,13 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                 const int32_t rmf1 = maskf[i01] * wy0 + maskf[i11] * wy1;
                 const int32_t rmb0 = maskb[i00] * wy0 + maskb[i10] * wy1;
                 const int32_t rmb1 = maskb[i01] * wy0 + maskb[i11] * wy1;
-                const int baseX = bc * kBlock + kBlock / 2;
+                const int baseX = bc * step + kBlock / 2;
 
                 for (int x = xStart; x < xEnd; x++) {
-                    int wx1 = x - baseX;
-                    if (wx1 < 0) wx1 = 0;
-                    if (wx1 > kBlock) wx1 = kBlock;
+                    int wxr = x - baseX;
+                    if (wxr < 0) wxr = 0;
+                    if (wxr > step) wxr = step;
+                    const int wx1 = wtab[wxr];
                     const int wx0 = kBlock - wx1;
 
                     const int32_t fxi = div16r(p0fx * wx0 + p1fx * wx1);
@@ -1255,8 +1294,13 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     // Both directions have to fail. A single hard-to-match subject would otherwise be read as a
     // cut, and a false positive replaces a good warp with a crossfade - far more visible than the
     // one bad frame a missed cut costs.
-    const int bwx = (w + kBlock - 1) / kBlock;
-    const int bwy = (h + kBlock - 1) / kBlock;
+    // Same grid the search accumulated its SADs on - the pitch, not kBlock - so the count below
+    // matches the number of gate windows actually measured. They overlap when the pitch is
+    // below kBlock, which counts border pixels twice; that scales the sum and the denominator
+    // alike, so the mean is unaffected.
+    const int step = blockStep();
+    const int bwx = (w + step - 1) / step;
+    const int bwy = (h + step - 1) / step;
     const double nblocks = static_cast<double>(bwx) * bwy;
     // The scene gate is the user's to switch off. With it off the warp always runs, even where
     // the two frames have nothing to do with each other - which is what the switch promises -
@@ -1319,18 +1363,36 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
     return true;
 }
 
-size_t MemcInterpolator::motionFieldBytes(int targetWidth, int targetHeight) {
-    if (targetWidth <= 0 || targetHeight <= 0) return 0;
-    const size_t bwx = static_cast<size_t>((targetWidth + kBlock - 1) / kBlock);
-    const size_t bwy = static_cast<size_t>((targetHeight + kBlock - 1) / kBlock);
+int MemcInterpolator::blockStep() const {
+    if (algorithm() != static_cast<int>(InterpolationAlgorithm::SVPLAYER)) return kBlock;
+    const int overlap = sv_config_.overlap;
+    if (overlap <= 0) return kBlock;
+    // SVP's rungs are 0 = none, 1 = 1/8 of the block, 2 = 1/4, 3 = 1/2, and SVP requires the
+    // resulting overlap in pixels to be even so the CPU path can keep its vectors on whole
+    // pixels - 2, 4 and 8 for a 16 px block. The window stays kBlock wide, so shrinking the
+    // pitch is what makes neighbouring windows overlap at all.
+    int overlapPx = 0;
+    if (overlap == 1)      overlapPx = kBlock / 8;
+    else if (overlap == 2) overlapPx = kBlock / 4;
+    else if (overlap >= 3) overlapPx = kBlock / 2;
+    if (overlapPx <= 0) return kBlock;
+    const int step = kBlock - overlapPx;
+    return step < 8 ? 8 : step;
+}
+
+size_t MemcInterpolator::motionFieldBytes(int targetWidth, int targetHeight, int step) {
+    if (targetWidth <= 0 || targetHeight <= 0 || step <= 0) return 0;
+    const size_t bwx = static_cast<size_t>((targetWidth + step - 1) / step);
+    const size_t bwy = static_cast<size_t>((targetHeight + step - 1) / step);
     // Two contiguous RGBA halves: the field first, the cover/uncover masks after it. Each is a
     // standalone texture image, so the caller uploads both out of this one buffer.
     return bwx * bwy * 8;
 }
 
 void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwardOnly) {
-    const int bwx = (w + kBlock - 1) / kBlock;
-    const int bwy = (h + kBlock - 1) / kBlock;
+    const int step = blockStep();
+    const int bwx = (w + step - 1) / step;
+    const int bwy = (h + step - 1) / step;
     const size_t blocks = static_cast<size_t>(bwx) * bwy;
     // The field is packed in half-pel, and the +128 byte bias leaves room for -128..+127
     // units, i.e. -64..+63.5 pixels. The widest reach the exposed search options can produce is
@@ -1356,10 +1418,10 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
     if (w >= 8 && h >= 8) {
         for (int r = 0; r < bwy; r++) {
             const size_t row = static_cast<size_t>(r) * bwx;
-            const int cy = r * kBlock + kBlock / 2;
+            const int cy = r * step + kBlock / 2;
             for (int c = 0; c < bwx; c++) {
                 const size_t i = row + c;
-                const int cx = c * kBlock + kBlock / 2;
+                const int cx = c * step + kBlock / 2;
                 // `p - mv` at t = 1, the same position the warp shader samples the partner at.
                 // The field is half-pel, so it goes through hpToPx before it can index luma.
                 const int sadF = sadAt(luma1_.data(), luma0_.data(), w, w, h,
@@ -1459,7 +1521,7 @@ bool MemcInterpolator::motionField(const uint8_t* src0, const uint8_t* src1,
                                    uint8_t* outMv, size_t outMvBytes,
                                    bool forwardOnly) {
     if (!outMv) return false;
-    if (outMvBytes < motionFieldBytes(targetWidth, targetHeight)) return false;
+    if (outMvBytes < motionFieldBytes(targetWidth, targetHeight, blockStep())) return false;
 
     const auto t0 = std::chrono::steady_clock::now();
     if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight, forwardOnly)) {

@@ -30,8 +30,10 @@ struct SvConfig {
     float performanceQuality = 1.0f;
     // 0f disables bad-area masking, 1f masks every block the search could not explain.
     float artifactMaskLevel = 1.0f;
-    // 0 = derive from performanceQuality, otherwise 16x8 / 32x8 / 32x16 by index.
-    int blockSize = 3;
+    // 0 = derive from performanceQuality, otherwise 16x8 / 16x16 / 32x8 / 32x16 by index.
+    // These are the ordinals of the Kotlin SvBlockSizeSetting, so 2 - SVP's own default window,
+    // and the one this struct ships with - is 16x16.
+    int blockSize = 2;
     // Pixels; 0 derives it from local contrast, which is SVP's negative search distance.
     int searchDistance = 16;
     // 1 = whole pixel, 2 = half pixel.
@@ -85,7 +87,7 @@ public:
 
     // Everything interpolate() does up to and including both motion estimates, then packs the
     // field instead of warping it: eight bytes per block, row-major over
-    // ceil(targetW/kBlock) x ceil(targetH/kBlock).
+    // ceil(targetW/blockStep()) x ceil(targetH/blockStep()).
     //
     //   [0..4)   forward x, forward y, backward x, backward y - whole-pixel vectors biased by +128
     //   [4..6)   forward and backward occlusion mask, 0 = fully trusted, 255 = covered up
@@ -123,7 +125,8 @@ public:
     // similarity gate on top and drop the sample the moment the two frames disagree by more than
     // their own noise does.
     //
-    // outMv must have at least motionFieldBytes(targetWidth, targetHeight) bytes of capacity.
+    // outMv must have at least motionFieldBytes(targetWidth, targetHeight, blockStep()) bytes of
+    // capacity.
     //
     // This is the hand-off to the GPU warp: a fragment shader samples the two source frames with
     // the same bilinear field the CPU path builds, so the per-pixel resample - by far the most
@@ -142,7 +145,22 @@ public:
 
     // Exact byte count motionField() writes for a processing size: eight bytes per block. Also
     // the size the caller must allocate for the packed field, still only tens of kB at 1080p.
-    static size_t motionFieldBytes(int targetWidth, int targetHeight);
+    //
+    // The grid step is a required argument rather than a defaulted one on purpose: it is the
+    // only thing that separates the SVPlayer layout from the MEMC one, and a caller that sizes
+    // its buffer from kBlock while the field is packed at blockStep() would silently overflow.
+    // Pass blockStep() of the same interpolator that will do the writing.
+    static size_t motionFieldBytes(int targetWidth, int targetHeight, int step);
+
+    // The pitch the motion grid is laid out on, in pixels. kBlock for the MEMC baseline and for
+    // SVPlayer with `overlap` switched off; kBlock minus the overlap otherwise. The value of
+    // `overlap` is SVP's own - 0 is none, 1 an eighth of a block, 2 a quarter - so the shipped
+    // overlap of 2 searches a 16 px window at a 12 px pitch, which is exactly what makes the
+    // neighbouring windows overlap by 4 px and the grid carry 1.77x as many vectors.
+    //
+    // It is public because the packed field is sized and then read back by the GL side, which
+    // has to agree with this to the pixel: gridW is ceil(width / blockStep()), not ceil(/16).
+    int blockStep() const;
 
     void reset();
 
@@ -177,6 +195,12 @@ private:
     // to a byte. The field is held in half-pel units, so one half-pel of fold earns `kOccScale`
     // counts and a whole pixel of fold earns 2 * kOccScale - a fold of 255/(2 * kOccScale)
     // pixels is already a fully untrusted sample.
+    //
+    // The fold is measured between two *adjacent grid cells*, so a denser grid (blockStep()
+    // < kBlock) sees a smaller difference for the same motion gradient. The scale is therefore
+    // divided by blockStep() in buildOcclusionMasks, which puts the byte back in the same units
+    // at every pitch: 255 is reached by a fold of exactly one block step either way, and at
+    // step == kBlock the division collapses to the plain multiply below.
     static constexpr int kOccScale = 8;
     // MVTools' thSCD1/thSCD2 scene-change gate, restated as the mean per-pixel luma SAD of the
     // *motion-compensated* pair. Consecutive frames of one shot land in single digits; an
@@ -292,6 +316,11 @@ private:
     // Only ever touched by the pipeline worker thread.
     int work_w_ = 0;
     int work_h_ = 0;
+    // Grid pitch the block arrays above were sized for. Changing `overlap` changes how many
+    // blocks a frame has without changing the frame, so the width/height guard in
+    // ensureCapacity() has to compare the pitch too or the field would be written past the
+    // end of a buffer sized for the old setting.
+    int work_step_ = 0;
 
     // reset() may be called from another thread while interpolate() is in flight, so it
     // only raises a flag that is consumed at the start of the next frame.

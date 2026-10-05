@@ -332,6 +332,7 @@ private fun SvSettingsSection(
                     when (it) {
                         SvBlockSizeSetting.AUTO -> R.string.sv_block_auto
                         SvBlockSizeSetting.BLOCK_16X8 -> R.string.sv_block_16x8
+                        SvBlockSizeSetting.BLOCK_16X16 -> R.string.sv_block_16x16
                         SvBlockSizeSetting.BLOCK_32X8 -> R.string.sv_block_32x8
                         SvBlockSizeSetting.BLOCK_32X16 -> R.string.sv_block_32x16
                     }

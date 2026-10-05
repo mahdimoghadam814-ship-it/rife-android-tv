@@ -95,6 +95,17 @@ Java_com_rife_androidtv_NativeEngine_setMemcThreadCount(
     g_memc.setThreadCount(static_cast<int>(threads));
 }
 
+// The pitch the packed motion grid is laid out on. The Java side cannot work it out for
+// itself: it depends on whether SVPlayer is selected and on the `overlap` setting, both of
+// which live in the interpolator. Everything that sizes or reads the packed field - the
+// ByteBuffer it is written into and the texture coordinates the shaders index it with -
+// derives gridW/gridH from this, and if it ever disagreed with blockStep() the field would
+// be sampled with the wrong pitch and come out smeared.
+extern "C" JNIEXPORT jint JNICALL
+Java_com_rife_androidtv_NativeEngine_motionFieldStep(JNIEnv*, jclass) {
+    return static_cast<jint>(g_memc.blockStep());
+}
+
 extern "C" JNIEXPORT void JNICALL
 Java_com_rife_androidtv_NativeEngine_setSvPlayerSettings(
     JNIEnv* env, jclass clazz,
@@ -236,7 +247,8 @@ Java_com_rife_androidtv_NativeEngine_computeMotionField(
     if (mvCapacity < 0) {
         return false;
     }
-    const size_t needed = rife::MemcInterpolator::motionFieldBytes(targetWidth, targetHeight);
+    const size_t needed =
+        rife::MemcInterpolator::motionFieldBytes(targetWidth, targetHeight, g_memc.blockStep());
     if (static_cast<size_t>(mvCapacity) < needed) {
         return false;
     }

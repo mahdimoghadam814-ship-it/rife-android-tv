@@ -572,6 +572,7 @@
     <string name="sv_me_scale_2">Half</string>
     <string name="sv_block_auto">Auto</string>
     <string name="sv_block_16x8">16 x 8</string>
+    <string name="sv_block_16x16">16 x 16</string>
     <string name="sv_block_32x8">32 x 8</string>
     <string name="sv_block_32x16">32 x 16</string>
     <string name="memc_level">MEMC Level</string>

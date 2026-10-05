@@ -93,6 +93,18 @@ object NativeEngine {
     @JvmStatic
     external fun setMemcThreadCount(threads: Int)
 
+    /**
+     * The pitch, in pixels, that the packed motion grid is laid out on - `ceil(width / step)` by
+     * `ceil(height / step)` blocks of eight bytes each.
+     *
+     * It is 16 for the MEMC baseline and for SVPlayer with `overlap` off, and smaller when
+     * SVP's overlap is on, because the overlap shrinks the grid pitch rather than widening the
+     * search window. Everything that sizes the field's buffer or indexes it in a shader has to
+     * ask for this rather than assume 16; a mismatch smears the field instead of failing.
+     */
+    @JvmStatic
+    external fun motionFieldStep(): Int
+
     @JvmStatic
     external fun setSvPlayerSettings(
         performanceQuality: Float,

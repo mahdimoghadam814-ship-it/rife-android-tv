@@ -9,6 +9,7 @@ import android.opengl.GLES20
 import android.util.Log
 import android.view.Surface
 import androidx.media3.common.util.UnstableApi
+import com.rife.androidtv.NativeEngine
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -82,9 +83,13 @@ class GlOutputRenderer {
          *    the frame, so `p * uTargetSize - 0.5` lands on the pixel's integer index exactly
          *    when mv == 0 and the whole expression collapses to the plain texcoord used by the
          *    single-texture blit above - which is what guarantees the same orientation.
-         *  * `p / uMotionGrid` reproduces `mvGridAxis()`: a field of ceil(w/16) vectors anchored
-         *    at the block centres, so effective texel = p/16 - 1/2, and CLAMP_TO_EDGE is the
-         *    border clamp rather than an extrapolation.
+         *  * `(p + uMotionOffset) / uMotionGrid` reproduces `mvGridAxis()`: a field of
+         *    ceil(w/step) vectors, one every `step` pixels and anchored `16/2` into each cell
+         *    (the anchor is the centre of the 16 px search window, not half the pitch), so the
+         *    effective texel is `(p - 8)/step`. `uMotionGrid` is `step * gridW` and
+         *    `uMotionOffset` is `step/2 - 8`, which is exactly zero at `step == 16` - so with
+         *    SVPlayer's overlap off, or with MEMC, the expression collapses back to `p / uMotionGrid`
+         *    unchanged. CLAMP_TO_EDGE is the border clamp rather than an extrapolation.
          *  * the two sample positions are the native `x - mv*t` and `x - mv*(1-t)`; adding the
          *    half texel back converts pixel index to texture coordinate. The packed field is in
          *    half-pel, so `* 0.5` in the decode below is what turns it back into pixels.
@@ -114,10 +119,11 @@ class GlOutputRenderer {
             uniform sampler2D uMask;
             uniform vec2 uTargetSize;
             uniform vec2 uMotionGrid;
+            uniform vec2 uMotionOffset;
             uniform float uTimestep;
             void main() {
                 vec2 p = vTextureCoord * uTargetSize - 0.5;
-                vec2 g = p / uMotionGrid;
+                vec2 g = (p + uMotionOffset) / uMotionGrid;
                 vec4 mv = texture2D(uMotion, g);
                 vec2 mvf = (mv.rg * 255.0 - 128.0) * 0.5;
                 vec2 mvb = (mv.ba * 255.0 - 128.0) * 0.5;
@@ -181,6 +187,7 @@ class GlOutputRenderer {
             uniform sampler2D uMask;
             uniform vec2 uTargetSize;
             uniform vec2 uMotionGrid;
+            uniform vec2 uMotionOffset;
             uniform float uHasHistory;
             // Multiplier on the history blend, from the denoise level. It scales how strongly a
             // pixel may be replaced by its own motion-compensated counterpart - the similarity
@@ -202,7 +209,7 @@ class GlOutputRenderer {
                 vec3 cur = texture2D(uCurrent, uv).rgb;
                 vec3 merged = cur;
                 if (uHasHistory > 0.5) {
-                    vec2 g = p / uMotionGrid;
+                    vec2 g = (p + uMotionOffset) / uMotionGrid;
                     vec2 mvf = (texture2D(uMotion, g).rg * 255.0 - 128.0) * 0.5;
                     vec4 aux = texture2D(uMask, g);
                     float w = aux.b * (255.0 - aux.r) / (255.0 * 255.0);
@@ -261,6 +268,7 @@ class GlOutputRenderer {
     private var warpUMask = -1
     private var warpUTargetSize = -1
     private var warpUMotionGrid = -1
+    private var warpUMotionOffset = -1
     private var warpUTimestep = -1
     private var warpTex0 = 0
     private var warpTex1 = 0
@@ -272,6 +280,9 @@ class GlOutputRenderer {
     private var warpTex1H = 0
     private var warpGridW = 0
     private var warpGridH = 0
+    // Pitch the motion texture above was uploaded at, so drawWarp() can build the same
+    // uMotionGrid/uMotionOffset pair the native side packed the field with.
+    private var warpGridStep = 16
     private var warpDrawCalls = 0L
 
     // ---- Temporal denoiser (see DENOISE_FRAGMENT_SHADER) ----
@@ -294,6 +305,7 @@ class GlOutputRenderer {
     private var denUMask = -1
     private var denUTargetSize = -1
     private var denUMotionGrid = -1
+    private var denUMotionOffset = -1
     private var denUHasHistory = -1
     private var denUStrength = -1
 
@@ -494,11 +506,13 @@ class GlOutputRenderer {
         warpUMask = GLES20.glGetUniformLocation(newProgram, "uMask")
         warpUTargetSize = GLES20.glGetUniformLocation(newProgram, "uTargetSize")
         warpUMotionGrid = GLES20.glGetUniformLocation(newProgram, "uMotionGrid")
+        warpUMotionOffset = GLES20.glGetUniformLocation(newProgram, "uMotionOffset")
         warpUTimestep = GLES20.glGetUniformLocation(newProgram, "uTimestep")
 
         if (warpAPosition < 0 || warpATexCoord < 0 || warpUContentScale < 0 ||
             warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 || warpUMask < 0 ||
-            warpUTargetSize < 0 || warpUMotionGrid < 0 || warpUTimestep < 0
+            warpUTargetSize < 0 || warpUMotionGrid < 0 || warpUMotionOffset < 0 ||
+            warpUTimestep < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
             warpProgram = 0
@@ -561,11 +575,13 @@ class GlOutputRenderer {
         denUMask = GLES20.glGetUniformLocation(newProgram, "uMask")
         denUTargetSize = GLES20.glGetUniformLocation(newProgram, "uTargetSize")
         denUMotionGrid = GLES20.glGetUniformLocation(newProgram, "uMotionGrid")
+        denUMotionOffset = GLES20.glGetUniformLocation(newProgram, "uMotionOffset")
         denUHasHistory = GLES20.glGetUniformLocation(newProgram, "uHasHistory")
         denUStrength = GLES20.glGetUniformLocation(newProgram, "uStrength")
         if (denDPosition < 0 || denDTexCoord < 0 || denUContentScale < 0 ||
             denUCurrent < 0 || denUHistory < 0 || denUMotion < 0 || denUMask < 0 ||
-            denUTargetSize < 0 || denUMotionGrid < 0 || denUHasHistory < 0 ||
+            denUTargetSize < 0 || denUMotionGrid < 0 || denUMotionOffset < 0 ||
+            denUHasHistory < 0 ||
             denUStrength < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
@@ -847,12 +863,12 @@ class GlOutputRenderer {
      * presents it. Buffer layout and calling-thread contract match [render].
      *
      * [frame0] and [frame1] are the raw source frames at [srcWidth] x [srcHeight]. [motion] holds
-     * `ceil(targetWidth/16) * ceil(targetHeight/16) * 8` bytes from
-     * `NativeEngine.computeMotionField`: a first half of forward x, forward y, backward x,
-     * backward y as whole-pixel vectors biased by +128, then a second half of forward and
-     * backward cover/uncover masks. The expensive part of interpolation - the per-pixel 4-tap
-     * resample of both frames - then happens once per output fragment in the shader instead of
-     * once per output pixel on the CPU.
+     * `ceil(targetWidth/step) * ceil(targetHeight/step) * 8` bytes from
+     * `NativeEngine.computeMotionField`, step being `NativeEngine.motionFieldStep()`: a first half
+     * of forward x, forward y, backward x, backward y as half-pixel vectors biased by +128, then
+     * a second half of forward and backward cover/uncover masks. The expensive part of
+     * interpolation - the per-pixel 4-tap resample of both frames - then happens once per output
+     * fragment in the shader instead of once per output pixel on the CPU.
      *
      * Returns false when the warp program is unavailable or a size is unserviceable, in which case
      * the caller must fall back to `NativeEngine.interpolateFrameBuffers()`.
@@ -899,8 +915,9 @@ class GlOutputRenderer {
         if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
             return false
         }
-        val gridW = (targetWidth + 15) / 16
-        val gridH = (targetHeight + 15) / 16
+        val gridStep = NativeEngine.motionFieldStep()
+        val gridW = (targetWidth + gridStep - 1) / gridStep
+        val gridH = (targetHeight + gridStep - 1) / gridStep
 
         if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
             return false
@@ -929,6 +946,7 @@ class GlOutputRenderer {
         warpTex1H = srcHeight
         warpGridW = gridW
         warpGridH = gridH
+        warpGridStep = gridStep
         nsUpload += System.nanoTime() - tPhase
 
         return drawWarps(
@@ -1001,9 +1019,11 @@ class GlOutputRenderer {
      * this pass writes to a framebuffer, so it costs no swap and can be followed by either.
      *
      * [current] is exactly [width] x [height] RGBA, top row first. [motion] is the packed field
-     * from `NativeEngine.computeMotionField()` at `ceil(width/16) x ceil(height/16)`, laid out as
-     * `renderWarp` documents: vectors in the first half, then the mask the denoiser reads from the
-     * second half as (cover mask, unused, blend weight, noise floor).
+     * from `NativeEngine.computeMotionField()` at `ceil(width/step) x ceil(height/step)`, where
+     * step is `NativeEngine.motionFieldStep()` - 16 with MEMC or SVPlayer's overlap off, smaller
+     * when overlap is on. It is laid out as [renderWarp] documents: vectors in the first half,
+     * then the mask the denoiser reads from the second half as (cover mask, unused, blend weight,
+     * noise floor).
      *
      * Returns false when the program, the EGL surface or the framebuffer is unusable, or the byte
      * counts overflow, in which case [hasDenoisePair] is left false and the caller must not warp
@@ -1024,8 +1044,9 @@ class GlOutputRenderer {
         if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
             return false
         }
-        val gridW = (width + 15) / 16
-        val gridH = (height + 15) / 16
+        val gridStep = NativeEngine.motionFieldStep()
+        val gridW = (width + gridStep - 1) / gridStep
+        val gridH = (height + gridStep - 1) / gridStep
         if (!ensureDenoiseTarget(width, height)) {
             return false
         }
@@ -1044,6 +1065,7 @@ class GlOutputRenderer {
         denCurrentH = height
         warpGridW = gridW
         warpGridH = gridH
+        warpGridStep = gridStep
         nsUpload += System.nanoTime() - tPhase
 
         // The history read and the history written are never the same texture, so there is no
@@ -1083,7 +1105,11 @@ class GlOutputRenderer {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
 
         GLES20.glUniform2f(denUTargetSize, width.toFloat(), height.toFloat())
-        GLES20.glUniform2f(denUMotionGrid, (gridW * 16).toFloat(), (gridH * 16).toFloat())
+        GLES20.glUniform2f(
+            denUMotionGrid, (gridW * gridStep).toFloat(), (gridH * gridStep).toFloat()
+        )
+        val motionOffset = motionOffsetFor(gridStep)
+        GLES20.glUniform2f(denUMotionOffset, motionOffset, motionOffset)
         GLES20.glUniform1f(denUHasHistory, if (src != 0) 1.0f else 0.0f)
         GLES20.glUniform1f(denUStrength, denoiseStrength)
         // Always full frame: this pass writes a texture, it does not letterbox into a surface, so
@@ -1181,8 +1207,9 @@ class GlOutputRenderer {
         if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
             return false
         }
-        val gridW = (targetWidth + 15) / 16
-        val gridH = (targetHeight + 15) / 16
+        val gridStep = NativeEngine.motionFieldStep()
+        val gridW = (targetWidth + gridStep - 1) / gridStep
+        val gridH = (targetHeight + gridStep - 1) / gridStep
 
         if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
             return false
@@ -1205,6 +1232,7 @@ class GlOutputRenderer {
         }
         warpGridW = gridW
         warpGridH = gridH
+        warpGridStep = gridStep
         nsUpload += System.nanoTime() - tPhase
 
         return drawWarps(
@@ -1350,9 +1378,14 @@ class GlOutputRenderer {
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
 
         GLES20.glUniform2f(warpUTargetSize, targetWidth.toFloat(), targetHeight.toFloat())
-        // The field covers ceil(size/16) blocks, so the padded extent is what maps a processing
-        // pixel onto the vector that straddles it.
-        GLES20.glUniform2f(warpUMotionGrid, (gridW * 16).toFloat(), (gridH * 16).toFloat())
+        // The field covers ceil(size/gridStep) cells, so gridW * gridStep is the padded extent
+        // that maps a processing pixel onto the vector straddling it, and motionOffsetFor() is
+        // the half-pixel-vs-half-window correction WARP_FRAGMENT_SHADER documents.
+        GLES20.glUniform2f(
+            warpUMotionGrid, (gridW * warpGridStep).toFloat(), (gridH * warpGridStep).toFloat()
+        )
+        val motionOffset = motionOffsetFor(warpGridStep)
+        GLES20.glUniform2f(warpUMotionOffset, motionOffset, motionOffset)
         GLES20.glUniform1f(warpUTimestep, timestep)
 
         // Always uploaded, never gated on updateContentScale(): each program has its own uniform
@@ -1395,6 +1428,16 @@ class GlOutputRenderer {
         }
         return true
     }
+
+    /**
+     * The `uMotionOffset` uniform: `step / 2 - 8`, half the grid pitch minus half the search
+     * window. A vector always sits 8 px into its cell - that is the centre of the 16 px window the
+     * search ran over - while a texture texel sits half a pitch in, so this is the correction that
+     * makes `(p + offset) / (step * grid)` land on the same vector `mvGridAxis()` picks. It is
+     * exactly 0 whenever the pitch is 16, which covers MEMC and SVPlayer with overlap off, so
+     * those paths evaluate `p / uMotionGrid` exactly as before.
+     */
+    private fun motionOffsetFor(gridStep: Int): Float = gridStep / 2f - 8f
 
     /**
      * Uploads `width` x `height` RGBA from [buffer] into [tex], re-specifying the texture only
@@ -1560,6 +1603,7 @@ class GlOutputRenderer {
             warpTex1H = 0
             warpGridW = 0
             warpGridH = 0
+            warpGridStep = 16
             GLES20.glDeleteProgram(warpProgram)
             warpProgram = 0
         }
@@ -1594,6 +1638,7 @@ class GlOutputRenderer {
         denUMask = -1
         denUTargetSize = -1
         denUMotionGrid = -1
+        denUMotionOffset = -1
         denUHasHistory = -1
         denUStrength = -1
         warpAPosition = -1
@@ -1605,6 +1650,7 @@ class GlOutputRenderer {
         warpUMask = -1
         warpUTargetSize = -1
         warpUMotionGrid = -1
+        warpUMotionOffset = -1
         warpUTimestep = -1
         aPositionHandle = -1
         aTextureCoordHandle = -1
