@@ -14,6 +14,8 @@ import com.rife.androidtv.DeviceProfile
 import com.rife.androidtv.VulkanCapabilities
 import com.rife.androidtv.encode.EncodedStreamSink
 import com.rife.androidtv.encode.HdrHevcEncoder
+import com.rife.androidtv.stream.MpegTsMuxer
+import com.rife.androidtv.stream.TsPacketSink
 import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
@@ -280,8 +282,13 @@ class RifeEngineController(
      * Off unless called: normal playback never encodes, and [stopEncoding] puts the renderer
      * back on the player's surface. Returns false when the device has no usable HEVC encoder, in
      * which case the preview path is left exactly as it was.
+     *
+     * [packetSink] is Phase E's hook: hand it something and the encoder's access units go through
+     * [MpegTsMuxer] on their way out, so one call is the whole "encoder -> transport stream"
+     * connection. Phase F passes a UDP socket; without a sink the output is only counted, which
+     * is all Phase C needed.
      */
-    fun startEncoding(config: HdrHevcEncoder.Config): Boolean {
+    fun startEncoding(config: HdrHevcEncoder.Config, packetSink: TsPacketSink? = null): Boolean {
         if (encoder != null) {
             Log.w(TAG, "startEncoding(): already encoding")
             return false
@@ -290,7 +297,8 @@ class RifeEngineController(
             capabilitiesLogged = true
             HdrHevcEncoder.logCapabilities()
         }
-        val candidate = HdrHevcEncoder(CountingSink())
+        val muxer = packetSink?.let { MpegTsMuxer(it) }
+        val candidate = HdrHevcEncoder(CountingSink(muxer))
         val surface = candidate.open(config)
         if (surface == null) {
             candidate.close()
@@ -304,7 +312,8 @@ class RifeEngineController(
         Log.i(
             TAG,
             "Encoding started: ${config.width}x${config.height}@${config.frameRate} " +
-                "bitrate=${config.effectiveBitrateBps()} hdr10=${config.hdr10}"
+                "bitrate=${config.effectiveBitrateBps()} hdr10=${config.hdr10} " +
+                "muxer=${if (muxer != null) "mpeg-ts" else "none"}"
         )
         return true
     }
@@ -338,14 +347,24 @@ class RifeEngineController(
     val isEncoding: Boolean
         get() = encoder != null
 
-    private inner class CountingSink : EncodedStreamSink {
+    /**
+     * Counts what the codec produced and hands the same bytes on to [delegate] untouched.
+     *
+     * Deliberately does not read the buffer: the muxer downstream does, and a counter that moved
+     * the position would leave it reading an empty frame.
+     */
+    private inner class CountingSink(
+        private val delegate: EncodedStreamSink?,
+    ) : EncodedStreamSink {
         override fun onOutputFormat(format: MediaFormat) {
             Log.i(TAG, "Encoder output format: $format")
+            delegate?.onOutputFormat(format)
         }
 
         override fun onAccessUnit(data: ByteBuffer, info: MediaCodec.BufferInfo) {
             val units = encodedUnits.incrementAndGet()
             encodedBytes.addAndGet(info.size.toLong())
+            delegate?.onAccessUnit(data, info)
             // Every 120 units rather than every frame: at 60 fps this is a line a second, which
             // is the resolution a bitrate graph needs and nothing like the cost of per-frame logs.
             if (units % 120L == 0L) {

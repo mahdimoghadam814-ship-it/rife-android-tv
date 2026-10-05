@@ -55,6 +55,13 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
         /** 0 selects [autoBitrate] for the resolution; anything else is used verbatim. */
         val bitrateBps: Int = 0,
         val iFrameIntervalSec: Int = 2,
+        /**
+         * B-frames are off by default and that is load bearing, not a performance preference:
+         * the MPEG-TS muxer writes PTS only, which is correct exactly when decode order equals
+         * presentation order. It is also what a streaming pipeline wants - a reference frame
+         * ahead of every P-frame is a frame of latency the network does not need.
+         */
+        val maxBFrames: Int = 0,
         /** HDR10 signalling: BT.2020 primaries, ST2084 transfer, limited range. */
         val hdr10: Boolean = true,
         val level: Int = MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51,
@@ -202,6 +209,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.iFrameIntervalSec)
                 setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
                 setInteger(MediaFormat.KEY_LEVEL, config.level)
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, config.maxBFrames)
                 if (config.hdr10) {
                     setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
                     setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_ST2084)
