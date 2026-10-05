@@ -110,6 +110,16 @@ interface RifeController {
     /** Records the decoded frame size reported by `Player.Listener.onVideoSizeChanged`. */
     fun setInputFrameSize(width: Int, height: Int)
 
+    /**
+     * Phase D: starts a local transport-stream capture at [path] fed by the Surface-based
+     * encoder, at the source frame size and [frameRate]. Returns false if the codec could not
+     * open or an encode is already running. Paired with [stopTestClip].
+     */
+    fun startTestClip(path: String, width: Int, height: Int, frameRate: Int): Boolean
+
+    /** Ends a capture opened by [startTestClip], leaving the file flushed and readable. */
+    fun stopTestClip(): Boolean
+
     /** Drops every buffered frame: seek, media transition, stream change. */
     fun resetForDiscontinuity(reason: String)
 

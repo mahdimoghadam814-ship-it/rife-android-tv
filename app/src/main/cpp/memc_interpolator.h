@@ -35,7 +35,12 @@ struct SvConfig {
     // and the one this struct ships with - is 16x16.
     int blockSize = 2;
     // Pixels; 0 derives it from local contrast, which is SVP's negative search distance.
-    int searchDistance = 16;
+    // 48 is the widest reach the half-pel field can carry without saturating its +128 bias
+    // (48 px of coarse search plus the two finer passes is 114 units of the 127 available), and
+    // below it camera motion is mis-estimated from roughly 16 px per frame upward: measured on
+    // a non-periodic test texture, 16 px scored 36.3 dB at a 16 px shift and 27.5 dB at 24 px,
+    // where 48 px scores 43.1 and 39.3 - the search simply could not reach the true match.
+    int searchDistance = 48;
     // 1 = whole pixel, 2 = half pixel.
     int subpel = 2;
     // Quarter-blocks of overlap between neighbours: 0, 1 or 2.

@@ -16,6 +16,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -57,6 +58,8 @@ import dev.anilbeesetti.nextplayer.feature.player.ui.PlayerVerticalGestureIndica
 import dev.anilbeesetti.nextplayer.feature.player.ui.SubtitleConfiguration
 import dev.anilbeesetti.nextplayer.feature.player.ui.preview.rememberPreviewPlayer
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.io.File
 import org.koin.compose.koinInject
 import kotlin.time.Duration.Companion.seconds
 
@@ -189,6 +192,10 @@ internal fun MediaPlayerContent(
     // out flat and milky. Read the source's transfer characteristic and tag the output with the
     // matching dataspace so the panel decodes it as HDR again.
     var outputDataSpace by remember { mutableIntStateOf(0) }
+    // Source dimensions, reported by the same listener that publishes the colour metadata. The
+    // encoder has to open at the size the processing stage draws, and this is the only place the
+    // player hands that size to the UI.
+    var clipSourceSize by remember { mutableStateOf<Pair<Int, Int>?>(null) }
     DisposableEffect(player) {
         fun publish(detected: Int?, source: String) {
             // `null` means the player handed over a track list with no video in it yet - the gap
@@ -208,6 +215,7 @@ internal fun MediaPlayerContent(
             // signal that the colour metadata is now known.
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 publish(player.currentTracks.outputDataSpace(), "videoSize")
+                clipSourceSize = videoSize.width to videoSize.height
             }
         }
         player.addListener(listener)
@@ -292,6 +300,37 @@ internal fun MediaPlayerContent(
                 )
             }
         }
+        // Phase D/E trigger: one press records, the next stops. The clip goes through the very
+        // same encoder -> muxer -> sink chain the UDP path uses, so a file that ffprobe accepts
+        // is direct evidence the live stream is well formed. The stop is wall-clock rather than
+        // frame-count driven, which keeps any timing decision out of the codec path.
+        val clipScope = rememberCoroutineScope()
+        var clipRolling by remember { mutableStateOf(false) }
+        val onRecordTestClip: () -> Unit = {
+            if (clipRolling) {
+                clipRolling = false
+                rifeController.stopTestClip()
+            } else {
+                val source = clipSourceSize
+                val width = source?.first ?: 0
+                val height = source?.second ?: 0
+                val path = File(context.filesDir, "phaseD_${System.currentTimeMillis()}.ts")
+                if (width > 0 && height > 0 &&
+                    rifeController.startTestClip(path.absolutePath, width, height, 60)
+                ) {
+                    clipRolling = true
+                    clipScope.launch {
+                        delay(5_000L)
+                        if (clipRolling) {
+                            clipRolling = false
+                            rifeController.stopTestClip()
+                        }
+                    }
+                } else {
+                    Toast.makeText(context, R.string.record_test_clip, Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
         MediaPlayerControls(
             player = player,
             state = state,
@@ -321,6 +360,7 @@ internal fun MediaPlayerContent(
                     algorithm = playerPreferences.interpolationAlgorithm.toInterpolationAlgorithm(),
                 )
             },
+            onRecordTestClip = onRecordTestClip,
         )
         if (volumeAndBrightnessGestureState != null && volumeState != null && brightnessState != null) {
             PlayerVerticalGestureIndicators(
@@ -389,13 +429,24 @@ private fun Tracks.outputDataSpace(): Int? {
     var sawColorInfo = false
     for (group in groups) {
         for (index in 0 until group.length) {
-            val colorInfo = group.getTrackFormat(index).colorInfo ?: continue
+            val format = group.getTrackFormat(index)
+            // Dolby Vision keeps its transfer inside the codec config rather than in the colour
+            // aspects Media3 publishes, so isTransferHdr() reports false for it while the panel
+            // still has to be told PQ. Tagging nothing here leaves the processed path as plain
+            // sRGB at the compositor - bypass hides this because the platform tags the decoder's
+            // own surface - and that is what rendered HDR dim.
+            if (format.sampleMimeType == "video/dolby-vision") {
+                Log.i(TAG, "Dolby Vision track -> dataspace=163971072")
+                return 163971072 // DataSpace.DATASPACE_BT2020_PQ
+            }
+            val colorInfo = format.colorInfo ?: continue
             sawColorInfo = true
-            if (!ColorInfo.isTransferHdr(colorInfo)) continue
             val dataSpace = when (colorInfo.colorTransfer) {
                 C.COLOR_TRANSFER_HLG -> 168165376 // DataSpace.DATASPACE_BT2020_HLG
-                else -> 163971072 // DataSpace.DATASPACE_BT2020_PQ
+                C.COLOR_TRANSFER_ST2084 -> 163971072 // DataSpace.DATASPACE_BT2020_PQ
+                else -> 0
             }
+            if (dataSpace == 0) continue
             Log.i(TAG, "HDR transfer=${colorInfo.colorTransfer} -> dataspace=$dataSpace")
             return dataSpace
         }

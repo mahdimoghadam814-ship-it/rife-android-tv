@@ -50,7 +50,7 @@ data class PlayerPreferences(
     // Video Processing Preferences (frame interpolation + motion-aligned denoising)
     val rifeEnabled: Boolean = false,
     val rifeResolution: RifeResolutionSetting = RifeResolutionSetting.AUTO,
-    val interpolationAlgorithm: InterpolationAlgorithmSetting = InterpolationAlgorithmSetting.MEMC,
+    val interpolationAlgorithm: InterpolationAlgorithmSetting = InterpolationAlgorithmSetting.SVPLAYER,
     val memcLevel: MemcLevelSetting = MemcLevelSetting.TWO_X,
     val fastDvdNetEnabled: Boolean = false,
     val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.BALANCED,

@@ -642,6 +642,17 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
     // changes.
     std::atomic<long long> sadAcc{0};
 
+    // Set where a level's winner came to rest against the edge of its own level, which is how a
+    // trailing block reports that it never got to look where its content actually went. At the
+    // coarsest level the window is 64 full-resolution pixels, so the last group in a row has no
+    // room to move in the direction of travel and keeps the zero it started on - and because
+    // that answer is then broadcast across the whole group and the fine levels only search a
+    // few pixels, the error is never recovered. It shows up as a band of wrong vectors one
+    // group deep inside each border, and it is why a clean pan still shimmers at the edges.
+    // The flag is only ever set by a coarser level, so widening below never widens a search
+    // that had a usable prediction to start from.
+    std::vector<uint8_t> predMiss(nblocks, 0);
+
     // Coarse -> fine. One search at level l covers a `group x group` set of
     // full-resolution blocks; the result is broadcast to that group so the next
     // finer level starts from a real motion estimate instead of from zero.
@@ -721,6 +732,8 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         const int hit = clampi(zero, 0, span);
                         range = base / 3 + ((base - base / 3) * hit) / span;
                     }
+
+                    if (sv && predMiss[idx]) range += kBlock >> (l > 0 ? l : 1);
 
                     int best = 0x7FFFFFFF;
                     int bestDx = gx, bestDy = gy;
@@ -812,6 +825,24 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                     // result (already in that unit), a coarser level's whole-pixel vector is
                     // doubled on the way out. At l == 0, div is 1, so the two agree when the
                     // refine did not fire.
+                    // A winner that came to rest against the wall of its own level could not go
+                    // where its content actually went, so its answer stays untrusted one level
+                    // down; a winner that moved freely clears the flag it inherited.
+                    {
+                        const int wx0 = bx + bestDx, wy0 = by + bestDy;
+                        const uint8_t flag = (bestPlain < 0 || wx0 <= 0 || wy0 <= 0 ||
+                                              wx0 + bw >= lw || wy0 + bh >= lh) ? 1 : 0;
+                        for (int dr = 0; dr < group; dr++) {
+                            const int rr = frow + dr;
+                            if (rr >= bwy) break;
+                            for (int dc = 0; dc < group; dc++) {
+                                const int cc = fcol + dc;
+                                if (cc >= bwx) break;
+                                predMiss[rr * bwx + cc] = flag;
+                            }
+                        }
+                    }
+
                     const int32_t mvFullX = (l == 0)
                         ? static_cast<int32_t>(bestHx)
                         : static_cast<int32_t>(bestDx * div * 2);

@@ -523,6 +523,8 @@
     <string name="show_chapters">Show chapters</string>
     <string name="video_processing">Video Processing</string>
     <string name="video_processing_description">Frame interpolation, processing resolution and denoising</string>
+    <string name="record_test_clip">Record Test Clip</string>
+    <string name="record_test_clip_description">Capture 5 seconds of the processed output to a local transport stream for ffprobe</string>
     <string name="rife">Interpolation</string>
     <string name="interpolation_description_rife">Generate in-between frames with the RIFE neural network</string>
     <string name="interpolation_description_memc">Generate in-between frames by matching motion blocks in the source frames</string>

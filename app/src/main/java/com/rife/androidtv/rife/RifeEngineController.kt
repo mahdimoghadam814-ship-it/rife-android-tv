@@ -14,6 +14,7 @@ import com.rife.androidtv.DeviceProfile
 import com.rife.androidtv.VulkanCapabilities
 import com.rife.androidtv.encode.EncodedStreamSink
 import com.rife.androidtv.encode.HdrHevcEncoder
+import com.rife.androidtv.stream.FilePacketSink
 import com.rife.androidtv.stream.MpegTsMuxer
 import com.rife.androidtv.stream.TsPacketSink
 import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
@@ -21,6 +22,7 @@ import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
 import dev.anilbeesetti.nextplayer.feature.player.rife.InterpolationAlgorithm as FeatureInterpolationAlgorithm
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeStats
+import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -346,6 +348,42 @@ class RifeEngineController(
     /** True while a Phase C encode owns the output window. */
     val isEncoding: Boolean
         get() = encoder != null
+
+    private var testClipSink: FilePacketSink? = null
+
+    /**
+     * Phase D: opens a short transport-stream capture at [path] and starts feeding the processed
+     * frames into it. The caller owns the duration and calls [stopTestClip] when it is done -
+     * the clip is a diagnostic, so a fixed wall-clock stop is the simplest thing that cannot
+     * deadlock, and it keeps the timing policy out of the codec path.
+     *
+     * The frames are whatever the processing stage is currently drawing, so the capture is of the
+     * real pipeline rather than of a synthetic source; that is the point of validating it here,
+     * before a network can hide a broken bitstream behind a broken receiver.
+     */
+    override fun startTestClip(path: String, width: Int, height: Int, frameRate: Int): Boolean {
+        val sink = FilePacketSink(File(path))
+        val config = HdrHevcEncoder.Config(
+            width = width,
+            height = height,
+            frameRate = frameRate,
+        )
+        if (!startEncoding(config, sink)) {
+            sink.close()
+            return false
+        }
+        testClipSink = sink
+        return true
+    }
+
+    /** Ends a clip opened by [startTestClip], leaving the file flushed and readable. */
+    override fun stopTestClip(): Boolean {
+        val ok = stopEncoding()
+        val sink = testClipSink
+        testClipSink = null
+        sink?.close()
+        return ok
+    }
 
     /**
      * Counts what the codec produced and hands the same bytes on to [delegate] untouched.

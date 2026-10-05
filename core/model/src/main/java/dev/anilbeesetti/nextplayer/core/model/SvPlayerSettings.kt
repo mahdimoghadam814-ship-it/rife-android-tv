@@ -71,8 +71,17 @@ data class SvPlayerSettings(
     /** 0f disables bad-area masking, 1f masks every block that cannot be explained. */
     val artifactMaskLevel: Float = 1.0f,
     val blockSize: SvBlockSizeSetting = SvBlockSizeSetting.BLOCK_16X16,
-    /** Search radius in pixels; 0 derives it from local contrast the way SVP's negative range does. */
-    val searchDistance: Int = 16,
+    /**
+     * Search radius in pixels; 0 derives it from local contrast the way SVP's negative range does.
+     *
+     * 48 is the ceiling rather than a preference: the motion field packs each vector into a byte
+     * biased by +128 and decoded as `(v * 255 - 128) * 0.5`, so a vector can only ever reach
+     * 63.5 px. 48 px of coarse search plus the two finer passes is 57 px, which fits with room to
+     * spare, and anything past that saturates instead of helping. The value matters more than it
+     * looks: at 16 px, camera motion stops resolving somewhere around a 16 px frame-to-frame shift
+     * (36 dB there, 27 dB at 24 px), while 48 px holds 43 and 39 dB over the same content.
+     */
+    val searchDistance: Int = 48,
     /** Samples per pixel: 1 is whole-pixel, 2 is half-pixel. */
     val subpel: Int = 2,
     /**
