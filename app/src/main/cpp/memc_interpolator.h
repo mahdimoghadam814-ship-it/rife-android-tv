@@ -174,9 +174,10 @@ private:
     // Occlusion is where the field folds: a block whose right/bottom neighbour travels *less*
     // than it does means the destinations between them overlap and some of the content is being
     // covered up. MVTools' MakeVectorOcclusionMaskTime works on exactly that divergence, scaled
-    // to a byte. This turns one pixel of fold into `kOccScale` counts, so a fold of
-    // 255/kOccScale pixels is already a fully untrusted sample.
-    static constexpr int kOccScale = 16;
+    // to a byte. The field is held in half-pel units, so one half-pel of fold earns `kOccScale`
+    // counts and a whole pixel of fold earns 2 * kOccScale - a fold of 255/(2 * kOccScale)
+    // pixels is already a fully untrusted sample.
+    static constexpr int kOccScale = 8;
     // MVTools' thSCD1/thSCD2 scene-change gate, restated as the mean per-pixel luma SAD of the
     // *motion-compensated* pair. Consecutive frames of one shot land in single digits; an
     // unrelated pair lands near 30-60 no matter how good the search was.
@@ -303,6 +304,12 @@ private:
     std::vector<uint8_t> pyr0_[kLevels];
     std::vector<uint8_t> pyr1_[kLevels];
     std::vector<uint8_t> resized0_, resized1_;
+    // Motion fields, one int32 per 16x16 block, held in **half-pixel** units (2 units = 1 pixel).
+    // Whole-pixel search results are written as an even value, and the sub-pel locate sets the
+    // low bit when a block lands between two pixels. Every consumer converts back to pixels -
+    // `hpToPx()` for the samplers on the CPU, `* 0.5` after the biased-byte decode in the
+    // shaders. Keeping the unit uniform means a whole-pixel search never sets the low bit, so
+    // MEMC's output is unchanged by the extra precision.
     std::vector<int32_t> mvf_x_, mvf_y_, mvb_x_, mvb_y_;
     // Destination for one regulariseField() pass; a few kilobytes even at 1080p.
     std::vector<int32_t> tmpx_, tmpy_;

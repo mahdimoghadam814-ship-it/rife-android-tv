@@ -86,10 +86,13 @@ class GlOutputRenderer {
          *    at the block centres, so effective texel = p/16 - 1/2, and CLAMP_TO_EDGE is the
          *    border clamp rather than an extrapolation.
          *  * the two sample positions are the native `x - mv*t` and `x - mv*(1-t)`; adding the
-         *    half texel back converts pixel index to texture coordinate.
+         *    half texel back converts pixel index to texture coordinate. The packed field is in
+         *    half-pel, so `* 0.5` in the decode below is what turns it back into pixels.
          *
-         * `highp` is requested because the field is stored biased by 128: a mediump (fp16) `mv`
-         * would quantise to about a quarter of a pixel after `* 255.0 - 128.0`.
+         * `highp` is requested because the field is stored biased by 128 and carries half-pel
+         * precision, so it survives the `(v * 255.0 - 128.0) * 0.5` decode intact: a mediump
+         * (fp16) `mv` would only resolve about an eighth of a pixel, which is too coarse for the
+         * sub-pixel interpolation it feeds.
          *
          * `uMask` holds the cover/uncover masks from `MemcInterpolator::buildOcclusionMasks()`,
          * one byte per block, sampled at the same coordinate as the field. Where a field folds
@@ -116,8 +119,8 @@ class GlOutputRenderer {
                 vec2 p = vTextureCoord * uTargetSize - 0.5;
                 vec2 g = p / uMotionGrid;
                 vec4 mv = texture2D(uMotion, g);
-                vec2 mvf = mv.rg * 255.0 - 128.0;
-                vec2 mvb = mv.ba * 255.0 - 128.0;
+                vec2 mvf = (mv.rg * 255.0 - 128.0) * 0.5;
+                vec2 mvb = (mv.ba * 255.0 - 128.0) * 0.5;
                 vec2 pa = p - mvf * uTimestep;
                 vec2 pb = p - mvb * (1.0 - uTimestep);
                 vec3 ca = texture2D(uFrame0, (pa + 0.5) / uTargetSize).rgb;
@@ -200,7 +203,7 @@ class GlOutputRenderer {
                 vec3 merged = cur;
                 if (uHasHistory > 0.5) {
                     vec2 g = p / uMotionGrid;
-                    vec2 mvf = texture2D(uMotion, g).rg * 255.0 - 128.0;
+                    vec2 mvf = (texture2D(uMotion, g).rg * 255.0 - 128.0) * 0.5;
                     vec4 aux = texture2D(uMask, g);
                     float w = aux.b * (255.0 - aux.r) / (255.0 * 255.0);
                     if (w > 0.0) {

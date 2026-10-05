@@ -136,6 +136,14 @@ static inline int32_t div16r(int32_t v) {
     return v >= 0 ? (v + 8) >> 4 : -(((-v) + 8) >> 4);
 }
 
+// Half-pel -> whole pixel, rounding away from zero. Motion fields are carried in half-pel so
+// the search can express a vector that lands between two pixels, but every sampler in this file
+// (`sadWin`, `sadAt`, `sampleBilinear`) still wants a whole-pixel offset, so this is the single
+// place the conversion happens on the CPU side.
+static inline int hpToPx(int hp) {
+    return hp >= 0 ? (hp + 1) >> 1 : -(((-hp) + 1) >> 1);
+}
+
 // Maps a pixel coordinate onto the motion-vector grid, which holds one vector per [pitch] pixels
 // anchored at the block centres. Returns the two bracketing grid indices and the weight of the
 // second in 1/pitch units. Within half a block of a frame border the weight is clamped instead
@@ -564,6 +572,9 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
     // The SVPlayer tuning only applies when that backend is the one selected. MEMC keeps the
     // measured baseline above unchanged so the two stay comparable from run to run.
     const bool sv = algorithm() == static_cast<int>(InterpolationAlgorithm::SVPLAYER);
+    // `subpel` is samples per pixel: 2 asks for a half-pixel search, 1 stays on whole pixels.
+    // Only the SVPlayer backend pays for the extra pass - MEMC's output stays bit-identical.
+    const bool halfPel = sv && sv_config_.subpel == 2;
     int coarseBase = kCoarseRange;
     int fineBase = kFineRange;
     int newLambdaBase = kPenaltyNew;
@@ -655,8 +666,11 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                     const int frow = lr * div;
                     const int idx = frow * bwx + fcol;
 
-                    const int gx = mvx[idx] / div;
-                    const int gy = mvy[idx] / div;
+                    // Prediction carried down from the coarser level, in this level's pixels.
+                    // The field is held in half-pel, so the divisor is div * 2; coarser levels
+                    // only ever write whole-pixel (even) vectors, so this is exact.
+                    const int gx = mvx[idx] / (div * 2);
+                    const int gy = mvy[idx] / (div * 2);
 
                     const uint8_t* tb = tgt + by * lw + bx;
                     // The matching window for this block, rounded down to a whole 8x8 tile so
@@ -704,6 +718,50 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                             }
                         }
                     }
+
+                    // The integer winner, expressed in half-pel. Seeding it from `bestDx` - not
+                    // from the prediction the search started at - is what makes an untouched
+                    // value exactly twice the pixel result, so a whole-pixel backend's output is
+                    // unchanged; the refine below only moves it onto a half pixel.
+                    int bestHx = bestDx * 2, bestHy = bestDy * 2;
+
+                    // Sub-pel locate. The integer pass settles the pixel, but the true minimum
+                    // is usually a fraction of a pixel off it, and a whole-pixel field makes
+                    // every warp land on a pixel boundary - which is where the combing and the
+                    // crawling stair-steps in a translating shot come from. Fit a parabola
+                    // through the winner's plain SAD and its four axis neighbours, all measured
+                    // on the same sharp reference the winner was scored against, so there is no
+                    // interpolated copy of the picture to disagree with it. Each axis then
+                    // rounds to the nearest half pixel, which reaches the whole half-pel lattice
+                    // - diagonals included - for four extra SADs and no scratch at all.
+                    if (halfPel && l == 0 && bestPlain >= 0) {
+                        auto plainSad = [&](int ox, int oy) -> int {
+                            const int xx = bx + bestDx + ox;
+                            const int yy = by + bestDy + oy;
+                            if (xx < 0 || yy < 0 || xx + bw > lw || yy + bh > lh) return -1;
+                            return sadWin(tb, ref + yy * lw + xx, lw, bw, bh);
+                        };
+                        // Vertex of the parabola through the three samples, in pixels relative
+                        // to the winner, rounded onto the half-pel lattice and clamped to the
+                        // one half-pixel each side of it. A flat or concave surface has no
+                        // trustworthy vertex, so a block that matched exactly where it should
+                        // simply keeps its integer vector.
+                        auto locate = [&](int sMinus, int s0, int sPlus) -> int {
+                            if (sMinus < 0 || sPlus < 0) return 0;
+                            const float denom = static_cast<float>(sMinus) -
+                                                2.0f * static_cast<float>(s0) +
+                                                static_cast<float>(sPlus);
+                            if (denom <= 0.0f) return 0;
+                            float d = 0.5f * static_cast<float>(sMinus - sPlus) / denom;
+                            if (d < -0.5f) d = -0.5f;
+                            if (d > 0.5f) d = 0.5f;
+                            const int half = static_cast<int>(d * 2.0f + (d >= 0.0f ? 0.5f : -0.5f));
+                            return half < -1 ? -1 : (half > 1 ? 1 : half);
+                        };
+                        bestHx = bestDx * 2 + locate(plainSad(-1, 0), bestPlain, plainSad(1, 0));
+                        bestHy = bestDy * 2 + locate(plainSad(0, -1), bestPlain, plainSad(0, 1));
+                    }
+
                     if (l == 0 && bestPlain >= 0) {
                         int gateSad = bestPlain;
                         if (bw != kBlock || bh != kBlock) {
@@ -721,8 +779,16 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         localSad += gateSad;
                     }
 
-                    const int32_t mvFullX = static_cast<int32_t>(bestDx * div);
-                    const int32_t mvFullY = static_cast<int32_t>(bestDy * div);
+                    // The field's unit is half-pel: the finest level takes the refine's
+                    // result (already in that unit), a coarser level's whole-pixel vector is
+                    // doubled on the way out. At l == 0, div is 1, so the two agree when the
+                    // refine did not fire.
+                    const int32_t mvFullX = (l == 0)
+                        ? static_cast<int32_t>(bestHx)
+                        : static_cast<int32_t>(bestDx * div * 2);
+                    const int32_t mvFullY = (l == 0)
+                        ? static_cast<int32_t>(bestHy)
+                        : static_cast<int32_t>(bestDy * div * 2);
                     for (int dr = 0; dr < group; dr++) {
                         const int rr = frow + dr;
                         if (rr >= bwy) break;
@@ -769,13 +835,14 @@ void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, i
     static const int kNy[4] = {0, 0, -1, 1};
 
     auto inBounds = [&](int bx, int by, int mx, int my) {
-        const int xx = bx + ox + mx;
-        const int yy = by + oy + my;
+        const int xx = bx + ox + hpToPx(mx);
+        const int yy = by + oy + hpToPx(my);
         return xx >= 0 && yy >= 0 && xx + 8 <= w && yy + 8 <= h;
     };
     auto score = [&](int bx, int by, int mx, int my) {
         const uint8_t* a = tgt + static_cast<size_t>(by + oy) * w + (bx + ox);
-        const uint8_t* b = ref + static_cast<size_t>(by + oy + my) * w + (bx + ox + mx);
+        const uint8_t* b = ref + static_cast<size_t>(by + oy + hpToPx(my)) * w +
+                          (bx + ox + hpToPx(mx));
         return sad8x8(a, b, w);
     };
 
@@ -801,7 +868,10 @@ void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, i
                     const int cy = mvy[nidx];
                     if (!inBounds(bx, by, cx, cy)) continue;
                     int s = score(bx, by, cx, cy);
-                    s += kPenaltyNeighbour * (std::abs(cx - sx) + std::abs(cy - sy));
+                    // The field is in half-pel, so a whole pixel of disagreement is two units;
+                    // kPenaltyNeighbour is quoted per full-resolution pixel, hence the /2. The
+                    // product is always even, so the division is exact.
+                    s += kPenaltyNeighbour * (std::abs(cx - sx) + std::abs(cy - sy)) / 2;
                     if (s < bestCost) {
                         bestCost = s;
                         bestX = cx;
@@ -896,10 +966,11 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     // division-free lerp. k=128 reproduces the old (a+b+1)>>1 exactly, but the weight now
     // tracks the timestep instead of being hard-wired to 50/50.
     const int wt = clampi(static_cast<int>(t * 256.0f + 0.5f), 0, 256);
-    // Vectors are whole pixels. Scaling by 16 puts the interpolated field on a 1/16 px grid, and
-    // one further multiply by the timestep lands on the 1/256 px fixed point the sampler reads.
-    const float ts = t * 16.0f;
-    const float us = u * 16.0f;
+    // Vectors are half-pixel, so the double-weighted field above is MV * 16 = MV_px * 32 - a
+    // 1/32 px grid. Scaling the timestep by 8 turns it into 1/256 px units, and the product
+    // lands on the fixed point the sampler reads: MV_px * 32 * t * 8 = MV_px * t * 256.
+    const float ts = t * 8.0f;
+    const float us = u * 8.0f;
     // Number of distinct bracketing pairs along x: pixels past the last vector reuse it, and a
     // frame narrower than one block has a single pair covering the whole row.
     const int ncol = bwx < 2 ? 1 : bwx - 1;
@@ -1261,9 +1332,11 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
     const int bwx = (w + kBlock - 1) / kBlock;
     const int bwy = (h + kBlock - 1) / kBlock;
     const size_t blocks = static_cast<size_t>(bwx) * bwy;
-    // The hierarchical search bounds the field well inside +-127 whole pixels (|mv| <= 38 at
-    // three levels with the ranges above), so the +128 bias always fits a byte. Clamp anyway: a
-    // future range change must degrade to a saturated vector, never a wrapped one.
+    // The field is packed in half-pel, and the +128 byte bias leaves room for -128..+127
+    // units, i.e. -64..+63.5 pixels. The widest reach the exposed search options can produce is
+    // the adaptive coarse pass at 12 level-2 blocks (48 px) plus the two finer passes (9 px) -
+    // 57 px, or 114 units - so it fits with room to spare. Clamp anyway: a hand-edited search
+    // distance must degrade to a saturated vector, never a wrapped one.
     auto bias = [](int32_t v) {
         const int32_t b = v + 128;
         return static_cast<uint8_t>(b < 0 ? 0 : (b > 255 ? 255 : b));
@@ -1288,8 +1361,10 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
                 const size_t i = row + c;
                 const int cx = c * kBlock + kBlock / 2;
                 // `p - mv` at t = 1, the same position the warp shader samples the partner at.
+                // The field is half-pel, so it goes through hpToPx before it can index luma.
                 const int sadF = sadAt(luma1_.data(), luma0_.data(), w, w, h,
-                                       cx, cy, cx - mvf_x_[i], cy - mvf_y_[i]);
+                                       cx, cy, cx - hpToPx(mvf_x_[i]),
+                                       cy - hpToPx(mvf_y_[i]));
                 nlmScore_[i * 2] = static_cast<uint8_t>(clampi(sadF / 64, 0, 255));
                 hist[nlmScore_[i * 2]]++;
                 // The backward residual is only a real residual when the backward field is.
@@ -1299,7 +1374,8 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
                 // harder than its own measurement justifies. Only the forward half counts then.
                 if (!forwardOnly) {
                     const int sadB = sadAt(luma0_.data(), luma1_.data(), w, w, h,
-                                           cx, cy, cx - mvb_x_[i], cy - mvb_y_[i]);
+                                           cx, cy, cx - hpToPx(mvb_x_[i]),
+                                           cy - hpToPx(mvb_y_[i]));
                     const int sb = clampi(sadB / 64, 0, 255);
                     nlmScore_[i * 2 + 1] = static_cast<uint8_t>(sb);
                     hist[sb]++;
