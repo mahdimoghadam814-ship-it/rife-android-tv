@@ -17,6 +17,7 @@ import com.rife.androidtv.encode.HdrHevcEncoder
 import com.rife.androidtv.stream.FilePacketSink
 import com.rife.androidtv.stream.MpegTsMuxer
 import com.rife.androidtv.stream.TsPacketSink
+import com.rife.androidtv.stream.UdpTsPacketSink
 import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeController
 import dev.anilbeesetti.nextplayer.feature.player.rife.RifeResolution as FeatureRifeResolution
@@ -128,6 +129,10 @@ class RifeEngineController(
         processor.stop()
         _inputSurface.value = null
         _processingEnabled.value = false
+    }
+
+    override fun getInputFrameSize(): Pair<Int, Int> {
+        return processor.getInputWidth() to processor.getInputHeight()
     }
 
     /**
@@ -272,6 +277,59 @@ class RifeEngineController(
     fun engineStatus(): RifeDiagnosticResult = NativeEngine.getRifeStatus()
 
     // --------------------------------------------------------------------------------------
+    // Phase E/F: UDP streaming of processed frames to a TV box
+    // --------------------------------------------------------------------------------------
+
+    /**
+     * Starts UDP streaming of the processed frame pipeline to [host]:[port] as MPEG-TS over UDP.
+     * Creates [UdpTsPacketSink] and starts the hardware HEVC encoder with the current video
+     * size. The encoder feeds processed frames through [MpegTsMuxer] into the UDP sink.
+     * Subtitles are not included in the TS output (they are ExoPlayer overlay-only); the TV box
+     * should render subtitles from the original source independently.
+     */
+    override fun startUdpStream(host: String, port: Int): Boolean {
+        val sink = UdpTsPacketSink(host, port)
+        try {
+            val (width, height) = getInputFrameSize()
+            if (width <= 0 || height <= 0) {
+                Log.w(TAG, "Cannot start UDP stream: input frame size not yet known")
+                return false
+            }
+            val frameRate = 60 // Default; encoder will adapt to actual frame rate
+            val config = HdrHevcEncoder.Config(
+                width = width,
+                height = height,
+                frameRate = frameRate,
+            )
+            if (!startEncoding(config, sink)) {
+                sink.close()
+                Log.e(TAG, "Failed to start encoding for UDP stream")
+                return false
+            }
+            _udpSink = sink
+            _udpRunning = true
+            _udpEnabled.value = true
+            Log.i(TAG, "UDP streaming started to $host:$port at ${width}x$height@$frameRate")
+            return true
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to start UDP streaming", e)
+            sink.close()
+            return false
+        }
+    }
+
+    /** Stops UDP streaming and releases the socket and sender thread. */
+    override fun stopUdpStream() {
+        if (!_udpRunning) return
+        _udpRunning = false
+        val sink = _udpSink
+        _udpSink = null
+        _udpEnabled.value = false
+        stopEncoding() // Stops the encoder and closes the muxer/sink
+        Log.i(TAG, "UDP streaming stopped")
+    }
+
+    // --------------------------------------------------------------------------------------
     // Phase C: the hardware Surface-based HEVC Main10 HDR encoder
     // --------------------------------------------------------------------------------------
 
@@ -366,6 +424,17 @@ class RifeEngineController(
         get() = encoder != null
 
     private var testClipSink: FilePacketSink? = null
+
+    /** The current UDP sink, held so stopUdpStream can close it. */
+    private var _udpSink: UdpTsPacketSink? = null
+
+    /** True while UDP streaming is active; stopUdpStream is a no-op if false. */
+    @Volatile
+    private var _udpRunning = false
+
+    /** StateFlow for observing UDP streaming status from the UI. */
+    private val _udpEnabled = MutableStateFlow(false)
+    override val udpEnabled: StateFlow<Boolean> = _udpEnabled.asStateFlow()
 
     /**
      * Phase D: opens a short transport-stream capture at [path] and starts feeding the processed

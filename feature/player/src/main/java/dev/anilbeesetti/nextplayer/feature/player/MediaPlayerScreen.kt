@@ -249,6 +249,20 @@ internal fun MediaPlayerContent(
         // even when the controls are already visible.
         rifeStatusTrigger++
     }
+    LaunchedEffect(
+        playerPreferences.udpStreamingEnabled,
+        playerPreferences.udpStreamingHost,
+        playerPreferences.udpStreamingPort,
+    ) {
+        if (playerPreferences.udpStreamingEnabled) {
+            rifeController.startUdpStream(
+                playerPreferences.udpStreamingHost,
+                playerPreferences.udpStreamingPort,
+            )
+        } else {
+            rifeController.stopUdpStream()
+        }
+    }
 
     val controlsVisible = controlsVisibilityState.controlsVisible
     LaunchedEffect(controlsVisible) {
@@ -365,7 +379,6 @@ internal fun MediaPlayerContent(
                     algorithm = playerPreferences.interpolationAlgorithm.toInterpolationAlgorithm(),
                 )
             },
-            onRecordTestClip = onRecordTestClip,
         )
         if (volumeAndBrightnessGestureState != null && volumeState != null && brightnessState != null) {
             PlayerVerticalGestureIndicators(

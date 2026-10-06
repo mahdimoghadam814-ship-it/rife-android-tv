@@ -141,8 +141,20 @@ interface RifeController {
      */
     fun setOutputDataSpace(dataSpace: Int)
 
-    /** Returns and clears the last pipeline error, if any. */
+    /** Drops every buffered frame: seek, media transition, stream change. */
     fun consumeError(): String?
+
+    /** Whether UDP streaming is active. */
+    val udpEnabled: StateFlow<Boolean>
+
+    /** Current input frame size (width, height) as reported by the decoder, or (0, 0) if unknown. */
+    fun getInputFrameSize(): Pair<Int, Int>
+
+    /** Starts UDP streaming of processed frames to [host]:[port] via MPEG-TS over UDP. */
+    fun startUdpStream(host: String, port: Int): Boolean
+
+    /** Stops UDP streaming and releases the socket and sender thread. */
+    fun stopUdpStream()
 
     /**
      * Called once the player has actually taken over the current input surface, so the replaced

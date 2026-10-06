@@ -48,13 +48,18 @@ data class PlayerPreferences(
     val enableVolumeBoost: Boolean = false,
 
     // Video Processing Preferences (frame interpolation + motion-aligned denoising)
-    val rifeEnabled: Boolean = false,
-    val rifeResolution: RifeResolutionSetting = RifeResolutionSetting.AUTO,
+    val rifeEnabled: Boolean = true,
+    val rifeResolution: RifeResolutionSetting = RifeResolutionSetting.ORIGINAL,
     val interpolationAlgorithm: InterpolationAlgorithmSetting = InterpolationAlgorithmSetting.SVPLAYER,
     val memcLevel: MemcLevelSetting = MemcLevelSetting.TWO_X,
-    val fastDvdNetEnabled: Boolean = false,
-    val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.BALANCED,
+    val fastDvdNetEnabled: Boolean = true,
+    val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.STRONG,
     val svPlayerSettings: SvPlayerSettings = SvPlayerSettings(),
+
+    // UDP Streaming Preferences (Phase E/F transport to TV box)
+    val udpStreamingEnabled: Boolean = false,
+    val udpStreamingHost: String = "10.112.131.92",
+    val udpStreamingPort: Int = 5004,
 
     // Subtitle Preferences
     val useSystemCaptionStyle: Boolean = false,

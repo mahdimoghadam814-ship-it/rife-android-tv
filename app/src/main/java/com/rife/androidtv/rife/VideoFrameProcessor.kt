@@ -610,6 +610,12 @@ class VideoFrameProcessor(
         }
     }
 
+    /** Current input frame width as reported by the decoder. */
+    fun getInputWidth(): Int = inputWidth
+
+    /** Current input frame height as reported by the decoder. */
+    fun getInputHeight(): Int = inputHeight
+
     /**
      * Called by the owner once the surface reported through the `onInputSurfaceCreated` callback
      * has actually been attached to the player. Only then is the replaced EGL context /

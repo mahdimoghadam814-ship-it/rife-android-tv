@@ -61,7 +61,6 @@ internal fun MediaPlayerControls(
     isPipSupported: Boolean,
     onPictureInPictureClick: () -> Unit,
     engineStatusOverlay: @Composable () -> Unit = {},
-    onRecordTestClip: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val playerPreferences = state.playerPreferences
@@ -207,7 +206,6 @@ internal fun MediaPlayerControls(
                 onMemcLevelSelected = { onAction(PlayerAction.SetMemcLevel(it)) },
                 onDenoiseLevelSelected = { onAction(PlayerAction.SetDenoiseLevel(it)) },
                 onSvSettingsChanged = { onAction(PlayerAction.SetSvPlayerSettings(it)) },
-                onRecordTestClip = onRecordTestClip,
             )
         }
     }

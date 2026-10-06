@@ -43,7 +43,6 @@ fun BoxScope.OverlayShowView(
     onMemcLevelSelected: (MemcLevelSetting) -> Unit = {},
     onDenoiseLevelSelected: (DenoiseLevelSetting) -> Unit = {},
     onSvSettingsChanged: (SvPlayerSettings) -> Unit = {},
-    onRecordTestClip: () -> Unit = {},
 ) {
     Box(
         modifier = Modifier
@@ -114,7 +113,6 @@ fun BoxScope.OverlayShowView(
         onMemcLevelSelected = onMemcLevelSelected,
         onDenoiseLevelSelected = onDenoiseLevelSelected,
         onSvSettingsChanged = onSvSettingsChanged,
-        onRecordTestClip = onRecordTestClip,
     )
 }
 

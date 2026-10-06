@@ -65,7 +65,6 @@ fun BoxScope.ProcessingSettingsView(
     onMemcLevelSelected: (MemcLevelSetting) -> Unit,
     onDenoiseLevelSelected: (DenoiseLevelSetting) -> Unit,
     onSvSettingsChanged: (SvPlayerSettings) -> Unit,
-    onRecordTestClip: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     OverlayView(
@@ -130,20 +129,6 @@ fun BoxScope.ProcessingSettingsView(
                 onSelected = onDenoiseLevelSelected,
             )
             HorizontalDivider()
-            // Phase D's only in-app control. The capture exercises the very settings above it, so
-            // it belongs on this sheet rather than in the playback controls - and its own state
-            // lives here, because whether a diagnostic clip is rolling is not a preference anyone
-            // would want restored the next time the player opens.
-            var recording by remember { mutableStateOf(false) }
-            ToggleRow(
-                title = stringResource(R.string.record_test_clip),
-                description = stringResource(R.string.record_test_clip_description),
-                checked = recording,
-                onToggle = {
-                    recording = !recording
-                    onRecordTestClip()
-                },
-            )
         }
     }
 }
