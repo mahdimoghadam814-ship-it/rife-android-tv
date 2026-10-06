@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.NavigateNext
+import androidx.compose.material.icons.rounded.Lan
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -85,6 +86,7 @@ fun ControlsBottomView(
     onPlaybackSpeedClick: () -> Unit,
     onPlayInBackgroundClick: () -> Unit,
     onProcessingSettingsClick: () -> Unit,
+    onUdpStreamingToggle: () -> Unit,
     onSeek: (Long) -> Unit,
     onSeekEnd: () -> Unit,
 ) {
@@ -196,6 +198,19 @@ fun ControlsBottomView(
                         painter = painterResource(R.drawable.ic_speed),
                         contentDescription = null,
                     )
+}
+                // UDP Streaming toggle - network streaming to TV box
+                val udpDescription = stringResource(R.string.udp_streaming)
+                PlayerButton(
+                    modifier = Modifier.semantics { contentDescription = udpDescription },
+                    onClick = onUdpStreamingToggle,
+                    containerColor = PlayerButtonBlackAlpha,
+                    contentPadding = PaddingValues(8.dp),
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Lan,
+                        contentDescription = null,
+                    )
                 }
             }
         }
@@ -273,6 +288,7 @@ private fun ControlsBottomViewPreview() {
                 onPlaybackSpeedClick = {},
                 onPlayInBackgroundClick = {},
                 onProcessingSettingsClick = {},
+                onUdpStreamingToggle = {},
                 onSeek = {},
                 onSeekEnd = {},
             )

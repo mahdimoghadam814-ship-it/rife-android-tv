@@ -379,6 +379,7 @@ internal fun MediaPlayerContent(
                     algorithm = playerPreferences.interpolationAlgorithm.toInterpolationAlgorithm(),
                 )
             },
+            onUdpStreamingToggle = { onAction(PlayerAction.ToggleUdpStreaming) },
         )
         if (volumeAndBrightnessGestureState != null && volumeState != null && brightnessState != null) {
             PlayerVerticalGestureIndicators(

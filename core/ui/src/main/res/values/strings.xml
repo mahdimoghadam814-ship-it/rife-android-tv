@@ -202,6 +202,7 @@
     <string name="channels">Channels</string>
     <string name="language">Language</string>
     <string name="frame_rate">Frame rate</string>
+    <string name="udp_streaming">UDP Streaming</string>
     <string name="okay">Okay</string>
     <string name="properties">Properties</string>
     <string name="volume_boost">Volume boost</string>

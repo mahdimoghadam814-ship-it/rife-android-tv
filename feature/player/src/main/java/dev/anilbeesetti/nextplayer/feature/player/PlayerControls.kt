@@ -61,6 +61,7 @@ fun PlayerControls(
     modifier: Modifier = Modifier,
     middleControlsModifier: Modifier = Modifier,
     engineStatusOverlay: @Composable () -> Unit = {},
+    onUdpStreamingToggle: () -> Unit = {},
 ) {
     Box(
         modifier = modifier.fillMaxSize(),
@@ -137,6 +138,7 @@ fun PlayerControls(
                     onVideoContentScaleLongClick = { onShowOverlay(OverlayView.VIDEO_CONTENT_SCALE) },
                     onPictureInPictureClick = onPictureInPictureClick,
                     onProcessingSettingsClick = { onShowOverlay(OverlayView.PROCESSING_SETTINGS) },
+                    onUdpStreamingToggle = onUdpStreamingToggle,
                 )
             }
         }

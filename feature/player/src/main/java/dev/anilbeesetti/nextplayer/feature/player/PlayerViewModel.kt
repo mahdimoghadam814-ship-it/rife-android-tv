@@ -44,6 +44,7 @@ class PlayerViewModel(
         val setVideoDecoderMode: (DecoderMode) -> Unit,
         val setAudioDecoderMode: (DecoderMode) -> Unit,
         val tryDecoderFallback: () -> Unit,
+        val showUdpConfigDialog: (Boolean, String, Int, (String, Int) -> Unit) -> Unit,
     )
 
     private val stateInternal = MutableStateFlow(
@@ -82,6 +83,7 @@ class PlayerViewModel(
             is PlayerAction.SetDenoiseLevel -> updateDenoiseLevel(action.level)
             is PlayerAction.SetSvPlayerSettings -> updateSvPlayerSettings(action.settings)
             is PlayerAction.ToggleTimeDisplay -> toggleTimeDisplay()
+            is PlayerAction.ToggleUdpStreaming -> toggleUdpStreaming()
             is PlayerAction.OnVideoZoomEvent -> onVideoZoomEvent(action.event)
             is PlayerAction.OnSubtitleOptionEvent -> onSubtitleOptionEvent(action.event)
         }
@@ -163,6 +165,34 @@ class PlayerViewModel(
         }
     }
 
+    private fun toggleUdpStreaming() {
+        val currentPrefs = preferencesRepository.playerPreferences.value
+        if (!currentPrefs.udpStreamingEnabled) {
+            // Show config dialog before enabling
+            output.showUdpConfigDialog(
+                false,
+                currentPrefs.udpStreamingHost,
+                currentPrefs.udpStreamingPort,
+                { host, port ->
+                    viewModelScope.launch {
+                        preferencesRepository.updatePlayerPreferences {
+                            it.copy(
+                                udpStreamingEnabled = true,
+                                udpStreamingHost = host,
+                                udpStreamingPort = port,
+                            )
+                        }
+                    }
+                }
+            )
+        } else {
+            // Just disable
+            viewModelScope.launch {
+                preferencesRepository.updatePlayerPreferences { it.copy(udpStreamingEnabled = false) }
+            }
+        }
+    }
+
     private fun onVideoZoomEvent(event: VideoZoomEvent) {
         when (event) {
             is VideoZoomEvent.ContentScaleChanged -> {
@@ -225,6 +255,7 @@ sealed interface PlayerAction {
     data class SetDenoiseLevel(val level: DenoiseLevelSetting) : PlayerAction
     data class SetSvPlayerSettings(val settings: SvPlayerSettings) : PlayerAction
     data object ToggleTimeDisplay : PlayerAction
+    data object ToggleUdpStreaming : PlayerAction
     data class OnVideoZoomEvent(val event: VideoZoomEvent) : PlayerAction
     data class OnSubtitleOptionEvent(val event: SubtitleOptionsEvent) : PlayerAction
 }

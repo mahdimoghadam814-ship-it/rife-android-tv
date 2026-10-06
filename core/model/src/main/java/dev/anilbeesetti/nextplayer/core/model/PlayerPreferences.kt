@@ -52,8 +52,8 @@ data class PlayerPreferences(
     val rifeResolution: RifeResolutionSetting = RifeResolutionSetting.ORIGINAL,
     val interpolationAlgorithm: InterpolationAlgorithmSetting = InterpolationAlgorithmSetting.SVPLAYER,
     val memcLevel: MemcLevelSetting = MemcLevelSetting.TWO_X,
-    val fastDvdNetEnabled: Boolean = true,
-    val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.STRONG,
+    val fastDvdNetEnabled: Boolean = false,
+    val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.BALANCED,
     val svPlayerSettings: SvPlayerSettings = SvPlayerSettings(),
 
     // UDP Streaming Preferences (Phase E/F transport to TV box)

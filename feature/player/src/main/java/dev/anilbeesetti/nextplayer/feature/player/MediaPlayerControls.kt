@@ -61,6 +61,7 @@ internal fun MediaPlayerControls(
     isPipSupported: Boolean,
     onPictureInPictureClick: () -> Unit,
     engineStatusOverlay: @Composable () -> Unit = {},
+    onUdpStreamingToggle: () -> Unit = {},
     modifier: Modifier = Modifier,
 ) {
     val playerPreferences = state.playerPreferences
@@ -169,6 +170,7 @@ internal fun MediaPlayerControls(
                     onToggleTimeDisplay = { onAction(PlayerAction.ToggleTimeDisplay) },
                     onPictureInPictureClick = onPictureInPictureClick,
                     engineStatusOverlay = engineStatusOverlay,
+                    onUdpStreamingToggle = { onAction(PlayerAction.ToggleUdpStreaming) },
                     middleControlsModifier = Modifier.thenIf(isTv) {
                         focusRequester(middleControlsFocusRequester)
                             .onFocusChanged { isMiddleControlsFocused = it.hasFocus }

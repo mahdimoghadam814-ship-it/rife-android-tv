@@ -1,11 +1,14 @@
 package dev.anilbeesetti.nextplayer.feature.player
 
+import android.app.AlertDialog
 import android.annotation.SuppressLint
 import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.view.WindowManager
+import android.widget.EditText
+import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
@@ -234,6 +237,11 @@ class PlayerActivity : ComponentActivity() {
         tryDecoderFallback = {
             lifecycleScope.launch { mediaController?.tryDecoderFallback() }
         },
+        showUdpConfigDialog = { isEnabled, host, port, onConfirm ->
+            runOnUiThread {
+                showUdpConfigDialog(isEnabled, host, port, onConfirm)
+            }
+        },
     )
 
     private suspend fun currentMediaDirectory(): Uri? {
@@ -259,6 +267,41 @@ class PlayerActivity : ComponentActivity() {
             contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
             snapshotFlow { mediaController }.filterNotNull().first().addSubtitleTrack(uri)
         }
+    }
+
+    private fun showUdpConfigDialog(
+        isEnabled: Boolean,
+        currentHost: String,
+        currentPort: Int,
+        onConfirm: (String, Int) -> Unit,
+    ) {
+        val hostInput = EditText(this).apply {
+            setText(currentHost)
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+            hint = "Host/IP"
+        }
+        val portInput = EditText(this).apply {
+            setText(currentPort.toString())
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+            hint = "Port"
+        }
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(32, 16, 32, 16)
+            addView(hostInput)
+            addView(portInput)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle(getString(coreUiR.string.udp_streaming))
+            .setView(layout)
+            .setPositiveButton(getString(coreUiR.string.okay)) { _, _ ->
+                val host = hostInput.text.toString()
+                val port = portInput.text.toString().toIntOrNull() ?: 5004
+                onConfirm(host, port)
+            }
+            .setNegativeButton(getString(coreUiR.string.cancel), null)
+            .show()
     }
 
     private fun selectAudio() {
