@@ -7,9 +7,9 @@ package com.rife.androidtv.rife
  */
 enum class RifeResolution {
     /**
-     * Let the engine pick: the source resolution below 4K, 1080p processing for a 4K source with
-     * MEMC on, and native 4K for a 4K source with only the denoiser on (degrading stepwise while
-     * the native frame rate cannot be held).
+     * Let the engine pick: with MEMC on, process 720p at 480p, 1080p at 720p, and 4K at 1080p;
+     * smaller sources stay native. With only denoising on, 4K starts native and degrades
+     * stepwise while the native frame rate cannot be held.
      */
     AUTO,
     ORIGINAL,

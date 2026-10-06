@@ -2656,8 +2656,12 @@ class VideoFrameProcessor(
 
     /**
      * The processing resolution the engine picks for this source and toggle state (AUTO mode).
+     * The decoder callback, OES readback, native processing, and presentation currently run
+     * serially on one worker. Keep that pipeline's synchronous readback bounded for HD sources:
+     * 720p is processed at 480p, 1080p at 720p, and 4K at 1080p when MEMC is enabled. The
+     * processed image is scaled into the output surface by the present. Sources below 720p keep
+     * their native dimensions so the established 480p path is unchanged.
      *
-     *  * below 4K -> the source resolution, untouched, whatever is enabled;
      *  * 4K with MEMC on -> 1080p. The interpolation cycle has to fit a 41.6 ms budget and 4K is
      *    four times the pixels; the result is scaled back up into the output surface by the
      *    present, which is where that upscaling belongs.
@@ -2666,7 +2670,10 @@ class VideoFrameProcessor(
      *    dropped (see [reportStageTiming]).
      */
     private fun autoResolution(srcW: Int, srcH: Int): RifeResolution {
-        if (maxOf(srcW, srcH) < auto4kMinDim) return RifeResolution.ORIGINAL
+        val longEdge = maxOf(srcW, srcH)
+        if (longEdge < 1280) return RifeResolution.ORIGINAL
+        if (longEdge < 1920) return if (isRifeEnabled) RifeResolution.RES_480P else RifeResolution.ORIGINAL
+        if (longEdge < auto4kMinDim) return if (isRifeEnabled) RifeResolution.RES_720P else RifeResolution.ORIGINAL
         if (isRifeEnabled) return RifeResolution.RES_1080P
         if (!isDenoiseEnabled) return RifeResolution.ORIGINAL
         return autoDegradeLadder[autoDegradeLevel.coerceIn(0, autoDegradeLadder.lastIndex)]
