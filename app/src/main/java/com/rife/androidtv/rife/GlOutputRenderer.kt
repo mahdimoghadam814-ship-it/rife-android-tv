@@ -165,6 +165,9 @@ class GlOutputRenderer {
                     vec3 termB = cb;
                     if (uBlendMode == 2) {
                         vec2 occ = texture2D(uMask, g).rg;
+                        // The masks describe full-pair flow. At time t the forward path has
+                        // traversed t of that flow and the backward path has traversed 1-t.
+                        occ *= vec2(uTimestep, 1.0 - uTimestep);
                         if (occ.r > 0.0 || occ.g > 0.0) {
                             vec2 raw = (p + 0.5) / uTargetSize;
                             vec3 innerF = ca;

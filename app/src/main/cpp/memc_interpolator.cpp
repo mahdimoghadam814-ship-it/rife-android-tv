@@ -515,6 +515,8 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     tmpy_.resize(blocks);
     maskf_.resize(blocks);
     maskb_.resize(blocks);
+    consistencyf_.resize(blocks);
+    consistencyb_.resize(blocks);
 
     work_w_ = w;
     work_h_ = h;
@@ -1023,6 +1025,71 @@ void MemcInterpolator::buildOcclusionMasks(int w, int h) {
     }
 }
 
+// Round-trip check over the already-estimated fields. For each vector, project its block centre
+// into the other frame, sample the opposite field at the nearest grid centre, and compose the
+// two half-pixel vectors. The resulting error is retained separately from cover/uncover masks:
+// scene-change detection can inspect the raw field quality before any synthesis mask is changed.
+size_t MemcInterpolator::buildConsistencyMasks(int w, int h) {
+    const int step = blockStep();
+    const int bwx = (w + step - 1) / step;
+    const int bwy = (h + step - 1) / step;
+    const size_t blocks = static_cast<size_t>(bwx) * bwy;
+    std::fill(consistencyf_.begin(), consistencyf_.begin() + blocks, 0);
+    std::fill(consistencyb_.begin(), consistencyb_.begin() + blocks, 0);
+    inconsistentBlocks_ = 0;
+    if (w < kBlock || h < kBlock || blocks == 0) return 0;
+
+    auto maskForError = [](int errorHalfPel) -> uint8_t {
+        if (errorHalfPel <= kConsistencyDeadZoneHalfPel) return 0;
+        if (errorHalfPel >= kConsistencyRejectHalfPel) return 255;
+        return static_cast<uint8_t>(
+            ((errorHalfPel - kConsistencyDeadZoneHalfPel) * 255 +
+             (kConsistencyRejectHalfPel - kConsistencyDeadZoneHalfPel) / 2) /
+            (kConsistencyRejectHalfPel - kConsistencyDeadZoneHalfPel));
+    };
+    auto nearestGrid = [step](int twicePosition) {
+        // Grid vectors are anchored at the 16x16 window centre (8 px), not at half the pitch.
+        const int delta = twicePosition - kBlock;
+        const int denom = 2 * step;
+        const int rounded = delta >= 0 ? (delta + step) / denom
+                                       : -((-delta + step) / denom);
+        return rounded;
+    };
+    auto checkDirection = [&](const int32_t* firstX, const int32_t* firstY,
+                              const int32_t* oppositeX, const int32_t* oppositeY,
+                              uint8_t* out) {
+        for (int r = 0; r < bwy; ++r) {
+            for (int c = 0; c < bwx; ++c) {
+                const size_t i = static_cast<size_t>(r) * bwx + c;
+                const int x = c * step + kBlock / 2;
+                const int y = r * step + kBlock / 2;
+                const int dx = hpToPx(firstX[i]);
+                const int dy = hpToPx(firstY[i]);
+                const int destX = x + dx;
+                const int destY = y + dy;
+                int error = kConsistencyRejectHalfPel;
+                if (destX >= 0 && destX < w && destY >= 0 && destY < h) {
+                    const int oc = clampi(nearestGrid(2 * x + firstX[i]), 0, bwx - 1);
+                    const int orow = clampi(nearestGrid(2 * y + firstY[i]), 0, bwy - 1);
+                    const size_t oi = static_cast<size_t>(orow) * bwx + oc;
+                    error = std::max(std::abs(firstX[i] + oppositeX[oi]),
+                                     std::abs(firstY[i] + oppositeY[oi]));
+                }
+                out[i] = maskForError(error);
+            }
+        }
+    };
+
+    checkDirection(mvf_x_.data(), mvf_y_.data(), mvb_x_.data(), mvb_y_.data(),
+                   consistencyf_.data());
+    checkDirection(mvb_x_.data(), mvb_y_.data(), mvf_x_.data(), mvf_y_.data(),
+                   consistencyb_.data());
+    for (size_t i = 0; i < blocks; ++i) {
+        if (consistencyf_[i] >= 128 || consistencyb_[i] >= 128) ++inconsistentBlocks_;
+    }
+    return blocks;
+}
+
 void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                                         int w, int h, float timestep,
                                         const int32_t* mvf_x, const int32_t* mvf_y,
@@ -1133,8 +1200,13 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                     uint32_t* po = reinterpret_cast<uint32_t*>(
                         out + (outRow + static_cast<size_t>(x)) * 4);
 
-                    const int mf = (rmf0 * wx0 + rmf1 * wx1 + 128) >> 8;
-                    const int mb = (rmb0 * wx0 + rmb1 * wx1 + 128) >> 8;
+                    const int rawMf = (rmf0 * wx0 + rmf1 * wx1 + 128) >> 8;
+                    const int rawMb = (rmb0 * wx0 + rmb1 * wx1 + 128) >> 8;
+                    // Cover and reliability are defined for the full source-to-source flow.
+                    // Only t of the forward displacement and (1-t) of the backward displacement
+                    // exists at this output moment, so scale their trust penalties accordingly.
+                    const int mf = (rawMf * wt + 128) >> 8;
+                    const int mb = (rawMb * (256 - wt) + 128) >> 8;
                     if (blendMode != 2 || (mf | mb) == 0) {
                         // Algo 11, plus algo 13's median when that is the selected renderer.
                         // This is also the only branch MEMC and algo 21's unoccluded case ever
@@ -1350,15 +1422,23 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
         acc_bwd_ns_ += nsSince(tBwd);
     }
 
+    // Compute raw forward/backward consistency before the cut decision, but keep its reliability
+    // bytes separate from the cover masks until that decision is complete. This reuses the two
+    // fields already produced above; it neither changes either directional SAD nor gates them.
+    const bool svPlayer = algorithm() == static_cast<int>(InterpolationAlgorithm::SVPLAYER);
+    const size_t consistencyBlocks = (svPlayer && !forwardOnly)
+        ? buildConsistencyMasks(w, h) : 0;
+
     // Scene-change gate: MVTools' thSCD1/thSCD2, restated as the mean per-pixel luma SAD of the
     // motion-compensated pair. One shot of video sits in single digits; two unrelated frames sit
     // near 30 whatever the search managed, because there is nothing to match. Zeroing the field
     // then costs nothing extra downstream: a zero field has no divergence, so the masks come out
     // clear and both the CPU warp and the shader fall through to a plain temporal crossfade.
     //
-    // Both directions have to fail. A single hard-to-match subject would otherwise be read as a
-    // cut, and a false positive replaces a good warp with a crossfade - far more visible than the
-    // one bad frame a missed cut costs.
+    // The original two-direction threshold remains the primary rule. SVPlayer also admits the
+    // asymmetric case only when one directional SAD is cut-level and round trips fail across at
+    // least 80% of the grid. The latter statistic comes directly from the unmodified vectors,
+    // not from the synthesis masks; a hard-to-match region alone cannot trigger this rule.
     // Same grid the search accumulated its SADs on - the pitch, not kBlock - so the count below
     // matches the number of gate windows actually measured. They overlap when the pitch is
     // below kBlock, which counts border pixels twice; that scales the sum and the denominator
@@ -1378,18 +1458,36 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
         // With the backward search skipped there is only one signal to judge, and requiring both
         // would disable the gate outright - the denoiser would then smear history across a cut.
         const double meanBwd = (forwardOnly ? sadFwd : sadBwd) * scale;
-        if (meanFwd > kSceneCutMeanSad && meanBwd > kSceneCutMeanSad) {
+        const double highSad = std::max(meanFwd, meanBwd);
+        const double inconsistentFraction = consistencyBlocks == 0 ? 0.0
+            : static_cast<double>(inconsistentBlocks_) / consistencyBlocks;
+        const bool bothDirectionsFail = meanFwd > kSceneCutMeanSad &&
+                                        meanBwd > kSceneCutMeanSad;
+        const bool oneDirectionMisleading = svPlayer && !forwardOnly &&
+            highSad > kSceneCutMeanSad && inconsistentFraction >= 0.80;
+        if (bothDirectionsFail || oneDirectionMisleading) {
             sceneCut_ = true;
             std::fill(mvf_x_.begin(), mvf_x_.end(), 0);
             std::fill(mvf_y_.begin(), mvf_y_.end(), 0);
             std::fill(mvb_x_.begin(), mvb_x_.end(), 0);
             std::fill(mvb_y_.begin(), mvb_y_.end(), 0);
-            LOGI_MEMC("scene cut: compensated SAD %.1f/%.1f > %d, crossfading instead of warping",
-                      meanFwd, meanBwd, kSceneCutMeanSad);
+            LOGI_MEMC("scene cut: compensated SAD %.1f/%.1f, inconsistent %.0f%%, "
+                      "crossfading instead of warping",
+                      meanFwd, meanBwd, inconsistentFraction * 100.0);
         }
     }
 
     buildOcclusionMasks(w, h);
+    // Preserve the existing cover-mask construction and artifactMaskLevel scaling. Reliability
+    // is merged afterward, so the artifact control cannot disable consistency rejection. A scene
+    // cut has zeroed fields and already selects the ordinary temporal crossfade.
+    if (svPlayer && !sceneCut_ && consistencyBlocks != 0) {
+        const size_t blocks = static_cast<size_t>(bwx) * bwy;
+        for (size_t i = 0; i < blocks; ++i) {
+            maskf_[i] = std::max(maskf_[i], consistencyf_[i]);
+            maskb_[i] = std::max(maskb_[i], consistencyb_[i]);
+        }
+    }
 
     if (aOut) *aOut = a;
     if (bOut) *bOut = b;

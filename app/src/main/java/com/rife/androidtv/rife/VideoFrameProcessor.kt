@@ -1893,8 +1893,17 @@ class VideoFrameProcessor(
             // reports zero for every access unit and the muxer invents a timeline at the
             // configured frame rate, which is how a 24 fps source at 3x ends up streamed as 60.
             val pairSpanUs = nextFrame.timestampUs - prev.timestampUs
+            val exactThreeTimes = memcLevelMultiplier == 3f &&
+                pairSpanUs in MIN_PAIR_INTERVAL_US..MAX_PAIR_INTERVAL_US
             val timestamps = LongArray(intermediate.size) { i ->
-                ((prev.timestampUs + intermediate[i] * pairSpanUs) * 1000L).toLong()
+                if (exactThreeTimes && i < 2) {
+                    prev.timestampUs * 1000L + (pairSpanUs * 1000L * (i + 1)) / 3L
+                } else {
+                    // Keep the large absolute media timestamp out of Float arithmetic. Float
+                    // spacing grows with playback time and eventually quantises output PTS.
+                    prev.timestampUs * 1000L +
+                        (intermediate[i].toDouble() * pairSpanUs * 1000.0).toLong()
+                }
             }
 
             var presented = intermediate.isEmpty()
@@ -2020,11 +2029,10 @@ class VideoFrameProcessor(
      * expressed as a timestep in [0, 1] where 0 is the previous frame and 1 is this one.
      *
      * The step is the pair's own timestamp interval divided by the multiplier, so the cadence
-     * follows the source rather than a nominal frame rate, and the phase is carried in absolute
-     * source time from one call to the next. Carrying it is what makes a ratio that does not
-     * divide the cadence evenly average out over time instead of wobbling; re-anchoring it to the
-     * pair being looked at whenever it does not fall inside that pair is what stops a seek, a
-     * stream change or a burst of skipped pairs from firing a backlog of frames in one go.
+     * follows the source rather than a nominal frame rate. Non-integer ratios carry phase in
+     * absolute source time so they average out instead of wobbling; exact 3x pins two samples to
+     * each pair's thirds. Re-anchoring outside a valid pair stops a seek, stream change or skipped
+     * pair burst from firing a backlog of frames in one go.
      *
      * The range is open at the previous frame, because that frame was already presented - either
      * as the first frame of the stream or as the last point of the pair before this one - so the
@@ -2041,6 +2049,14 @@ class VideoFrameProcessor(
         val baseUs = if (discontinuity) nextUs - intervalUs else prevUs
         val ratio = memcLevelMultiplier.toDouble().coerceIn(MIN_MEMC_RATIO, MAX_MEMC_RATIO)
         val stepUs = maxOf(1L, (intervalUs / ratio).toLong())
+
+        // At exactly 3x, each source pair owns exactly two synthesized moments. Pin them to
+        // pair-relative thirds instead of carrying a wall-clock phase across variable frame
+        // intervals; otherwise the pair can emit unevenly spaced samples or miss its endpoint.
+        if (ratio == 3.0 && !discontinuity) {
+            nextOutputUs = Long.MIN_VALUE
+            return floatArrayOf(1f / 3f, 2f / 3f, 1f)
+        }
 
         // Re-anchor when the pair is not a pair, when there is no phase yet, or when the phase has
         // run more than the widest supported multiplier away from where it should be.

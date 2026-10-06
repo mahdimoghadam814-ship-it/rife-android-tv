@@ -218,6 +218,10 @@ private:
     // at every pitch: 255 is reached by a fold of exactly one block step either way, and at
     // step == kBlock the division collapses to the plain multiply below.
     static constexpr int kOccScale = 8;
+    // Forward/backward round-trip error is measured in half-pixel vector units. Errors up to
+    // one pixel are tolerated; trust is reduced linearly to zero by four pixels.
+    static constexpr int kConsistencyDeadZoneHalfPel = 2;
+    static constexpr int kConsistencyRejectHalfPel = 8;
     // MVTools' thSCD1/thSCD2 scene-change gate, restated as the mean per-pixel luma SAD of the
     // *motion-compensated* pair. Consecutive frames of one shot land in single digits; an
     // unrelated pair lands near 30-60 no matter how good the search was.
@@ -280,6 +284,7 @@ private:
     // Cover/uncover masks derived from the two fields, one byte per block. Parallel only over
     // the two directions: each pass is a single linear sweep of a few thousand bytes.
     void buildOcclusionMasks(int w, int h);
+    size_t buildConsistencyMasks(int w, int h);
 
     // Shared front half of interpolate() and motionField(): scratch sizing, the optional shrink to
     // the processing size, RGBA->luma, the pyramid and both motion estimates. On success *aOut and
@@ -360,6 +365,10 @@ private:
     std::vector<int32_t> tmpx_, tmpy_;
     // Cover/uncover masks, one byte per block, derived from the two fields above.
     std::vector<uint8_t> maskf_, maskb_;
+    // Reliability penalties from the unmodified bidirectional fields, kept separate from the
+    // cover masks until scene-cut detection has made its independent decision.
+    std::vector<uint8_t> consistencyf_, consistencyb_;
+    size_t inconsistentBlocks_ = 0;
     // Set by prepare() when the scene-change gate fires, so packMotionField() can suppress the
     // blend weights it is about to derive from a field that was deliberately zeroed.
     bool sceneCut_ = false;
