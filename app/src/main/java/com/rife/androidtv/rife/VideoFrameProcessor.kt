@@ -120,6 +120,14 @@ class VideoFrameProcessor(
         private const val TIMING_WINDOW_FRAMES = 30
 
         /**
+         * Cadence of the stage heartbeat. The timing window only closes when a pair completes, so
+         * a stalled pipeline would go silent exactly when there is something to report; this line
+         * keeps emitting once per second while frames are flowing and logs the stall transition
+         * when they stop.
+         */
+        private const val STAGE_HEARTBEAT_MS = 1000L
+
+        /**
          * Bounds the frame-pair interval the MEMC level divides. The same [1ms, 1s] window the
          * AUTO policy already accepts, so a seek or a bogus timestamp cannot produce a step of
          * zero or a backlog of frames.
@@ -265,6 +273,8 @@ class VideoFrameProcessor(
 
     private var frameCountInput = 0
     private var frameCountOutput = 0
+    /** Decoder deliveries onto the input SurfaceTexture, counted before any early return. */
+    private var frameCountArrival = 0
     private var droppedFrameCount = 0L
     private var droppedOutputFrameCount = 0L
     private var submittedOutputFrameCount = 0L
@@ -273,6 +283,18 @@ class VideoFrameProcessor(
     private var droppedOutputAtWindowStart = 0L
     private var lastStatsResetTime = SystemClock.elapsedRealtime()
     private var lastProcTimeMs = 0L
+    private var statsCapturedAtStart = 0
+    private var statsOutputAtStart = 0
+
+    // Stage heartbeat: independent baselines so one consumer's reset cannot skew another's rate.
+    private var stageHeartbeatNs = 0L
+    private var stageArrivalAtBeat = 0
+    private var stageCapturedAtBeat = 0
+    private var stageOutputAtBeat = 0
+    private var stageSubmittedAtBeat = 0L
+    private var stageDroppedInAtBeat = 0L
+    private var stageDroppedOutAtBeat = 0L
+    private var stagePrevArrival = 0
 
     private var cachedIn0Buf: ByteBuffer? = null
     private var cachedIn1Buf: ByteBuffer? = null
@@ -304,7 +326,6 @@ class VideoFrameProcessor(
      * downgrade is logged with what it cost.
      */
     private var autoDegradeLevel = 0
-    private var autoInterpolationDegradeLevel = 0
     private var autoDenoiseBranch = false
     private var autoCaptureW = 0
     private var autoCaptureH = 0
@@ -473,6 +494,8 @@ class VideoFrameProcessor(
     private var nsRenderDraw = 0L
     private var nsRenderSwap = 0L
     private var capturedAtWindowStart = 0
+    private var outputAtWindowStart = 0
+    private var arrivalAtWindowStart = 0
     private var droppedAtWindowStart = 0L
 
     private val mainHandler: Handler? = try {
@@ -519,6 +542,16 @@ class VideoFrameProcessor(
         released = false
 
         runOnWorker("start()") {
+            stageHeartbeatNs = System.nanoTime()
+            stageArrivalAtBeat = frameCountArrival
+            stageCapturedAtBeat = frameCountInput
+            stageOutputAtBeat = frameCountOutput
+            stageSubmittedAtBeat = submittedOutputFrameCount
+            stageDroppedInAtBeat = droppedFrameCount
+            stageDroppedOutAtBeat = droppedOutputFrameCount
+            stagePrevArrival = 0
+            workerHandler?.removeCallbacks(stageHeartbeat)
+            workerHandler?.postDelayed(stageHeartbeat, STAGE_HEARTBEAT_MS)
             createInputSurfaceOnWorker("start")
         }
     }
@@ -701,6 +734,7 @@ class VideoFrameProcessor(
         if (handler == null) {
             return
         }
+        handler.removeCallbacks(stageHeartbeat)
 
         val latch = CountDownLatch(1)
         if (handler.post {
@@ -718,6 +752,53 @@ class VideoFrameProcessor(
         workerHandler = null
         createdInputSurface = null
         inputSurfaceReady = false
+    }
+
+    /**
+     * One heartbeat per second on the worker thread: decoder arrivals, capture, processing and
+     * submission rates over the last second, plus the queue depth and both drop counters. It runs
+     * off its own baselines because the timing window only closes when a pair completes - if the
+     * pipeline stalls, [reportStageTiming] stops firing exactly when the numbers are needed. The
+     * line is printed only while something moved, or once when arrivals stop under an enabled
+     * pipeline, so a paused player does not emit a stream of zeros.
+     */
+    private val stageHeartbeat = object : Runnable {
+        override fun run() {
+            if (released) return
+            val now = System.nanoTime()
+            val windowSec = ((now - stageHeartbeatNs).coerceAtLeast(1L)) / 1_000_000_000.0
+            val arrival = frameCountArrival - stageArrivalAtBeat
+            val captured = frameCountInput - stageCapturedAtBeat
+            val processed = frameCountOutput - stageOutputAtBeat
+            val submitted = submittedOutputFrameCount - stageSubmittedAtBeat
+            val droppedIn = droppedFrameCount - stageDroppedInAtBeat
+            val droppedOut = droppedOutputFrameCount - stageDroppedOutAtBeat
+            val queue = frameQueue.size
+            val moved = arrival > 0 || captured > 0 || processed > 0 || submitted > 0 ||
+                droppedIn != 0L || droppedOut != 0L
+            val stalled = isProcessingEnabled && stagePrevArrival > 0 && arrival == 0
+            if (moved || stalled) {
+                val f = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
+                Log.i(
+                    TAG,
+                    "[STAGE] decoderArrivalFps=${f(arrival / windowSec)} " +
+                        "capturedFps=${f(captured / windowSec)} " +
+                        "processedFps=${f(processed / windowSec)} " +
+                        "generatedOutFps=${f(submitted / windowSec)} " +
+                        "droppedIn=$droppedIn droppedOut=$droppedOut queue=$queue" +
+                        if (stalled) " | STALLED: decoder delivered no frames this second" else ""
+                )
+            }
+            stageHeartbeatNs = now
+            stageArrivalAtBeat = frameCountArrival
+            stageCapturedAtBeat = frameCountInput
+            stageOutputAtBeat = frameCountOutput
+            stageSubmittedAtBeat = submittedOutputFrameCount
+            stageDroppedInAtBeat = droppedFrameCount
+            stageDroppedOutAtBeat = droppedOutputFrameCount
+            stagePrevArrival = arrival
+            workerHandler?.postDelayed(this, STAGE_HEARTBEAT_MS)
+        }
     }
 
     // ---------------------------------------------------------------------------------------
@@ -1165,6 +1246,8 @@ class VideoFrameProcessor(
 
         frameCountInput = 0
         frameCountOutput = 0
+        statsCapturedAtStart = 0
+        statsOutputAtStart = 0
         lastStatsResetTime = SystemClock.elapsedRealtime()
         lastProcTimeMs = 0L
 
@@ -1448,6 +1531,9 @@ class VideoFrameProcessor(
      * SurfaceTexture. This is where real decoded pixels become available.
      */
     private fun onInputFrameAvailableOnWorker(texture: SurfaceTexture) {
+        // Counted first: this is the decoder-arrival rate the audit asks for, and it must be
+        // visible even when every later stage rejects the frame.
+        frameCountArrival++
         if (released) {
             return
         }
@@ -1811,8 +1897,10 @@ class VideoFrameProcessor(
                 )
                 if (denoised) {
                     // DIAGNOSTICS: Log checksum after FastDVDnet pass-through
-                    val fastDvdNetChecksum = calculateChecksum(den1Buf, rifeInputW, rifeInputH)
-                    Log.d(TAG, "PIPELINE CHECKSUM: after FastDVDnet ${rifeInputW}x${rifeInputH} checksum=$fastDvdNetChecksum (unchanged=${fastDvdNetChecksum == nextChecksum})")
+                    if (VERBOSE_DIAGNOSTICS) {
+                        val fastDvdNetChecksum = calculateChecksum(den1Buf, rifeInputW, rifeInputH)
+                        Log.d(TAG, "PIPELINE CHECKSUM: after FastDVDnet ${rifeInputW}x${rifeInputH} checksum=$fastDvdNetChecksum (unchanged=${fastDvdNetChecksum == nextChecksum})")
+                    }
                     renderBufferToOutput(den1Buf, rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L)
                 } else {
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
@@ -1860,9 +1948,11 @@ class VideoFrameProcessor(
                 src0Buf = den0Buf
                 src1Buf = den1Buf
                 // DIAGNOSTICS: Log checksum after FastDVDnet
-                val den0Checksum = calculateChecksum(den0Buf, rifeInputW, rifeInputH)
-                val den1Checksum = calculateChecksum(den1Buf, rifeInputW, rifeInputH)
-                Log.d(TAG, "PIPELINE CHECKSUM: after FastDVDnet den0 checksum=$den0Checksum den1 checksum=$den1Checksum")
+                if (VERBOSE_DIAGNOSTICS) {
+                    val den0Checksum = calculateChecksum(den0Buf, rifeInputW, rifeInputH)
+                    val den1Checksum = calculateChecksum(den1Buf, rifeInputW, rifeInputH)
+                    Log.d(TAG, "PIPELINE CHECKSUM: after FastDVDnet den0 checksum=$den0Checksum den1 checksum=$den1Checksum")
+                }
             } else {
                 Log.w(TAG, "FastDVDnet stage failed, interpolating the raw frames")
             }
@@ -2223,23 +2313,6 @@ class VideoFrameProcessor(
             }
         }
 
-        // The AUTO policy's interpolation branch (RIFE at 4K -> 1080p) also degrades when
-        // the native frame rate cannot be held. It starts at 1080p (index 1) and can step
-        // down to 720p (index 2) and 480p (index 3).
-        if (isRifeEnabled && autoInterpolationDegradeLevel < autoDegradeLadder.lastIndex - 1) {
-            val cycleNs = nsPair / n
-            val overBudget = sourceIntervalNs > 0L && cycleNs > sourceIntervalNs.toDouble()
-            if (dropped > 0 || overBudget) {
-                autoInterpolationDegradeLevel++
-                Log.w(
-                    TAG,
-                    "RES POLICY (interp): ${autoCaptureW}x$autoCaptureH cannot hold the native rate " +
-                        "(cycle=${fmtMs(cycleNs)} ms, budget=${fmtMs(sourceIntervalNs.toDouble())} ms, " +
-                        "dropped=$dropped), degrading to ${autoDegradeLadder[autoInterpolationDegradeLevel + 1]}"
-                )
-            }
-        }
-
         Log.i(
             TAG,
             "PIPELINE TIMING: n=$timingCycles " +
@@ -2253,13 +2326,23 @@ class VideoFrameProcessor(
                 "st=${fmtMs(nsRenderSetup / n)} up=${fmtMs(nsRenderUpload / n)} " +
                 "dr=${fmtMs(nsRenderDraw / n)} sw=${fmtMs(nsRenderSwap / n)} | " +
                 "captured=$captured dropped=$dropped " +
-                "in=${frameCountInput} out=$frameCountOutput rife=$isRifeEnabled"
+                "in=${frameCountInput - capturedAtWindowStart} " +
+                "out=${frameCountOutput - outputAtWindowStart} rife=$isRifeEnabled"
         )
         val sourceFps = if (lastPairIntervalUs > 0L) 1_000_000.0 / lastPairIntervalUs else 0.0
         val windowSeconds = ((System.nanoTime() - diagnosticWindowStartNs).coerceAtLeast(1L)) / 1_000_000_000.0
         val generatedFps = (submittedOutputFrameCount - diagnosticOutputStartCount) / windowSeconds
         val droppedOutput = droppedOutputFrameCount - droppedOutputAtWindowStart
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} motionMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
+        // Swap split: while an encode runs the primary window surface is the encoder's input
+        // surface and the mirror is the phone preview; without an encode the primary swap is the
+        // phone preview itself. Drained (and reset) once per window so the rates cannot race.
+        val swaps = outputRenderer?.takeSwapCounts() ?: longArrayOf(0L, 0L)
+        val arrivalRate = (frameCountArrival - arrivalAtWindowStart) / windowSeconds
+        val encodeActive = encodeSurface != null
+        val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
+        val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
+        val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} motionMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
 
         timingCycles = 0
         diagnosticWindowStartNs = System.nanoTime()
@@ -2277,6 +2360,8 @@ class VideoFrameProcessor(
         nsRenderSwap = 0
         nsPair = 0
         capturedAtWindowStart = frameCountInput
+        outputAtWindowStart = frameCountOutput
+        arrivalAtWindowStart = frameCountArrival
         droppedAtWindowStart = droppedFrameCount
 
         // Periodic safety net: a wipe between two resets would otherwise go unnoticed until the
@@ -2532,8 +2617,7 @@ class VideoFrameProcessor(
      * The processing resolution the engine picks for this source and toggle state (AUTO mode).
      *
      *  * below 4K -> the source resolution, untouched, whatever is enabled;
-     *  * 4K with MEMC on -> 1080p, then degrades to 720p/480p if frames are dropped.
-     *    The interpolation cycle has to fit a 41.6 ms budget and 4K is
+     *  * 4K with MEMC on -> 1080p. The interpolation cycle has to fit a 41.6 ms budget and 4K is
      *    four times the pixels; the result is scaled back up into the output surface by the
      *    present, which is where that upscaling belongs.
      *  * 4K with only the denoiser -> native 4K. This is the one branch allowed to run at source
@@ -2542,10 +2626,7 @@ class VideoFrameProcessor(
      */
     private fun autoResolution(srcW: Int, srcH: Int): RifeResolution {
         if (maxOf(srcW, srcH) < auto4kMinDim) return RifeResolution.ORIGINAL
-        if (isRifeEnabled) {
-            // Interpolation branch: starts at 1080p (index 1), can degrade to 720p (2) and 480p (3)
-            return autoDegradeLadder[(1 + autoInterpolationDegradeLevel).coerceIn(1, autoDegradeLadder.lastIndex)]
-        }
+        if (isRifeEnabled) return RifeResolution.RES_1080P
         if (!isDenoiseEnabled) return RifeResolution.ORIGINAL
         return autoDegradeLadder[autoDegradeLevel.coerceIn(0, autoDegradeLadder.lastIndex)]
     }
@@ -2572,16 +2653,6 @@ class VideoFrameProcessor(
             // explicitly). The ladder belongs to that branch alone, so it starts over rather than
             // inheriting a downgrade decided under different conditions.
             autoDegradeLevel = 0
-        }
-
-        // Interpolation branch tracking: RIFE at 4K degrades from 1080p down the ladder.
-        val autoInterpolationBranch = resolution == RifeResolution.AUTO &&
-            isRifeEnabled &&
-            maxOf(srcW, srcH) >= auto4kMinDim
-
-        if (!autoInterpolationBranch && autoInterpolationDegradeLevel != 0) {
-            // Left the interpolation branch; reset its degrade level.
-            autoInterpolationDegradeLevel = 0
         }
 
         var (targetW, targetH) = calculateTargetDimensions(srcW, srcH, effective)
@@ -2688,8 +2759,10 @@ class VideoFrameProcessor(
         val durationSec = (now - lastStatsResetTime) / 1000.0f
 
         if (durationSec >= 1.0f) {
-            val inFps = frameCountInput / durationSec
-            val outFps = frameCountOutput / durationSec
+            // Baselines, not resets: frameCountInput/frameCountOutput are cumulative so the stage
+            // heartbeat and the timing window can derive their own rates without racing this one.
+            val inFps = (frameCountInput - statsCapturedAtStart) / durationSec
+            val outFps = (frameCountOutput - statsOutputAtStart) / durationSec
 
             val resStr = when (resolution) {
                 RifeResolution.AUTO -> "Auto"
@@ -2718,8 +2791,8 @@ class VideoFrameProcessor(
 
             onStatisticsUpdated(stats)
 
-            frameCountInput = 0
-            frameCountOutput = 0
+            statsCapturedAtStart = frameCountInput
+            statsOutputAtStart = frameCountOutput
             lastStatsResetTime = now
         }
     }

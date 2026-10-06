@@ -3,6 +3,7 @@ package com.rife.androidtv.rife
 import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
@@ -16,6 +17,7 @@ import com.rife.androidtv.DeviceProfile
 import com.rife.androidtv.VulkanCapabilities
 import com.rife.androidtv.encode.EncodedStreamSink
 import com.rife.androidtv.encode.HdrHevcEncoder
+import com.rife.androidtv.stream.AudioPassthroughFeeder
 import com.rife.androidtv.stream.FilePacketSink
 import com.rife.androidtv.stream.MpegTsMuxer
 import com.rife.androidtv.stream.TsPacketSink
@@ -128,6 +130,9 @@ class RifeEngineController(
      * destroyed.
      */
     override fun stop() {
+        // stopUdpStream also stops the encoder it opened; stopEncoding below is the no-op
+        // fallback for the encode that was started without UDP (test clip).
+        stopUdpStream()
         stopEncoding()
         processor.stop()
         _inputSurface.value = null
@@ -271,14 +276,17 @@ class RifeEngineController(
     }
 
     /**
-     * Drops every buffered frame: seek, media transition, stream change.
+     * Drops every buffered frame: seek, media transition, stream change. [positionMs] is where
+     * playback resumes (or -1 when unknown) and is remembered for the audio feeder, which has to
+     * re-extract from the new position after a seek.
      */
-    override fun resetForDiscontinuity(reason: String) {
+    override fun resetForDiscontinuity(reason: String, positionMs: Long) {
         processor.resetForNewStream(reason)
         activeMuxer?.resetForDiscontinuity()
         encoder?.requestKeyFrame()
         // The block-matching pyramid holds state across frames; a seek/stream change invalidates it.
         NativeEngine.resetMemcState()
+        audioFeeder?.onDiscontinuity(positionMs)
     }
 
     /**
@@ -299,14 +307,45 @@ class RifeEngineController(
     // Phase E/F: UDP streaming of processed frames to a TV box
     // --------------------------------------------------------------------------------------
 
+    /** Phase F: taps the source container's E-AC-3 track and gates it onto the muxed video timeline. */
+    @Volatile
+    private var audioFeeder: AudioPassthroughFeeder? = null
+
+    private fun startAudioFeeder(mediaUri: Uri, startPositionMs: Long) {
+        stopAudioFeeder()
+        val muxer = activeMuxer ?: return
+        val feeder = AudioPassthroughFeeder(context, mediaUri, startPositionMs, muxer)
+        if (feeder.start()) {
+            audioFeeder = feeder
+        }
+    }
+
+    private fun stopAudioFeeder() {
+        val feeder = audioFeeder ?: return
+        audioFeeder = null
+        feeder.stop()
+    }
+
     /**
      * Starts UDP streaming of the processed frame pipeline to [host]:[port] as MPEG-TS over UDP.
      * Creates [UdpTsPacketSink] and starts the hardware HEVC encoder with the current video
-     * size. The encoder feeds processed frames through [MpegTsMuxer] into the UDP sink.
-     * Subtitles are not included in the TS output (they are ExoPlayer overlay-only); the TV box
-     * should render subtitles from the original source independently.
+     * size; the encoder's frames go through [MpegTsMuxer] into the UDP sink, and [mediaUri]'s
+     * E-AC-3 track is muxed alongside when present. Subtitles stay a local overlay (logged),
+     * because a remote subtitle transport does not exist for them yet.
      */
-    override fun startUdpStream(host: String, port: Int): Boolean {
+    override fun startUdpStream(host: String, port: Int, mediaUri: Uri?, startPositionMs: Long): Boolean {
+        if (_udpRunning) {
+            // The player screen retries until the frame size is known; a second call while the
+            // same stream is already up must not trip "already encoding" and die on it. A
+            // different media uri means the source changed underneath the stream and everything
+            // (encoder size, audio extractor) has to be rebuilt for it.
+            if (_udpTargetHost == host && _udpTargetPort == port && _udpTargetUri == mediaUri) {
+                Log.i(TAG, "[UDP] start requested but stream already running to $host:$port")
+                return true
+            }
+            Log.i(TAG, "[UDP] target or media changed (host=$_udpTargetHost:$_udpTargetPort uri=$_udpTargetUri); restarting")
+            stopUdpStream()
+        }
         var sink: UdpTsPacketSink? = null
         try {
             val (sourceWidth, sourceHeight) = getInputFrameSize()
@@ -371,24 +410,42 @@ class RifeEngineController(
             }
             _udpSink = streamSink
             _udpRunning = true
+            _udpTargetHost = host
+            _udpTargetPort = port
+            _udpTargetUri = mediaUri
             _udpEnabled.value = true
-            Log.i(TAG, "[UDP] source=${sourceWidth}x$sourceHeight processing=${width}x$height encoder=${width}x$height sourceFps=${processor.currentSourceFrameRate()} requestedMultiplier=${processor.requestedInterpolationMultiplier()} remoteFps=$remoteOutputFps codec=$codecName/$profileName bitrate=${config.effectiveBitrateBps()} audio=unsupported subtitles=local-overlay-only")
+            Log.i(TAG, "[UDP] source=${sourceWidth}x$sourceHeight processing=${width}x$height encoder=${width}x$height sourceFps=${processor.currentSourceFrameRate()} requestedMultiplier=${processor.requestedInterpolationMultiplier()} remoteFps=$remoteOutputFps codec=$codecName/$profileName bitrate=${config.effectiveBitrateBps()} subtitles=local-overlay-only")
+            // Phase F: parallel extractor that muxes the source's E-AC-3 track as-is.
+            if (mediaUri != null) {
+                startAudioFeeder(mediaUri, startPositionMs)
+            } else {
+                Log.i(TAG, "[UDP] no media uri; streaming video-only (audio=unsupported)")
+            }
             Log.i(TAG, "UDP streaming started to $host:$port at ${width}x${height}@$frameRate")
             return true
         } catch (e: Exception) {
-            Log.e(TAG, "Failed to start UDP streaming", e)
+Log.e(TAG, "Failed to start UDP streaming", e)
+            // startEncoding may have opened the encoder before the failure; the next call would
+            // otherwise die on "already encoding" and the stream would never come up. The rate
+            // ceiling set above is cleared here too because no encoder will own the surface.
+            stopEncoding()
+            processor.setRemoteOutputFrameRate(0f)
             sink?.close()
             return false
         }
     }
 
-    /** Stops UDP streaming and releases the socket and sender thread. */
+    /** Stops UDP streaming and releases the socket, feeder and sender thread. */
     override fun stopUdpStream() {
         if (!_udpRunning) return
         _udpRunning = false
+        _udpTargetHost = null
+        _udpTargetPort = -1
+        _udpTargetUri = null
         val sink = _udpSink
         _udpSink = null
         _udpEnabled.value = false
+        stopAudioFeeder()
         stopEncoding() // Stops the encoder and closes the muxer/sink
         Log.i(TAG, "UDP streaming stopped")
     }
@@ -513,6 +570,11 @@ class RifeEngineController(
 
     /** The current UDP sink, held so stopUdpStream can close it. */
     private var _udpSink: UdpTsPacketSink? = null
+
+    /** Target of the running stream, so a repeated start for the same target is a no-op. */
+    private var _udpTargetHost: String? = null
+    private var _udpTargetPort = -1
+    private var _udpTargetUri: Uri? = null
 
     /** True while UDP streaming is active; stopUdpStream is a no-op if false. */
     @Volatile

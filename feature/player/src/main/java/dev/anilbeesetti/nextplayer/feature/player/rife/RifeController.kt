@@ -126,8 +126,12 @@ interface RifeController {
     /** Ends a capture opened by [startTestClip], leaving the file flushed and readable. */
     fun stopTestClip(): Boolean
 
-    /** Drops every buffered frame: seek, media transition, stream change. */
-    fun resetForDiscontinuity(reason: String)
+    /**
+     * Drops every buffered frame: seek, media transition, stream change. [positionMs] is where
+     * playback resumes from (0 for a new media item, -1 when unknown), so the UDP side can
+     * re-anchor its audio timeline; the reason is the diagnostic label.
+     */
+    fun resetForDiscontinuity(reason: String, positionMs: Long)
 
     /**
      * Publishes the output surface (the SurfaceView the processed result is rendered to). Passing
@@ -154,8 +158,13 @@ interface RifeController {
     /** Current input frame size (width, height) as reported by the decoder, or (0, 0) if unknown. */
     fun getInputFrameSize(): Pair<Int, Int>
 
-    /** Starts UDP streaming of processed frames to [host]:[port] via MPEG-TS over UDP. */
-    fun startUdpStream(host: String, port: Int): Boolean
+    /**
+     * Starts UDP streaming of processed frames to [host]:[port] via MPEG-TS over UDP.
+     * [mediaUri] and [startPositionMs] feed the audio passthrough feeder (Phase F); a null URI
+     * means video-only, which is logged as such rather than silently dropping audio.
+     * Returns false only when the pipeline is not ready yet - the caller should retry.
+     */
+    fun startUdpStream(host: String, port: Int, mediaUri: android.net.Uri?, startPositionMs: Long): Boolean
 
     /** Stops UDP streaming and releases the socket and sender thread. */
     fun stopUdpStream()

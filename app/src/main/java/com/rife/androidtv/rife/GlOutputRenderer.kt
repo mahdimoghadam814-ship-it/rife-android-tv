@@ -757,9 +757,30 @@ class GlOutputRenderer {
         releaseMirrorSurface()
         mirrorSurface = surface
         if (surface == null || !surface.isValid) return
-        val config = activeConfig ?: return
-        val egl = EGL14.eglCreateWindowSurface(eglDisplay, config, surface, intArrayOf(EGL14.EGL_NONE), 0)
-        if (egl == null || egl == EGL14.EGL_NO_SURFACE) {
+        // The mirror is always the SurfaceView's RGBA8888 surface, and activeConfig may be a
+        // Main10 encoder config by now (setOutputSurface switched the primary to the encoder
+        // input first), which EGL rejects against an 8-bit native window with EGL_BAD_MATCH -
+        // the exact frozen-preview failure. Pick the config against this surface itself,
+        // strict first, and leave the primary's activeConfig alone.
+        val strict = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_NONE
+        )
+        var egl = createWindowSurface(eglDisplay, surface, strict, recordConfig = false)
+        if (egl == null) {
+            val relaxed = intArrayOf(
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_NONE
+            )
+            egl = createWindowSurface(eglDisplay, surface, relaxed, recordConfig = false)
+        }
+        if (egl == null) {
             Log.w(TAG, "Could not create preview mirror EGL surface: 0x${EGL14.eglGetError().toString(16)}")
             mirrorSurface = null
             return
@@ -789,7 +810,9 @@ class GlOutputRenderer {
     private fun createWindowSurface(
         display: EGLDisplay,
         surface: Surface,
-        configAttribs: IntArray
+        configAttribs: IntArray,
+        /** False for surfaces that must not become the config [describeConfig] reports. */
+        recordConfig: Boolean = true
     ): EGLSurface? {
         val configs = arrayOfNulls<EGLConfig>(1)
         val numConfigs = IntArray(1)
@@ -810,7 +833,7 @@ class GlOutputRenderer {
             Log.e(TAG, "eglCreateWindowSurface failed: 0x${EGL14.eglGetError().toString(16)}")
             return null
         }
-        activeConfig = configs[0]
+        if (recordConfig) activeConfig = configs[0]
         return candidate
     }
 
@@ -857,6 +880,17 @@ class GlOutputRenderer {
         nsSwap = 0L
         renderCalls = 0L
     }
+
+    @Volatile private var primarySwapCount = 0L
+    @Volatile private var mirrorSwapCount = 0L
+
+    /**
+     * Swaps since the previous call: [0] is the primary window surface (the encoder input while
+     * an encode runs, the phone preview otherwise) and [1] is the mirror preview. [VideoFrameProcessor]
+     * drains this once per timing window to report preview and encoder submission rates.
+     */
+    fun takeSwapCounts(): LongArray = longArrayOf(primarySwapCount, mirrorSwapCount)
+        .also { primarySwapCount = 0L; mirrorSwapCount = 0L }
 
     /**
      * Makes this renderer's window surface current, unless it already is.
@@ -920,6 +954,7 @@ class GlOutputRenderer {
                 if (nextRemotePresentationNs == Long.MIN_VALUE) nextRemotePresentationNs = outputTimestampNs + interval
                 else while (nextRemotePresentationNs <= outputTimestampNs) nextRemotePresentationNs += interval
             }
+            primarySwapCount++
         }
 
         // Always update the mirror (phone preview) regardless of remote frame rate cap.
@@ -953,6 +988,7 @@ class GlOutputRenderer {
             if (outputTimestampNs != 0L) EGLExt.eglPresentationTimeANDROID(eglDisplay, mirror, outputTimestampNs)
             EGL14.eglSwapBuffers(eglDisplay, mirror)
             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, context)
+            mirrorSwapCount++
         }
     }
 
@@ -1617,13 +1653,14 @@ class GlOutputRenderer {
         nsDraw += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
-        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
-        val swapError = EGL14.eglGetError()
+        // Through swapBuffers, not a bare eglSwapBuffers: the denoised present must carry the
+        // presentation timestamp (otherwise the encoder stamps presentationTimeUs = 0 and the muxer
+        // falls back to arrival order), draw the mirror preview, honour the remote rate cap, and
+        // count toward the preview/encoder swap rates.
+        outputTimestampNs = timestampNs
+        swapBuffers(eglDisplay, eglSurface, "denoised")
         nsSwap += System.nanoTime() - tPhase
         renderCalls++
-        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
-            Log.d(TAG, "eglSwapBuffers (denoised): result=$swapResult error=0x${swapError.toString(16)}")
-        }
         return true
     }
 

@@ -92,13 +92,16 @@ class PlayerActivity : ComponentActivity() {
     private val playbackStateListener = object : Player.Listener {
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             intent.data = mediaItem?.localConfiguration?.uri
-            rifeController.resetForDiscontinuity("media_item_transition_$reason")
+            rifeController.resetForDiscontinuity("media_item_transition_$reason", 0L)
         }
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             updateKeepScreenOnFlag()
             if (rifeController.udpEnabled.value) {
-                rifeController.resetForDiscontinuity(if (isPlaying) "udp_resume" else "udp_pause")
+                rifeController.resetForDiscontinuity(
+                    if (isPlaying) "udp_resume" else "udp_pause",
+                    mediaController?.currentPosition ?: -1L,
+                )
             }
         }
 
@@ -115,7 +118,10 @@ class PlayerActivity : ComponentActivity() {
                 reason == Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT ||
                 reason == Player.DISCONTINUITY_REASON_INTERNAL
             ) {
-                rifeController.resetForDiscontinuity("position_discontinuity_$reason")
+                rifeController.resetForDiscontinuity(
+                    "position_discontinuity_$reason",
+                    newPosition.positionMs,
+                )
             }
         }
 

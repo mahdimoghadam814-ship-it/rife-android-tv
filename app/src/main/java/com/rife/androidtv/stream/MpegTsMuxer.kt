@@ -19,23 +19,24 @@ fun interface TsPacketSink {
 }
 
 /**
- * Phase E: MPEG-TS muxing of the encoder's H.265 access units.
+ * Phase E/F: MPEG-TS muxing of the encoder's H.265 access units, plus the source's compressed
+ * E-AC-3 track once [AudioPassthroughFeeder] supplies it.
  *
  * ```
- * HdrHevcEncoder -> MpegTsMuxer -> TsPacketSink (file now, UDP in Phase F)
+ * HdrHevcEncoder -> MpegTsMuxer -> TsPacketSink (file or UDP)
+ * AudioPassthroughFeeder ------>/
  * ```
- *
- * Video only. Audio is deliberately absent until Phase H, which owns the presentation timeline -
- * muxing an audio track whose PTS we have not yet derived from the source would produce a stream
- * that looks wrong for the wrong reason.
  *
  * What is emitted, per 188-byte packet:
  *
  *  * a PAT on PID 0 and a PMT on [pmtPid], every 50 ms and before the first access unit, so a
- *    player that tunes in late still finds the program;
- *  * one PES packet per access unit, PTS only. PTS-only is correct exactly when there are no
- *    B-frames - which is why [com.rife.androidtv.encode.HdrHevcEncoder] asks for `max-bframes=0` -
- *    and it is what a low-latency streaming pipeline wants anyway;
+ *    player that tunes in late still finds the program; the PMT advertises the audio stream
+ *    type 0x87 only once an audio frame has actually been muxed;
+ *  * one PES packet per video access unit, PTS only. PTS-only is correct exactly when there are
+ *    no B-frames - which is why [com.rife.androidtv.encode.HdrHevcEncoder] asks for
+ *    `max-bframes=0` - and it is what a low-latency streaming pipeline wants anyway;
+ *  * one PES packet per audio frame on [audioPid], PTS only, anchored onto the segment's first
+ *    muxed video PTS and kept monotonic by the muxer;
  *  * a PCR every 30 ms in the adaptation field, derived from the same clock as the PES PTS so a
  *    player can lock its clock to ours instead of guessing.
  *
@@ -43,11 +44,15 @@ fun interface TsPacketSink {
  * arrives as zero or stops increasing - a surface-input encoder that nobody called
  * `eglPresentationTimeANDROID` on - the muxer falls back to a generated timeline at the negotiated
  * frame rate and says so once, loudly, rather than emitting a stream of zero-length PTS deltas.
- * Replacing that fallback with the real media timeline is Phase H's job.
+ *
+ * A discontinuity ([resetForDiscontinuity]) closes the stream until the next key frame so the
+ * encoder's queued pre-seek frames cannot reach the receiver, re-arms the audio anchor and marks
+ * the first packet after it with the adaptation-field discontinuity_indicator.
  */
 class MpegTsMuxer(
     private val output: TsPacketSink,
     private val videoPid: Int = 0x0100,
+    private val audioPid: Int = 0x0101,
     private val pmtPid: Int = 0x1000,
     private val programNumber: Int = 1,
 ) : EncodedStreamSink {
@@ -61,7 +66,16 @@ class MpegTsMuxer(
         /** ISO 13818-1 stream_type for H.265 / HEVC. */
         private const val STREAM_TYPE_HEVC = 0x24
 
+        /** SMPTE ST 302 / TS 102 366: AC-3 / E-AC-3 (Dolby Digital Plus) audio. */
+        private const val STREAM_TYPE_EAC3 = 0x87
+
         private const val VIDEO_STREAM_ID = 0xE0
+
+        /**
+         * E-AC-3 rides PES private_stream_1, not the audio stream_id range: verified against a
+         * reference stream muxed by ffmpeg (PES bytes `00 00 01 BD` on the E-AC-3 PID).
+         */
+        private const val AUDIO_STREAM_ID = 0xBD
 
         /**
          * PSI repetition interval.
@@ -121,6 +135,32 @@ class MpegTsMuxer(
     private var paceAnchorPtsUs = Long.MIN_VALUE
     private var paceAnchorNs = 0L
 
+    // ---- Phase H/F: seek-safe video and the audio passthrough timeline ----
+
+    /** Set by [resetForDiscontinuity], cleared at the first key frame after it. */
+    private var dropUntilKeyFrame = false
+    private var droppedAfterReset = 0L
+
+    /** Emits the adaptation-field discontinuity_indicator on the first packet after a reset. */
+    private var pendingDiscontinuityFlag = false
+
+    /** Bumped on every discontinuity; the audio feeder compares it to detect a new segment. */
+    @Volatile var timelineGeneration = 0
+        private set
+
+    /** First muxed video PTS of the current segment; audio extracts offset themselves onto it. */
+    @Volatile var videoAnchorUs = Long.MIN_VALUE
+        private set
+
+    /** Latest muxed video PTS; the audio feeder holds a bounded lead over it. */
+    @Volatile var lastVideoPtsUs = Long.MIN_VALUE
+        private set
+    private var anchorGeneration = -1
+
+    /** True once the PMT must advertise the audio elementary stream. */
+    @Volatile private var hasAudio = false
+    private var lastAudioPtsUs = Long.MIN_VALUE
+
     override fun onOutputFormat(format: MediaFormat) {
         Log.i(TAG, "encoder format: $format")
         frameRate = runCatching {
@@ -176,13 +216,35 @@ class MpegTsMuxer(
         val accessUnit = ByteArray(data.remaining())
         data.duplicate().get(accessUnit)
 
+        val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+
+        // Phase H: after a seek the encoder's queued pre-seek frames still drain through with old
+        // timestamps; muxing them corrupts the receiver's timeline up to the next IDR. Hold the
+        // stream closed until the first key frame of the new segment, then resume from it. The
+        // requestKeyFrame() issued alongside the reset makes that arrive within a frame or two.
+        if (dropUntilKeyFrame) {
+            if (isKeyFrame) {
+                dropUntilKeyFrame = false
+                droppedAfterReset = 0L
+                Log.i(TAG, "video resuming after discontinuity at pts=${info.presentationTimeUs}us")
+            } else {
+                if (++droppedAfterReset in setOf(1L, 30L, 120L)) {
+                    Log.i(TAG, "dropping $droppedAfterReset pre-keyframe access units after discontinuity")
+                }
+                return
+            }
+        }
+
         val ptsUs = nextPtsUs(info.presentationTimeUs)
         // Non-blocking pace calculation for PTS generation only; we do NOT block here.
         // The UDP sink's sender thread handles actual transmission pacing.
         calculatePaceDelayNs(ptsUs)
         maybeWritePsi(ptsUs)
-
-        val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
+        if (anchorGeneration != timelineGeneration) {
+            anchorGeneration = timelineGeneration
+            videoAnchorUs = ptsUs
+        }
+        lastVideoPtsUs = ptsUs
         val header = buildPesHeader(ptsUs)
         val params = if (isKeyFrame) config else null
 
@@ -200,7 +262,9 @@ class MpegTsMuxer(
         cursor += accessUnit.size
 
         val pts90 = toTicks(ptsUs)
-        writePes(pesBuffer, cursor, pcrDue(pts90), pts90)
+        val discontinuity = pendingDiscontinuityFlag
+        pendingDiscontinuityFlag = false
+        writePes(pesBuffer, cursor, pcrDue(pts90), pts90, videoPid, discontinuity)
         unitsMuxed++
 
         if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
@@ -208,7 +272,43 @@ class MpegTsMuxer(
         }
     }
 
-    /** Re-anchor PTS and sender pacing after a seek; raw UDP cannot signal a remote seek command. */
+    /**
+     * Phase F: one compressed audio frame (E-AC-3) from the source container, already on the
+     * source media timeline. The muxer anchors it to the first video PTS of the current segment
+     * ([videoAnchorUs]) and keeps it monotonic; the feeder owns the actual offset and gating.
+     */
+    @Synchronized fun onAudioAccessUnit(data: ByteArray, rawPtsUs: Long) {
+        if (data.isEmpty()) return
+        if (data.size + 8 > 0xFFFF) {
+            // PES_packet_length is 16-bit and audio streams must carry a real value. A single
+            // E-AC-3 frame is a few kB, so this is a guard, not a path.
+            Log.e(TAG, "audio frame of ${data.size} bytes does not fit one PES packet; dropping")
+            return
+        }
+        val ptsUs = if (lastAudioPtsUs == Long.MIN_VALUE || rawPtsUs > lastAudioPtsUs) {
+            rawPtsUs
+        } else {
+            // A backwards PTS makes receivers drop audio until the next resync, which is exactly
+            // what the discontinuity path is trying to avoid. Repair it by one tick instead.
+            lastAudioPtsUs + 1L
+        }
+        lastAudioPtsUs = ptsUs
+        hasAudio = true
+        maybeWritePsi(ptsUs)
+
+        val header = buildPesHeader(ptsUs, AUDIO_STREAM_ID, data.size + 8)
+        val needed = header.size + data.size
+        if (pesBuffer.size < needed) pesBuffer = ByteArray(needed)
+        System.arraycopy(header, 0, pesBuffer, 0, header.size)
+        System.arraycopy(data, 0, pesBuffer, header.size, data.size)
+        writePes(pesBuffer, header.size + data.size, withPcr = false, toTicks(ptsUs), audioPid, discontinuity = false)
+    }
+
+    /**
+     * Re-anchor PTS and sender pacing after a seek; raw UDP cannot signal a remote seek command.
+     * Also closes the stream until the next key frame ([dropUntilKeyFrame]) so the encoder's
+     * queued pre-seek frames cannot reach the receiver, and re-arms the audio anchor.
+     */
     @Synchronized fun resetForDiscontinuity() {
         lastPtsUs = Long.MIN_VALUE
         fallbackActive = false
@@ -216,8 +316,16 @@ class MpegTsMuxer(
         lastPsiUs = Long.MIN_VALUE
         paceAnchorPtsUs = Long.MIN_VALUE
         paceAnchorNs = 0L
+        dropUntilKeyFrame = true
+        droppedAfterReset = 0L
+        pendingDiscontinuityFlag = true
+        timelineGeneration++
+        videoAnchorUs = Long.MIN_VALUE
+        lastVideoPtsUs = Long.MIN_VALUE
+        anchorGeneration = -1
+        lastAudioPtsUs = Long.MIN_VALUE
         (output as? UdpTsPacketSink)?.discardPending()
-        Log.i(TAG, "stream timeline reset after discontinuity")
+        Log.i(TAG, "stream timeline reset after discontinuity (generation=$timelineGeneration)")
     }
 
     /**
@@ -289,17 +397,20 @@ class MpegTsMuxer(
         writePmt()
     }
 
-    /** The 9-byte PES header plus the 5-byte PTS, which is all a video packet needs. */
-    private fun buildPesHeader(ptsUs: Long): ByteArray {
+    /**
+     * The PES header: the 9 fixed bytes plus the 5-byte PTS. [packetLength] follows the spec's
+     * accounting - bytes after the length field - where 0 marks the unbounded video form and the
+     * audio form must carry its real size.
+     */
+    private fun buildPesHeader(ptsUs: Long, streamId: Int = VIDEO_STREAM_ID, packetLength: Int = 0): ByteArray {
         val pts = toTicks(ptsUs)
         val header = ByteArray(14)
         header[0] = 0x00
         header[1] = 0x00
         header[2] = 0x01
-        header[3] = VIDEO_STREAM_ID.toByte()
-        // PES_packet_length 0: video packets are unbounded by the spec.
-        header[4] = 0x00
-        header[5] = 0x00
+        header[3] = streamId.toByte()
+        header[4] = ((packetLength shr 8) and 0xFF).toByte()
+        header[5] = (packetLength and 0xFF).toByte()
         // '10' + scrambling 00 + priority 0 + alignment 0 + copyright 0 + original 0
         header[6] = 0x80.toByte()
         // PTS_DTS_flags '10' (PTS only) + six clear flags
@@ -366,13 +477,25 @@ class MpegTsMuxer(
         section[n++] = 0x43.toByte() // 'C'
         // program_info_length is the 12-bit field two bytes above the descriptor tag; it was
         // written as a placeholder and is only knowable once the descriptor exists.
-        section[10] = (0xF0 or ((5 shr 8) and 0x0F)).toByte()
-        section[11] = 0x05.toByte()
+        // It counts the descriptor itself: tag + length + 4 payload bytes = 6. Writing 5 here
+        // made every ES entry after the descriptor parse one byte early, which is how ffprobe
+        // ended up reporting codec_tag 0x0043 instead of HEVC.
+        section[10] = (0xF0 or ((6 shr 8) and 0x0F)).toByte()
+        section[11] = 0x06.toByte()
         section[n++] = STREAM_TYPE_HEVC.toByte()
         section[n++] = (0xE0 or ((videoPid shr 8) and 0x1F)).toByte() // reserved | elementary_PID
         section[n++] = (videoPid and 0xFF).toByte()
         section[n++] = 0xF0.toByte() // reserved | ES_info_length = 0
         section[n++] = 0x00.toByte()
+        // The audio entry appears only once a frame has actually been muxed: advertising a PID
+        // that never carries packets makes some receivers wait for audio before showing video.
+        if (hasAudio) {
+            section[n++] = STREAM_TYPE_EAC3.toByte()
+            section[n++] = (0xE0 or ((audioPid shr 8) and 0x1F)).toByte()
+            section[n++] = (audioPid and 0xFF).toByte()
+            section[n++] = 0xF0.toByte() // ES_info_length = 0
+            section[n++] = 0x00.toByte()
+        }
         patchSectionLength(section, n)
         n = appendCrc(section, n)
         writePsi(pmtPid, section, n)
@@ -428,35 +551,46 @@ class MpegTsMuxer(
     // ------------------------------------------------------------------------------------
 
     /**
-     * Splits one PES packet ([length] bytes of [payload]) into transport packets on [videoPid].
+     * Splits one PES packet ([length] bytes of [payload]) into transport packets on [pid].
      *
-     * The adaptation field does double duty: it carries the PCR when [withPcr] is set, and it
-     * absorbs the padding that brings the final packet of a PES up to exactly 188 bytes. A
-     * payload-only packet gets `adaptation_field_control=01`; anything else gets `11`, and a
-     * one-byte adaptation is written as `adaptation_field_length = 0`, which is the spec's way of
-     * stuffing a single byte.
+     * The adaptation field does double duty: it carries the PCR when [withPcr] is set, sets the
+     * discontinuity_indicator when [discontinuity] is set, and absorbs the padding that brings
+     * the final packet of a PES up to exactly 188 bytes. A payload-only packet gets
+     * `adaptation_field_control=01`; anything else gets `11`, and a one-byte adaptation is written
+     * as `adaptation_field_length = 0`, which is the spec's way of stuffing a single byte.
      */
-    private fun writePes(payload: ByteArray, length: Int, withPcr: Boolean, pts90: Long) {
+    private fun writePes(
+        payload: ByteArray,
+        length: Int,
+        withPcr: Boolean,
+        pts90: Long,
+        pid: Int,
+        discontinuity: Boolean = false,
+    ) {
         var offset = 0
         var first = true
         while (offset < length) {
             val remaining = length - offset
             val pcrBytes = if (first && withPcr) 8 else 0
-            val maxPayload = TS_PACKET_SIZE - 4 - pcrBytes
+            // A discontinuity_indicator on the first packet needs its own flags byte, so reserve
+            // two adaptation bytes when no PCR already guarantees a flags-bearing adaptation. A
+            // one-byte adaptation is length-only and cannot carry the flag.
+            val flagBytes = if (first && discontinuity && pcrBytes == 0) 2 else 0
+            val maxPayload = TS_PACKET_SIZE - 4 - pcrBytes - flagBytes
             val take = minOf(remaining, maxPayload)
             val adaptation = TS_PACKET_SIZE - 4 - take
 
             packet[0] = 0x47.toByte()
             packet[1] = (
-                (if (first) 0x40 else 0x00) or ((videoPid shr 8) and 0x1F)
+                (if (first) 0x40 else 0x00) or ((pid shr 8) and 0x1F)
                 ).toByte() // payload_unit_start on the packet that begins the PES
-            packet[2] = (videoPid and 0xFF).toByte()
+            packet[2] = (pid and 0xFF).toByte()
             packet[3] = (
-                ((if (adaptation == 0) 0x01 else 0x03) shl 4) or takeContinuity(videoPid)
+                ((if (adaptation == 0) 0x01 else 0x03) shl 4) or takeContinuity(pid)
                 ).toByte()
 
             if (adaptation > 0) {
-                writeAdaptation(adaptation, if (first) pts90 else null, withPcr && first)
+                writeAdaptation(adaptation, if (first) pts90 else null, withPcr && first, discontinuity && first)
             }
             System.arraycopy(payload, offset, packet, 4 + adaptation, take)
             output.onTsPacket(packet, TS_PACKET_SIZE)
@@ -466,13 +600,13 @@ class MpegTsMuxer(
         }
     }
 
-    private fun writeAdaptation(totalBytes: Int, pcr: Long?, writePcr: Boolean) {
+    private fun writeAdaptation(totalBytes: Int, pcr: Long?, writePcr: Boolean, discontinuity: Boolean = false) {
         if (totalBytes == 1) {
             packet[4] = 0x00.toByte() // adaptation_field_length 0: one byte of pure stuffing
             return
         }
         packet[4] = (totalBytes - 1).toByte()
-        val flags = if (writePcr) 0x10 else 0x00 // PCR_flag
+        val flags = (if (writePcr) 0x10 else 0x00) or (if (discontinuity) 0x80 else 0x00)
         packet[5] = flags.toByte()
         var cursor = 6
         if (writePcr && pcr != null) {

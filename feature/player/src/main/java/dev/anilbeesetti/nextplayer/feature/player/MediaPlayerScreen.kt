@@ -28,6 +28,7 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.media3.common.C
 import androidx.media3.common.ColorInfo
+import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.common.Tracks
 import androidx.media3.common.VideoSize
@@ -58,6 +59,7 @@ import dev.anilbeesetti.nextplayer.feature.player.ui.PlayerVerticalGestureIndica
 import dev.anilbeesetti.nextplayer.feature.player.ui.SubtitleConfiguration
 import dev.anilbeesetti.nextplayer.feature.player.ui.preview.rememberPreviewPlayer
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import org.koin.compose.koinInject
@@ -198,6 +200,10 @@ internal fun MediaPlayerContent(
     // encoder has to open at the size the processing stage draws, and this is the only place the
     // player hands that size to the UI.
     var clipSourceSize by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    // Bumped on every media transition so the UDP effect below restarts for the new URI -
+    // the feeder tracks the container, and a stream left pointing at the previous file would
+    // keep sending its audio over the new video.
+    var mediaGeneration by remember { mutableStateOf(0) }
     DisposableEffect(player) {
         fun publish(detected: Int?, source: String) {
             // `null` means the player handed over a track list with no video in it yet - the gap
@@ -217,7 +223,20 @@ internal fun MediaPlayerContent(
                 .flatMap { group -> (0 until group.length).asSequence().map(group::getTrackFormat) }
                 .map { "${it.sampleMimeType ?: "unknown"}:${it.language ?: "und"}" }
                 .toList()
-            Log.i(TAG, "[UDP] sourceAudio=${audio?.sampleMimeType ?: "none"} audioMode=unsupported(no-compressed-sample-tap) subtitleTracks=${subtitleTracks.ifEmpty { listOf("none") }} subtitleMode=local-overlay-only")
+            // Phase G: the transport supports E-AC-3 audio as-is and no subtitle transport at
+            // all, so say so explicitly per codec instead of leaving the user to find out on the
+            // TV box. The overlay rendering itself is unchanged.
+            val audioMode = when (val mime = audio?.sampleMimeType) {
+                null -> "none"
+                "audio/eac3", "audio/ac3" -> "passthrough-eac3(ts stream_type 0x87)"
+                else -> "unsupported($mime) no-transcode"
+            }
+            val subtitleMode = if (subtitleTracks.isEmpty()) {
+                "none"
+            } else {
+                "remote-unsupported(${subtitleTracks.joinToString(",") { it.substringBefore(':') }}) rendering=local-overlay"
+            }
+            Log.i(TAG, "[UDP] sourceAudio=${audio?.sampleMimeType ?: "none"} audioMode=$audioMode subtitleTracks=${subtitleTracks.ifEmpty { listOf("none") }} subtitleMode=$subtitleMode")
             val selected = tracks.groups.asSequence()
                 .filter { it.type == C.TRACK_TYPE_VIDEO }
                 .flatMap { group -> (0 until group.length).asSequence().filter(group::isTrackSelected).map(group::getTrackFormat) }
@@ -226,6 +245,10 @@ internal fun MediaPlayerContent(
             sourceFrameRate = selected?.frameRate ?: -1f
         }
         val listener = object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                mediaGeneration++
+            }
+
             override fun onTracksChanged(tracks: Tracks) {
                 publish(tracks.outputDataSpace(), "tracks")
                 publishFormat(tracks)
@@ -279,12 +302,28 @@ internal fun MediaPlayerContent(
         playerPreferences.udpStreamingEnabled,
         playerPreferences.udpStreamingHost,
         playerPreferences.udpStreamingPort,
+        mediaGeneration,
     ) {
         if (playerPreferences.udpStreamingEnabled) {
-            rifeController.startUdpStream(
-                playerPreferences.udpStreamingHost,
-                playerPreferences.udpStreamingPort,
-            )
+            // startUdpStream needs the decoder's frame size, which onVideoSizeChanged only
+            // reports once the player has actually begun rendering - at first launch the effect
+            // runs before that exists, the start fails, and without this retry the stream never
+            // comes up for the rest of the session (the keys above do not change again).
+            var attempts = 0
+            while (isActive && attempts < 60) {
+                val started = rifeController.startUdpStream(
+                    playerPreferences.udpStreamingHost,
+                    playerPreferences.udpStreamingPort,
+                    player.currentMediaItem?.localConfiguration?.uri,
+                    player.currentPosition,
+                )
+                if (started) break
+                attempts++
+                delay(500)
+            }
+            if (attempts >= 60) {
+                Log.w(TAG, "UDP stream did not start after $attempts attempts; giving up until the settings change")
+            }
         } else {
             rifeController.stopUdpStream()
         }
