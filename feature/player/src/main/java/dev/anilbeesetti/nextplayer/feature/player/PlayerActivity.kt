@@ -97,12 +97,13 @@ class PlayerActivity : ComponentActivity() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             updateKeepScreenOnFlag()
-            if (rifeController.udpEnabled.value) {
-                rifeController.resetForDiscontinuity(
-                    if (isPlaying) "udp_resume" else "udp_pause",
-                    mediaController?.currentPosition ?: -1L,
-                )
-            }
+            // Deliberately no resetForDiscontinuity here. isPlaying is false whenever playback is
+            // not *ready* as well as when the user pauses, so every rebuffer used to tear the UDP
+            // stream down: discardPending() threw away queued datagrams, dropUntilKeyFrame blanked
+            // the receiver until an IDR arrived, and resetMemcState() flushed the pipeline - which
+            // is the "pauses for a while, then normal, then Signal Interruption again" loop. A
+            // pause produces no encoder frames and the muxer's PTS stays monotonic on its own, so
+            // the stream simply goes quiet and resumes; nothing needs re-anchoring.
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {

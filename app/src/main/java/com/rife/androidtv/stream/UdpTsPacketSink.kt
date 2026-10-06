@@ -81,7 +81,7 @@ class UdpTsPacketSink(
         repeat(queueCapacity) { free.add(Slot(ByteArray(maxDatagramBytes))) }
 
         senderThread = Thread({ sendLoop() }, "ts-udp-sender").also { it.start() }
-        Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=unsupported(no-compressed-sample-tap) subtitles=local-overlay-only queue=${pending.size} droppedVideo=${droppedVideoFrames()} bytesPerDatagram=$maxDatagramBytes; raw UDP has no remote pause/seek control")
+        Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=local-overlay-only queue=${pending.size} droppedVideo=${droppedVideoFrames()} bytesPerDatagram=$maxDatagramBytes; raw UDP has no remote pause/seek control")
     }
 
     @Synchronized override fun onTsPacket(packet: ByteArray, length: Int) {
@@ -173,7 +173,7 @@ class UdpTsPacketSink(
                     val totalBytes = bytesSent.get()
                     val rate = (totalBytes - lastWindowBytesSent).coerceAtLeast(0L) * 8.0 / (elapsed * 1000.0)
                     lastWindowBytesSent = totalBytes
-                    Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=unsupported subtitles=local-overlay-only packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} droppedVideo=${droppedVideoFrames()} droppedPackets=${datagramsDropped.get()} windowMs=$elapsed")
+                    Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=local-overlay-only packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} droppedVideo=${droppedVideoFrames()} droppedPackets=${datagramsDropped.get()} windowMs=$elapsed")
                     lastWindowLogMs = now
                 }
             } catch (interrupted: InterruptedException) {
@@ -231,11 +231,13 @@ class UdpTsPacketSink(
         const val DEFAULT_DATAGRAM_BYTES = 1316
 
         /**
-         * Two seconds of a 60 Mbps stream. Sized so a slow receiver costs dropped datagrams
-         * instead of a stalled encoder, while not so large that a stalled link buffers minutes of
-         * latency before anything gives.
+         * Datagrams of buffer. The old value of 32 was sized by a comment claiming "two seconds of
+         * a 60 Mbps stream"; 32 x 1316 bytes is 42 kB, which is 5.6 ms at 60 Mbps - a single Wi-Fi
+         * hiccup or one bursty encode cycle overflowed it and dropped packets, which is what a
+         * receiver reports as Signal Interruption. 1024 is 1.35 MB, ~180 ms at 60 Mbps: long
+         * enough to ride out a stall, short enough that it can never become a latency reservoir.
          */
-        const val DEFAULT_QUEUE_CAPACITY = 32
+        const val DEFAULT_QUEUE_CAPACITY = 1024
 
         /**
          * How long the sender parks between datagrams. Two milliseconds, not twenty: the whole

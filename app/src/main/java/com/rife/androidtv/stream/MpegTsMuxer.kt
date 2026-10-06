@@ -66,8 +66,18 @@ class MpegTsMuxer(
         /** ISO 13818-1 stream_type for H.265 / HEVC. */
         private const val STREAM_TYPE_HEVC = 0x24
 
-        /** SMPTE ST 302 / TS 102 366: AC-3 / E-AC-3 (Dolby Digital Plus) audio. */
-        private const val STREAM_TYPE_EAC3 = 0x87
+        /**
+         * SMPTE ST 302 / TS 102 366: AC-3 / E-AC-3 (Dolby Digital Plus) audio. Public because
+         * [AudioPassthroughFeeder] declares it to the muxer rather than the muxer guessing.
+         */
+        const val STREAM_TYPE_EAC3 = 0x87
+
+        /**
+         * ISO 13818-1 stream_type for MPEG-2 Audio (AAC) carried as ADTS. The feeder wraps every
+         * frame in ADTS whether or not the container already had it, so one stream_type covers
+         * both cases.
+         */
+        const val STREAM_TYPE_AAC_ADTS = 0x0F
 
         private const val VIDEO_STREAM_ID = 0xE0
 
@@ -75,7 +85,10 @@ class MpegTsMuxer(
          * E-AC-3 rides PES private_stream_1, not the audio stream_id range: verified against a
          * reference stream muxed by ffmpeg (PES bytes `00 00 01 BD` on the E-AC-3 PID).
          */
-        private const val AUDIO_STREAM_ID = 0xBD
+        const val AUDIO_STREAM_ID = 0xBD
+
+        /** PES stream_id for stream 0 of the MPEG audio stream_id range (0xC0-0xDF). */
+        const val AUDIO_STREAM_ID_MPEG = 0xC0
 
         /**
          * PSI repetition interval.
@@ -160,6 +173,24 @@ class MpegTsMuxer(
     /** True once the PMT must advertise the audio elementary stream. */
     @Volatile private var hasAudio = false
     private var lastAudioPtsUs = Long.MIN_VALUE
+
+    /**
+     * Codec of the stream that will be put on [audioPid], as declared by the feeder. Both the
+     * PMT entry and the PES stream_id come from here: the muxer cannot infer them, and a PMT
+     * that names a codec the stream does not carry makes receivers withhold audio entirely.
+     */
+    @Volatile private var audioStreamType: Int = STREAM_TYPE_EAC3
+    @Volatile private var audioStreamId: Int = AUDIO_STREAM_ID
+
+    /**
+     * Declares what [AudioPassthroughFeeder] is about to write, before the first frame. E-AC-3
+     * stays the default so a stream that never calls this still muxes as it did before.
+     */
+    fun setAudioFormat(streamType: Int, streamId: Int) {
+        audioStreamType = streamType
+        audioStreamId = streamId
+        Log.i(TAG, "audio format: stream_type=0x${streamType.toString(16)} pes_stream_id=0x${streamId.toString(16)}")
+    }
 
     override fun onOutputFormat(format: MediaFormat) {
         Log.i(TAG, "encoder format: $format")
@@ -273,15 +304,16 @@ class MpegTsMuxer(
     }
 
     /**
-     * Phase F: one compressed audio frame (E-AC-3) from the source container, already on the
-     * source media timeline. The muxer anchors it to the first video PTS of the current segment
-     * ([videoAnchorUs]) and keeps it monotonic; the feeder owns the actual offset and gating.
+     * Phase F: one compressed audio frame (E-AC-3 or ADTS-framed AAC) from the source container,
+     * already on the source media timeline. The muxer anchors it to the first video PTS of the
+     * current segment ([videoAnchorUs]) and keeps it monotonic; the feeder owns the actual offset
+     * and gating, and declared the codec through [setAudioFormat].
      */
     @Synchronized fun onAudioAccessUnit(data: ByteArray, rawPtsUs: Long) {
         if (data.isEmpty()) return
         if (data.size + 8 > 0xFFFF) {
             // PES_packet_length is 16-bit and audio streams must carry a real value. A single
-            // E-AC-3 frame is a few kB, so this is a guard, not a path.
+            // E-AC-3 or AAC frame is a few kB, so this is a guard, not a path.
             Log.e(TAG, "audio frame of ${data.size} bytes does not fit one PES packet; dropping")
             return
         }
@@ -296,7 +328,7 @@ class MpegTsMuxer(
         hasAudio = true
         maybeWritePsi(ptsUs)
 
-        val header = buildPesHeader(ptsUs, AUDIO_STREAM_ID, data.size + 8)
+        val header = buildPesHeader(ptsUs, audioStreamId, data.size + 8)
         val needed = header.size + data.size
         if (pesBuffer.size < needed) pesBuffer = ByteArray(needed)
         System.arraycopy(header, 0, pesBuffer, 0, header.size)
@@ -490,7 +522,7 @@ class MpegTsMuxer(
         // The audio entry appears only once a frame has actually been muxed: advertising a PID
         // that never carries packets makes some receivers wait for audio before showing video.
         if (hasAudio) {
-            section[n++] = STREAM_TYPE_EAC3.toByte()
+            section[n++] = audioStreamType.toByte()
             section[n++] = (0xE0 or ((audioPid shr 8) and 0x1F)).toByte()
             section[n++] = (audioPid and 0xFF).toByte()
             section[n++] = 0xF0.toByte() // ES_info_length = 0

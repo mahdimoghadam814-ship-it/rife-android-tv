@@ -1057,13 +1057,23 @@ class VideoFrameProcessor(
         probeCodecDataSpace()
         val want = effectiveOutputDataSpace()
         val before = NativeEngine.getOutputDataSpace(surface)
-        if (before == want) return
-        val rc = NativeEngine.setOutputDataSpace(surface, want)
-        Log.w(
-            TAG,
-            "Output dataspace drifted ($reason): window=$before want=$want " +
-                "codec=$codecDataSpace rc=${if (rc == 0) "ok" else dataSpaceError(rc)}"
-        )
+        if (before != want) {
+            val rc = NativeEngine.setOutputDataSpace(surface, want)
+            Log.w(
+                TAG,
+                "Output dataspace drifted ($reason): window=$before want=$want " +
+                    "codec=$codecDataSpace rc=${if (rc == 0) "ok" else dataSpaceError(rc)}"
+            )
+        }
+        // The preview is a second window while an encode owns the primary one, and it drifts on
+        // its own: EGL re-tags a window whenever it is recreated, and only the primary is read
+        // back here. Left alone the mirror keeps rendering the same pixels untagged, which is
+        // exactly "the TV box still has HDR, the phone lost it".
+        val mirror = outputRenderer?.mirrorOutputSurface
+        if (mirror != null && mirror.isValid && NativeEngine.getOutputDataSpace(mirror) != want) {
+            NativeEngine.setOutputDataSpace(mirror, want)
+            Log.w(TAG, "Preview mirror dataspace drifted ($reason); re-tagged to $want")
+        }
     }
 
     /** Turns the JNI stage's failure code back into something readable in a log line. */
@@ -1992,6 +2002,20 @@ class VideoFrameProcessor(
         // computeMotionField() reports false when the algorithm produces no field at all, so
         // the RIFE path keeps working without this layer knowing about the switch.
         val motionBuf = cachedMotionBuf
+
+        // The emission schedule has to be known before the engine call, not after it. When the
+        // warp cannot draw this pair the per-timestep CPU loop further down is the stage that
+        // will, and asking that same stage here as well interpolated the pair a second time -
+        // two full CPU interpolations per pair at 2x where one was needed, which is where the
+        // fallback path spent about half its time.
+        val times = outputTimesFor(prev.timestampUs, nextFrame.timestampUs)
+        val ownFrame = times.isNotEmpty() && times[times.lastIndex] >= 1f
+        val intermediate = if (ownFrame) {
+            times.copyOfRange(0, times.size - 1)
+        } else {
+            times
+        }
+
         val tJniStart = System.nanoTime()
         var motionReady = false
         if (motionBuf != null && outputRenderer?.isWarpInitialized == true) {
@@ -2006,16 +2030,25 @@ class VideoFrameProcessor(
                 forwardOnly = false,
             )
         }
-        val success = motionReady || NativeEngine.interpolateFrameBuffers(
-            src0Buf,
-            src1Buf,
-            rifeInputW,
-            rifeInputH,
-            rifeOutputW,
-            rifeOutputH,
-            0.5f,
-            outBuf
-        )
+        val success = when {
+            // The warp path renders every point itself; nothing else has to run.
+            motionReady -> true
+            // No point to render, so the CPU loop below never runs and this is the stage's only
+            // caller. Its result is what decides whether the pair can be presented at all.
+            intermediate.isEmpty() -> NativeEngine.interpolateFrameBuffers(
+                src0Buf,
+                src1Buf,
+                rifeInputW,
+                rifeInputH,
+                rifeOutputW,
+                rifeOutputH,
+                0.5f,
+                outBuf
+            )
+            // The loop below runs the stage once per point; a probe here would run the pair
+            // twice. It reports its own failure rather than the probe reporting it for it.
+            else -> true
+        }
         nsJni += System.nanoTime() - tJniStart
 
         lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
@@ -2049,17 +2082,9 @@ class VideoFrameProcessor(
                 }
             }
 
-            val times = outputTimesFor(prev.timestampUs, nextFrame.timestampUs)
-
-            // Everything before the pair's own frame is an interpolation. They share one upload of
-            // the pair and of the field - only the uniform and the swap repeat - because at a level
-            // above 2x the same two frames are being resampled several times over.
-            val ownFrame = times.isNotEmpty() && times[times.lastIndex] >= 1f
-            val intermediate = if (ownFrame) {
-                times.copyOfRange(0, times.size - 1)
-            } else {
-                times
-            }
+            // times / ownFrame / intermediate are computed above, before the engine call: they
+            // are the schedule this block executes, and outputTimesFor() carries the cadence
+            // phase, so calling it twice here would advance the phase by a whole pair.
 
             // The presentation time each interpolated frame must carry. Without it the encoder
             // reports zero for every access unit and the muxer invents a timeline at the
@@ -2123,9 +2148,10 @@ class VideoFrameProcessor(
                             "interpolator, which resamples per block and will show as blocks"
                     )
                 }
+                var renderedPoints = 0
                 for (i in intermediate.indices) {
                     val t = intermediate[i]
-                    NativeEngine.interpolateFrameBuffers(
+                    val ok = NativeEngine.interpolateFrameBuffers(
                         src0Buf,
                         src1Buf,
                         rifeInputW,
@@ -2135,6 +2161,9 @@ class VideoFrameProcessor(
                         t,
                         outBuf
                     )
+                    if (!ok) {
+                        continue
+                    }
                     // Native wrote requiredOutputBytes of RGBA through the direct address without
                     // touching the Java position, so the readable range is established here rather
                     // than with flip(): position 0, limit = requiredOutputBytes.
@@ -2149,6 +2178,18 @@ class VideoFrameProcessor(
                     }
 
                     renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH, timestamps[i])
+                    renderedPoints++
+                }
+                if (renderedPoints == 0) {
+                    // On this path the loop is the stage's only caller, so nothing else can
+                    // report a refusal: surface it and put the untouched capture on screen
+                    // rather than whatever the output buffer happened to hold.
+                    val status = NativeEngine.getRifeStatus()
+                    reportError(
+                        if (status.lastError.isNotEmpty()) status.lastError
+                        else "RIFE frame interpolation failed"
+                    )
+                    renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
                 }
             }
 

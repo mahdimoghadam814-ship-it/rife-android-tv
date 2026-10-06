@@ -307,7 +307,7 @@ class RifeEngineController(
     // Phase E/F: UDP streaming of processed frames to a TV box
     // --------------------------------------------------------------------------------------
 
-    /** Phase F: taps the source container's E-AC-3 track and gates it onto the muxed video timeline. */
+    /** Phase F: taps the source container's audio track and gates it onto the muxed video timeline. */
     @Volatile
     private var audioFeeder: AudioPassthroughFeeder? = null
 
@@ -330,8 +330,18 @@ class RifeEngineController(
      * Starts UDP streaming of the processed frame pipeline to [host]:[port] as MPEG-TS over UDP.
      * Creates [UdpTsPacketSink] and starts the hardware HEVC encoder with the current video
      * size; the encoder's frames go through [MpegTsMuxer] into the UDP sink, and [mediaUri]'s
-     * E-AC-3 track is muxed alongside when present. Subtitles stay a local overlay (logged),
-     * because a remote subtitle transport does not exist for them yet.
+     * E-AC-3 or AAC-LC track is muxed alongside when the container has one.
+     *
+     * Two things this deliberately does not carry, and why:
+     *
+     *  * **Subtitles** stay a local overlay. The only transports raw TS has are DVB/teletext
+     *    bitmap pages (stream_type 0x06 with a subtitling descriptor) or 608/708 captions folded
+     *    into the video SEI - both need a new encoder-side pipeline and a receiver that renders
+     *    them, and neither can be verified without the device on the other end.
+     *  * **Remote pause/seek** need a receiver that speaks back. This app only *sends*; the box
+     *    plays the stream in a third-party player, so there is no process on the far side to
+     *    receive a control datagram. Locally, a seek is already fast because
+     *    [MpegTsMuxer.resetForDiscontinuity] drops to the next key frame on request.
      */
     override fun startUdpStream(host: String, port: Int, mediaUri: Uri?, startPositionMs: Long): Boolean {
         if (_udpRunning) {

@@ -281,6 +281,21 @@ class GlOutputRenderer {
             0.0f, 0.0f, 0.0f, 1.0f,
             1.0f, 0.0f, 0.0f, 1.0f
         )
+
+        /**
+         * Texture coordinates for the preview mirror. [FULL_QUAD_TEX_COORDS] flips V because the
+         * picture is uploaded top row first; the mirror does not upload anything, it samples a
+         * `glCopyTexSubImage2D` of the window, and that copy starts at the window's *bottom-left*
+         * corner. So texture row 0 of the mirror already holds the bottom of the picture, and the
+         * flip that keeps [FULL_QUAD_TEX_COORDS] upright turns the preview upside down. Same strip,
+         * same vertices, V unflipped.
+         */
+        private val MIRROR_QUAD_TEX_COORDS = floatArrayOf(
+            0.0f, 0.0f, 0.0f, 1.0f,
+            1.0f, 0.0f, 0.0f, 1.0f,
+            0.0f, 1.0f, 0.0f, 1.0f,
+            1.0f, 1.0f, 0.0f, 1.0f
+        )
     }
 
     private var program = 0
@@ -452,6 +467,16 @@ class GlOutputRenderer {
         .asFloatBuffer()
         .apply {
             put(FULL_QUAD_TEX_COORDS)
+            position(0)
+        }
+
+    /** [MIRROR_QUAD_TEX_COORDS] in direct memory; see there for why it differs from [texCoordBuffer]. */
+    private val mirrorTexCoordBuffer: FloatBuffer = ByteBuffer
+        .allocateDirect(MIRROR_QUAD_TEX_COORDS.size * 4)
+        .order(ByteOrder.nativeOrder())
+        .asFloatBuffer()
+        .apply {
+            put(MIRROR_QUAD_TEX_COORDS)
             position(0)
         }
 
@@ -978,9 +1003,11 @@ class GlOutputRenderer {
             vertexBuffer.position(0)
             GLES20.glEnableVertexAttribArray(aPositionHandle)
             GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
-            texCoordBuffer.position(0)
+            // Not texCoordBuffer: the mirror samples a framebuffer copy, whose row 0 is already
+            // the bottom of the picture. Reusing the upload path's flipped V inverted the preview.
+            mirrorTexCoordBuffer.position(0)
             GLES20.glEnableVertexAttribArray(aTextureCoordHandle)
-            GLES20.glVertexAttribPointer(aTextureCoordHandle, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+            GLES20.glVertexAttribPointer(aTextureCoordHandle, 4, GLES20.GL_FLOAT, false, 16, mirrorTexCoordBuffer)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             GLES20.glDisableVertexAttribArray(aPositionHandle)
             GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
