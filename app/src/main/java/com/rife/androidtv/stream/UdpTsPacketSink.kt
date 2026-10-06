@@ -42,7 +42,11 @@ class UdpTsPacketSink(
     }
 
     private val address: InetAddress = InetAddress.getByName(host)
-    private val socket = DatagramSocket()
+    private val socket = DatagramSocket().apply {
+        setReuseAddress(true)
+        // Increase send buffer to handle bursts
+        setSendBufferSize(256 * 1024)
+    }
 
     /** Written by the drain thread, read by the drain thread. */
     private val staging = ByteArray(maxDatagramBytes)
@@ -203,7 +207,12 @@ class UdpTsPacketSink(
         } catch (interrupted: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        socket.close()
+        // Ensure socket is closed and port is released immediately
+        try {
+            socket.close()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error closing socket", e)
+        }
         Log.i(
             TAG,
             "closed after ${datagramsSent.get()} datagrams (${bytesSent.get()} bytes), " +
@@ -234,6 +243,6 @@ class UdpTsPacketSink(
          * stream whose entire reason for existing is to be live.
          */
         private const val POLL_INTERVAL_MS = 2L
-        private const val JOIN_TIMEOUT_MS = 500L
+        private const val JOIN_TIMEOUT_MS = 2000L
     }
 }

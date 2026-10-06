@@ -922,7 +922,10 @@ class GlOutputRenderer {
             }
         }
 
-        if (mirror != null && mirrorTexture != 0 && mirrorWidth > 0 && mirrorHeight > 0 &&
+        // Always update the mirror (phone preview) regardless of remote frame rate cap.
+        // The local preview must continue showing the latest processed frame even when
+        // the remote encoder is rate-limited and dropping frames.
+        if (mirror != null && mirrorSurface?.isValid == true && mirrorTexture != 0 &&
             EGL14.eglMakeCurrent(eglDisplay, mirror, mirror, context)
         ) {
             GLES20.glViewport(0, 0, mirrorWidth, mirrorHeight)

@@ -177,7 +177,9 @@ class MpegTsMuxer(
         data.duplicate().get(accessUnit)
 
         val ptsUs = nextPtsUs(info.presentationTimeUs)
-        paceToTimestamp(ptsUs)
+        // Non-blocking pace calculation for PTS generation only; we do NOT block here.
+        // The UDP sink's sender thread handles actual transmission pacing.
+        calculatePaceDelayNs(ptsUs)
         maybeWritePsi(ptsUs)
 
         val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
@@ -218,19 +220,20 @@ class MpegTsMuxer(
         Log.i(TAG, "stream timeline reset after discontinuity")
     }
 
-    private fun paceToTimestamp(ptsUs: Long) {
+    /**
+     * Non-blocking pace helper: returns the nanoseconds until the next frame should be sent
+     * based on the frame rate, or 0 if no pacing is needed. This does NOT block - the caller
+     * decides whether to wait. Used only for PTS generation when codec timestamps are unusable.
+     */
+    private fun calculatePaceDelayNs(ptsUs: Long): Long {
         if (paceAnchorPtsUs == Long.MIN_VALUE) {
             paceAnchorPtsUs = ptsUs
             paceAnchorNs = System.nanoTime()
-            return
+            return 0L
         }
         val dueNs = paceAnchorNs + (ptsUs - paceAnchorPtsUs).coerceAtLeast(0L) * 1_000L
-        while (true) {
-            val remaining = dueNs - System.nanoTime()
-            if (remaining <= 0L) return
-            LockSupport.parkNanos(remaining)
-            if (Thread.currentThread().isInterrupted) return
-        }
+        val remaining = dueNs - System.nanoTime()
+        return remaining.coerceAtLeast(0L)
     }
 
     /**

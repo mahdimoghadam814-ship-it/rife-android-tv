@@ -304,6 +304,7 @@ class VideoFrameProcessor(
      * downgrade is logged with what it cost.
      */
     private var autoDegradeLevel = 0
+    private var autoInterpolationDegradeLevel = 0
     private var autoDenoiseBranch = false
     private var autoCaptureW = 0
     private var autoCaptureH = 0
@@ -2222,6 +2223,23 @@ class VideoFrameProcessor(
             }
         }
 
+        // The AUTO policy's interpolation branch (RIFE at 4K -> 1080p) also degrades when
+        // the native frame rate cannot be held. It starts at 1080p (index 1) and can step
+        // down to 720p (index 2) and 480p (index 3).
+        if (isRifeEnabled && autoInterpolationDegradeLevel < autoDegradeLadder.lastIndex - 1) {
+            val cycleNs = nsPair / n
+            val overBudget = sourceIntervalNs > 0L && cycleNs > sourceIntervalNs.toDouble()
+            if (dropped > 0 || overBudget) {
+                autoInterpolationDegradeLevel++
+                Log.w(
+                    TAG,
+                    "RES POLICY (interp): ${autoCaptureW}x$autoCaptureH cannot hold the native rate " +
+                        "(cycle=${fmtMs(cycleNs)} ms, budget=${fmtMs(sourceIntervalNs.toDouble())} ms, " +
+                        "dropped=$dropped), degrading to ${autoDegradeLadder[autoInterpolationDegradeLevel + 1]}"
+                )
+            }
+        }
+
         Log.i(
             TAG,
             "PIPELINE TIMING: n=$timingCycles " +
@@ -2514,7 +2532,8 @@ class VideoFrameProcessor(
      * The processing resolution the engine picks for this source and toggle state (AUTO mode).
      *
      *  * below 4K -> the source resolution, untouched, whatever is enabled;
-     *  * 4K with MEMC on -> 1080p. The interpolation cycle has to fit a 41.6 ms budget and 4K is
+     *  * 4K with MEMC on -> 1080p, then degrades to 720p/480p if frames are dropped.
+     *    The interpolation cycle has to fit a 41.6 ms budget and 4K is
      *    four times the pixels; the result is scaled back up into the output surface by the
      *    present, which is where that upscaling belongs.
      *  * 4K with only the denoiser -> native 4K. This is the one branch allowed to run at source
@@ -2523,7 +2542,10 @@ class VideoFrameProcessor(
      */
     private fun autoResolution(srcW: Int, srcH: Int): RifeResolution {
         if (maxOf(srcW, srcH) < auto4kMinDim) return RifeResolution.ORIGINAL
-        if (isRifeEnabled) return RifeResolution.RES_1080P
+        if (isRifeEnabled) {
+            // Interpolation branch: starts at 1080p (index 1), can degrade to 720p (2) and 480p (3)
+            return autoDegradeLadder[(1 + autoInterpolationDegradeLevel).coerceIn(1, autoDegradeLadder.lastIndex)]
+        }
         if (!isDenoiseEnabled) return RifeResolution.ORIGINAL
         return autoDegradeLadder[autoDegradeLevel.coerceIn(0, autoDegradeLadder.lastIndex)]
     }
@@ -2550,6 +2572,16 @@ class VideoFrameProcessor(
             // explicitly). The ladder belongs to that branch alone, so it starts over rather than
             // inheriting a downgrade decided under different conditions.
             autoDegradeLevel = 0
+        }
+
+        // Interpolation branch tracking: RIFE at 4K degrades from 1080p down the ladder.
+        val autoInterpolationBranch = resolution == RifeResolution.AUTO &&
+            isRifeEnabled &&
+            maxOf(srcW, srcH) >= auto4kMinDim
+
+        if (!autoInterpolationBranch && autoInterpolationDegradeLevel != 0) {
+            // Left the interpolation branch; reset its degrade level.
+            autoInterpolationDegradeLevel = 0
         }
 
         var (targetW, targetH) = calculateTargetDimensions(srcW, srcH, effective)

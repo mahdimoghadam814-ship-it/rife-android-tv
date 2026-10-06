@@ -372,7 +372,7 @@ internal fun MediaPlayerContent(
                         }
                     }
                 } else {
-                    Toast.makeText(context, R.string.record_test_clip, Toast.LENGTH_SHORT).show()
+                    Toast.makeText(context, "Test clip recording unavailable", Toast.LENGTH_SHORT).show()
                 }
             }
         }

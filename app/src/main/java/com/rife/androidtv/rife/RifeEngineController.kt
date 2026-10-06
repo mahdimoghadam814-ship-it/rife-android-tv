@@ -445,6 +445,24 @@ class RifeEngineController(
         encodedUnits.set(0)
         encodedBytes.set(0)
         processor.setEncodeSurface(surface)
+
+        // Set the dataspace on the encoder input surface so the encoder knows the input is HDR.
+        // This is critical for the encoder to generate correct HDR SEI NAL units.
+        if (config.hdr10) {
+            val hdrDataSpace = when (config.colorTransfer) {
+                MediaFormat.COLOR_TRANSFER_ST2084 -> 163971072 // DATASPACE_BT2020_PQ
+                MediaFormat.COLOR_TRANSFER_HLG -> 168165376 // DATASPACE_BT2020_HLG
+                else -> 0
+            }
+            if (hdrDataSpace != 0) {
+                val rc = NativeEngine.setOutputDataSpace(surface, hdrDataSpace)
+                if (rc != 0) {
+                    Log.w(TAG, "Failed to set HDR dataspace on encoder input surface: rc=$rc")
+                } else {
+                    Log.i(TAG, "Set HDR dataspace on encoder input surface: $hdrDataSpace")
+                }
+            }
+        }
         Log.i(
             TAG,
             "Encoding started: ${config.width}x${config.height}@${config.frameRate} " +
