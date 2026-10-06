@@ -7,6 +7,8 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
 import androidx.media3.common.SurfaceInfo
+import androidx.media3.common.ColorInfo
+import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import com.rife.androidtv.NativeEngine
 import com.rife.androidtv.RifeDiagnosticResult
@@ -27,6 +29,7 @@ import java.io.Closeable
 import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.roundToInt
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -245,6 +248,19 @@ class RifeEngineController(
         processor.setOutputDataSpace(dataSpace)
     }
 
+    @Volatile private var sourceColorInfo: ColorInfo? = null
+    @Volatile private var sourceMimeType: String? = null
+    @Volatile private var sourceCodecs: String? = null
+
+    override fun setSourceVideoColorInfo(colorInfo: ColorInfo?, sampleMimeType: String?, codecs: String?, frameRate: Float) {
+        sourceColorInfo = colorInfo
+        sourceMimeType = sampleMimeType
+        sourceCodecs = codecs
+        processor.setSourceFrameRate(frameRate)
+        processor.setSourceColorInfo(colorInfo)
+        Log.i(TAG, "[HDR] inputColor=$colorInfo mime=$sampleMimeType codecs=$codecs")
+    }
+
     override fun onInputSurfaceAttached() {
         processor.onInputSurfaceAttached()
     }
@@ -258,6 +274,7 @@ class RifeEngineController(
      */
     override fun resetForDiscontinuity(reason: String) {
         processor.resetForNewStream(reason)
+        activeMuxer?.resetForDiscontinuity()
         // The block-matching pyramid holds state across frames; a seek/stream change invalidates it.
         NativeEngine.resetMemcState()
     }
@@ -288,32 +305,58 @@ class RifeEngineController(
      * should render subtitles from the original source independently.
      */
     override fun startUdpStream(host: String, port: Int): Boolean {
-        val sink = UdpTsPacketSink(host, port)
+        var sink: UdpTsPacketSink? = null
         try {
             val (width, height) = getInputFrameSize()
             if (width <= 0 || height <= 0) {
                 Log.w(TAG, "Cannot start UDP stream: input frame size not yet known")
                 return false
             }
-            val frameRate = 60 // Default; encoder will adapt to actual frame rate
+            val frameRate = processor.currentOutputFrameRate().roundToInt().coerceIn(1, 120)
+            val source = sourceColorInfo
+            val dvProfile8 = sourceMimeType == "video/dolby-vision" &&
+                (sourceCodecs?.contains("dvhe.08", ignoreCase = true) == true || sourceCodecs?.contains("dvh1.08", ignoreCase = true) == true)
+            val hdr10 = source?.colorTransfer == C.COLOR_TRANSFER_ST2084 || dvProfile8
+            val range = when (source?.colorRange) {
+                C.COLOR_RANGE_FULL -> MediaFormat.COLOR_RANGE_FULL
+                else -> MediaFormat.COLOR_RANGE_LIMITED
+            }
+            val standard = when (source?.colorSpace) {
+                C.COLOR_SPACE_BT2020 -> MediaFormat.COLOR_STANDARD_BT2020
+                C.COLOR_SPACE_BT709 -> MediaFormat.COLOR_STANDARD_BT709
+                else -> if (hdr10) MediaFormat.COLOR_STANDARD_BT2020 else MediaFormat.COLOR_STANDARD_BT709
+            }
+            val transfer = when (source?.colorTransfer) {
+                C.COLOR_TRANSFER_HLG -> MediaFormat.COLOR_TRANSFER_HLG
+                C.COLOR_TRANSFER_ST2084 -> MediaFormat.COLOR_TRANSFER_ST2084
+                else -> if (dvProfile8) MediaFormat.COLOR_TRANSFER_ST2084 else MediaFormat.COLOR_TRANSFER_SDR_VIDEO
+            }
             val config = HdrHevcEncoder.Config(
                 width = width,
                 height = height,
                 frameRate = frameRate,
+                hdr10 = hdr10,
+                colorStandard = standard,
+                colorTransfer = transfer,
+                colorRange = range,
+                hdrStaticInfo = source?.hdrStaticInfo?.let { ByteBuffer.wrap(it) },
             )
-            if (!startEncoding(config, sink)) {
-                sink.close()
+            Log.i(TAG, "[HDR] inputColor=$source outputDataSpace=${processor.outputDataSpaceForDiagnostics()} encoderProfile=HEVCMain10 transfer=$transfer primaries=$standard range=$range")
+            val streamSink = UdpTsPacketSink(host, port, bitrateBps = config.effectiveBitrateBps())
+            sink = streamSink
+            if (!startEncoding(config, streamSink)) {
+                streamSink.close()
                 Log.e(TAG, "Failed to start encoding for UDP stream")
                 return false
             }
-            _udpSink = sink
+            _udpSink = streamSink
             _udpRunning = true
             _udpEnabled.value = true
             Log.i(TAG, "UDP streaming started to $host:$port at ${width}x$height@$frameRate")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start UDP streaming", e)
-            sink.close()
+            sink?.close()
             return false
         }
     }
@@ -341,6 +384,7 @@ class RifeEngineController(
      * Without this the UDP socket, its sender thread and its buffer slots leak on every stop.
      */
     private var packetSink: TsPacketSink? = null
+    @Volatile private var activeMuxer: MpegTsMuxer? = null
     private val encodedUnits = AtomicLong()
     private val encodedBytes = AtomicLong()
     private var capabilitiesLogged = false
@@ -367,6 +411,7 @@ class RifeEngineController(
             HdrHevcEncoder.logCapabilities()
         }
         val muxer = packetSink?.let { MpegTsMuxer(it) }
+        activeMuxer = muxer
         val candidate = HdrHevcEncoder(CountingSink(muxer))
         val surface = candidate.open(config)
         if (surface == null) {
@@ -396,6 +441,7 @@ class RifeEngineController(
         val running = encoder ?: return true
         val cfg = encodeConfig
         encoder = null
+        activeMuxer = null
         encodeConfig = null
         processor.setEncodeSurface(null)
         val eos = running.signalEndOfStream()

@@ -107,7 +107,9 @@ class VideoFrameProcessor(
         private const val FRAME_QUEUE_CAPACITY = 4
 
         /** Pooled capture buffers. Bounded so a 4K stream cannot inflate the heap. */
-        private const val MAX_POOLED_FRAME_BUFFERS = 6
+        private const val MAX_POOLED_FRAME_BUFFERS = 2
+        private const val FRAME_MEMORY_BUDGET_BYTES = 128L * 1024L * 1024L
+        private const val MAX_CAPTURE_FRAMES_BUDGETED = 8L
 
         private const val WORKER_TASK_TIMEOUT_MS = 3000L
 
@@ -264,6 +266,11 @@ class VideoFrameProcessor(
     private var frameCountInput = 0
     private var frameCountOutput = 0
     private var droppedFrameCount = 0L
+    private var droppedOutputFrameCount = 0L
+    private var submittedOutputFrameCount = 0L
+    private var diagnosticOutputStartCount = 0L
+    private var diagnosticWindowStartNs = 0L
+    private var droppedOutputAtWindowStart = 0L
     private var lastStatsResetTime = SystemClock.elapsedRealtime()
     private var lastProcTimeMs = 0L
 
@@ -273,6 +280,7 @@ class VideoFrameProcessor(
     private var cachedDenoised1Buf: ByteBuffer? = null
     private var cachedOutBuf: ByteBuffer? = null
     private var cachedTargetSize = 0
+    private var rejectedTargetSize = 0
 
     /**
      * Packed motion field for the GPU warp: four bytes per 16x16 block, so a few kilobytes even
@@ -317,6 +325,16 @@ class VideoFrameProcessor(
 
     /** Microseconds between the last pair's two source frames; 0 until a pair has been seen. */
     private var lastPairIntervalUs = 0L
+
+    @Volatile private var sourceFrameRateHint = 0f
+    fun setSourceFrameRate(frameRate: Float) {
+        sourceFrameRateHint = frameRate.takeIf { it.isFinite() && it > 0f } ?: 0f
+    }
+    fun currentOutputFrameRate(): Float = if (sourceFrameRateHint > 0f) {
+        sourceFrameRateHint * memcLevelMultiplier
+    } else if (lastPairIntervalUs > 0L) {
+        (1_000_000.0 / lastPairIntervalUs.toDouble() * memcLevelMultiplier).toFloat()
+    } else 60f
 
     /**
      * Interpolation ratio: how many output frames are synthesised per source frame. Two is one
@@ -376,6 +394,8 @@ class VideoFrameProcessor(
      * matching transfer curve. Read on the worker thread only.
      */
     private var outputDataSpace: Int = 0
+    @Volatile private var currentOutputDataSpace: Int = 0
+    @Volatile private var sourceColorInfo: ColorInfo? = null
 
     /**
      * Dataspace MediaCodec stamped on its own output window, read back through
@@ -706,7 +726,7 @@ class VideoFrameProcessor(
                 registerInputStreamOnWorker(
                     FrameInfo(
                         Format.Builder()
-                            .setColorInfo(ColorInfo.SDR_BT709_LIMITED)
+                            .setColorInfo(format.colorInfo ?: sourceColorInfo ?: ColorInfo.SDR_BT709_LIMITED)
                             .setWidth(inputWidth)
                             .setHeight(inputHeight)
                             .build(),
@@ -805,6 +825,7 @@ class VideoFrameProcessor(
         encodeSurface ?: pendingOutputSurfaceInfo?.surface
 
     fun setOutputDataSpace(dataSpace: Int) {
+        currentOutputDataSpace = dataSpace
         runOnWorker("setOutputDataSpace()") {
             if (outputDataSpace != dataSpace) {
                 outputDataSpace = dataSpace
@@ -814,6 +835,15 @@ class VideoFrameProcessor(
                 codecDataSpaceProbeLogged = false
             }
             applyOutputDataSpace()
+        }
+    }
+
+    fun outputDataSpaceForDiagnostics(): Int = currentOutputDataSpace
+
+    fun setSourceColorInfo(colorInfo: ColorInfo?) {
+        sourceColorInfo = colorInfo
+        runOnWorker("setSourceColorInfo") {
+            Log.i(TAG, "[HDR] inputColor=${colorInfo ?: "unknown"} outputDataSpace=$outputDataSpace")
         }
     }
 
@@ -1033,7 +1063,7 @@ class VideoFrameProcessor(
         val height = if (inputHeight > 0) inputHeight else FALLBACK_FRAME_HEIGHT
         return FrameInfo(
             Format.Builder()
-                .setColorInfo(ColorInfo.SDR_BT709_LIMITED)
+                .setColorInfo(sourceColorInfo ?: ColorInfo.SDR_BT709_LIMITED)
                 .setWidth(width)
                 .setHeight(height)
                 .build(),
@@ -1048,6 +1078,7 @@ class VideoFrameProcessor(
             media3Listener.onInputStreamRegistered(
                 Media3VideoFrameProcessor.INPUT_TYPE_SURFACE,
                 Format.Builder()
+                    .setColorInfo(frameInfo.format.colorInfo ?: sourceColorInfo ?: ColorInfo.SDR_BT709_LIMITED)
                     .setWidth(frameInfo.format.width)
                     .setHeight(frameInfo.format.height)
                     .build(),
@@ -1089,7 +1120,9 @@ class VideoFrameProcessor(
         cachedDenoised1Buf = null
         cachedOutBuf = null
         cachedMotionBuf = null
+        frameBufferPool.clear()
         cachedTargetSize = 0
+        rejectedTargetSize = 0
         readbackInProgress = false
 
         frameCountInput = 0
@@ -1494,6 +1527,10 @@ class VideoFrameProcessor(
             captureHeight != lastCaptureLogH ||
             resolution != lastCaptureLogRes
         ) {
+            if (maxOf(sourceWidth, sourceHeight) >= auto4kMinDim) {
+                Log.i(TAG, "4K source -> selected processing resolution ${captureWidth}x$captureHeight -> estimated RGBA memory ${captureWidth.toLong() * captureHeight * 4L * 13L} bytes")
+            }
+            frameBufferPool.clear()
             lastCaptureLogSrcW = sourceWidth
             lastCaptureLogSrcH = sourceHeight
             lastCaptureLogW = captureWidth
@@ -1523,6 +1560,11 @@ class VideoFrameProcessor(
         // decoder's BufferQueue actually experiences, so it is the number that has to reach the
         // frame interval for playback to keep up.
         timingStartNs = System.nanoTime()
+        if (timingCycles == 0 && diagnosticWindowStartNs == 0L) {
+            diagnosticWindowStartNs = timingStartNs
+            diagnosticOutputStartCount = submittedOutputFrameCount
+            droppedOutputAtWindowStart = droppedOutputFrameCount
+        }
         val tCaptureStart = timingStartNs
         val pixels = obtainFrameBuffer(captureWidth, captureHeight)
         val readOk = pixels.capacity() > 0 &&
@@ -2156,8 +2198,16 @@ class VideoFrameProcessor(
                 "captured=$captured dropped=$dropped " +
                 "in=${frameCountInput} out=$frameCountOutput rife=$isRifeEnabled"
         )
+        val sourceFps = if (lastPairIntervalUs > 0L) 1_000_000.0 / lastPairIntervalUs else 0.0
+        val windowSeconds = ((System.nanoTime() - diagnosticWindowStartNs).coerceAtLeast(1L)) / 1_000_000_000.0
+        val generatedFps = (submittedOutputFrameCount - diagnosticOutputStartCount) / windowSeconds
+        val droppedOutput = droppedOutputFrameCount - droppedOutputAtWindowStart
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} motionMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
 
         timingCycles = 0
+        diagnosticWindowStartNs = System.nanoTime()
+        diagnosticOutputStartCount = submittedOutputFrameCount
+        droppedOutputAtWindowStart = droppedOutputFrameCount
         nsReadback = 0
         nsCopy = 0
         nsChecksum = 0
@@ -2199,6 +2249,7 @@ class VideoFrameProcessor(
             return false
         }
         val requiredBytesInt = requiredBytes.toInt()
+        if (rejectedTargetSize == requiredBytesInt) return false
         val gridStep = NativeEngine.motionFieldStep()
         val gridW = (inputWidth + gridStep - 1) / gridStep
         val gridH = (inputHeight + gridStep - 1) / gridStep
@@ -2206,6 +2257,12 @@ class VideoFrameProcessor(
         // blend weight and its noise floor. Mirrors MemcInterpolator::motionFieldBytes(), which the
         // JNI side re-checks against the buffer capacity before it writes anything.
         val motionBytes = gridW.toLong() * gridH.toLong() * 8L
+        val estimatedMemory = requiredBytes * (5L + MAX_CAPTURE_FRAMES_BUDGETED) + motionBytes
+        if (estimatedMemory > FRAME_MEMORY_BUDGET_BYTES) {
+            rejectedTargetSize = requiredBytes.toInt()
+            Log.e(TAG, "Direct frame budget rejects ${inputWidth}x${inputHeight}: estimated=${estimatedMemory} budget=$FRAME_MEMORY_BUDGET_BYTES")
+            return false
+        }
         if (motionBytes > Int.MAX_VALUE) {
             Log.e(TAG, "ensureCachedBuffers: motion field $motionBytes overflows Int")
             return false
@@ -2217,12 +2274,24 @@ class VideoFrameProcessor(
             motionCapacity < motionBytes ||
             cachedTargetSize != requiredBytesInt
         ) {
-            cachedIn0Buf = ByteBuffer.allocateDirect(requiredBytesInt)
-            cachedIn1Buf = ByteBuffer.allocateDirect(requiredBytesInt)
-            cachedDenoised0Buf = ByteBuffer.allocateDirect(requiredBytesInt)
-            cachedDenoised1Buf = ByteBuffer.allocateDirect(requiredBytesInt)
-            cachedOutBuf = ByteBuffer.allocateDirect(requiredBytesInt)
-            cachedMotionBuf = ByteBuffer.allocateDirect(motionBytes.toInt())
+            try {
+                val in0 = ByteBuffer.allocateDirect(requiredBytesInt)
+                val in1 = ByteBuffer.allocateDirect(requiredBytesInt)
+                val den0 = ByteBuffer.allocateDirect(requiredBytesInt)
+                val den1 = ByteBuffer.allocateDirect(requiredBytesInt)
+                val out = ByteBuffer.allocateDirect(requiredBytesInt)
+                val motion = ByteBuffer.allocateDirect(motionBytes.toInt())
+                cachedIn0Buf = in0; cachedIn1Buf = in1
+                cachedDenoised0Buf = den0; cachedDenoised1Buf = den1
+                cachedOutBuf = out; cachedMotionBuf = motion
+            } catch (oom: OutOfMemoryError) {
+                cachedIn0Buf = null; cachedIn1Buf = null
+                cachedDenoised0Buf = null; cachedDenoised1Buf = null
+                cachedOutBuf = null; cachedMotionBuf = null; cachedTargetSize = 0
+                rejectedTargetSize = requiredBytesInt
+                Log.e(TAG, "Direct buffer allocation failed at ${inputWidth}x${inputHeight}; frame will bypass", oom)
+                return false
+            }
             cachedTargetSize = requiredBytesInt
             Log.i(
                 TAG,
@@ -2245,6 +2314,10 @@ class VideoFrameProcessor(
             return ByteBuffer.allocateDirect(0)
         }
         val intBytes = requiredBytes.toInt()
+        if (rejectedTargetSize == intBytes) {
+            droppedFrameCount++
+            return ByteBuffer.allocateDirect(0)
+        }
         while (true) {
             val pooled = frameBufferPool.poll() ?: break
             if (pooled.capacity() >= intBytes) {
@@ -2252,7 +2325,14 @@ class VideoFrameProcessor(
                 return pooled
             }
         }
-        return ByteBuffer.allocateDirect(intBytes)
+        return try {
+            ByteBuffer.allocateDirect(intBytes)
+        } catch (oom: OutOfMemoryError) {
+            droppedFrameCount++
+            rejectedTargetSize = intBytes
+            Log.e(TAG, "Capture allocation failed at ${width}x$height; suppressing repeat allocation", oom)
+            ByteBuffer.allocateDirect(0)
+        }
     }
 
     /**
@@ -2260,7 +2340,7 @@ class VideoFrameProcessor(
      * of every frame buffer, so nothing can still be reading it.
      */
     private fun releaseFrameBuffer(buffer: ByteBuffer?) {
-        if (buffer == null || frameBufferPool.size >= MAX_POOLED_FRAME_BUFFERS) {
+        if (buffer == null || frameBufferPool.size >= minOf(MAX_POOLED_FRAME_BUFFERS, 2)) {
             return
         }
         buffer.clear()
@@ -2334,15 +2414,17 @@ class VideoFrameProcessor(
     ) {
         // An encode can run before, or without, any preview surface being published, so the
         // encoder target counts as a legitimate destination here.
-        if (pendingOutputSurfaceInfo == null && encodeSurface == null) return
+        if (pendingOutputSurfaceInfo == null && encodeSurface == null) { droppedOutputFrameCount++; return }
         val surface = activeOutputSurface()
         if (surface == null || !surface.isValid) {
             Log.w(TAG, "renderBufferToOutput: no valid output surface; frame dropped")
+            droppedOutputFrameCount++
             return
         }
-        val renderer = outputRenderer ?: return
+        val renderer = outputRenderer ?: run { droppedOutputFrameCount++; return }
         if (!renderer.isInitialized) {
             Log.w(TAG, "renderBufferToOutput: renderer not initialized; frame dropped")
+            droppedOutputFrameCount++
             return
         }
 
@@ -2364,7 +2446,9 @@ class VideoFrameProcessor(
 
         try {
             renderer.render(pixels, width, height, timestampNs)
+            submittedOutputFrameCount++
         } catch (t: Throwable) {
+            droppedOutputFrameCount++
             Log.w(TAG, "Failed to render a frame to the output surface", t)
         }
     }
@@ -2429,7 +2513,29 @@ class VideoFrameProcessor(
             autoDegradeLevel = 0
         }
 
-        val (targetW, targetH) = calculateTargetDimensions(srcW, srcH, effective)
+        var (targetW, targetH) = calculateTargetDimensions(srcW, srcH, effective)
+        val targetBytes = targetW.toLong() * targetH.toLong() * 4L
+        val estimated = targetBytes * 13L
+        if (estimated > FRAME_MEMORY_BUDGET_BYTES) {
+            val safe = calculateTargetDimensions(srcW, srcH, RifeResolution.RES_1080P)
+            targetW = safe.first
+            targetH = safe.second
+            Log.w(TAG, "4K source -> selected processing resolution ${targetW}x$targetH -> estimated RGBA memory ${targetW.toLong() * targetH * 4L * 13L} bytes (requested ${estimated} bytes)")
+        }
+        val targetBytesInt = (targetW.toLong() * targetH * 4L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        if (rejectedTargetSize == targetBytesInt) {
+            val fallback = if (effective == RifeResolution.RES_480P) {
+                calculateTargetDimensions(srcW, srcH, RifeResolution.RES_480P)
+            } else {
+                val at720 = calculateTargetDimensions(srcW, srcH, RifeResolution.RES_720P)
+                if ((at720.first.toLong() * at720.second * 4L).toInt() == rejectedTargetSize) {
+                    calculateTargetDimensions(srcW, srcH, RifeResolution.RES_480P)
+                } else at720
+            }
+            targetW = fallback.first
+            targetH = fallback.second
+            Log.w(TAG, "Capture allocation fallback -> ${targetW}x$targetH after rejecting prior buffer size")
+        }
         val surfaceW = outputRenderer?.outputSurfaceWidth ?: 0
         val surfaceH = outputRenderer?.outputSurfaceHeight ?: 0
         if (surfaceW <= 0 || surfaceH <= 0) return Pair(targetW, targetH)

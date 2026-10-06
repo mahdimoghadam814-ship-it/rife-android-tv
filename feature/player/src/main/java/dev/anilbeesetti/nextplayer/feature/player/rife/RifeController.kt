@@ -1,6 +1,7 @@
 package dev.anilbeesetti.nextplayer.feature.player.rife
 
 import android.view.Surface
+import androidx.media3.common.ColorInfo
 import androidx.media3.common.SurfaceInfo
 import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import kotlinx.coroutines.flow.StateFlow
@@ -140,6 +141,9 @@ interface RifeController {
      * and therefore gets no dataspace from the platform, unlike the bypass path.
      */
     fun setOutputDataSpace(dataSpace: Int)
+
+    /** Source track colour metadata for processing and UDP encoder configuration. */
+    fun setSourceVideoColorInfo(colorInfo: ColorInfo?, sampleMimeType: String?, codecs: String?, frameRate: Float)
 
     /** Drops every buffered frame: seek, media transition, stream change. */
     fun consumeError(): String?

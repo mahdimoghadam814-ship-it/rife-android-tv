@@ -50,6 +50,9 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
         val maxBFrames: Int = 0,
         /** HDR10 signalling: BT.2020 primaries, ST2084 transfer, limited range. */
         val hdr10: Boolean = true,
+        val colorStandard: Int = MediaFormat.COLOR_STANDARD_BT2020,
+        val colorTransfer: Int = MediaFormat.COLOR_TRANSFER_ST2084,
+        val colorRange: Int = MediaFormat.COLOR_RANGE_LIMITED,
         val level: Int = MediaCodecInfo.CodecProfileLevel.HEVCMainTierLevel51,
         /** Codec to open when present; otherwise [pickCodec]'s best candidate is used. */
         val preferredCodec: String = PREFERRED_CODEC,
@@ -205,9 +208,9 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                 setInteger(MediaFormat.KEY_LATENCY, 0)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
                 if (config.hdr10) {
-                    setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT2020)
-                    setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_ST2084)
-                    setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                    setInteger(MediaFormat.KEY_COLOR_STANDARD, config.colorStandard)
+                    setInteger(MediaFormat.KEY_COLOR_TRANSFER, config.colorTransfer)
+                    setInteger(MediaFormat.KEY_COLOR_RANGE, config.colorRange)
                     config.hdrStaticInfo?.let { info ->
                         // Rewound so the codec reads the whole payload; Media3 hands these over at
                         // an arbitrary position.
@@ -215,9 +218,9 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                         setByteBuffer(MediaFormat.KEY_HDR_STATIC_INFO, info)
                     }
                 } else {
-                    setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
-                    setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
-                    setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_LIMITED)
+                    setInteger(MediaFormat.KEY_COLOR_STANDARD, config.colorStandard)
+                    setInteger(MediaFormat.KEY_COLOR_TRANSFER, config.colorTransfer)
+                    setInteger(MediaFormat.KEY_COLOR_RANGE, config.colorRange)
                 }
             }
             return format
@@ -315,6 +318,9 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
         }
     }
 
+    private fun MediaFormat.intOrUnknown(key: String): Int =
+        if (containsKey(key)) runCatching { getInteger(key) }.getOrDefault(-1) else -1
+
     private fun loop() {
         val info = MediaCodec.BufferInfo()
         var sawFormat = false
@@ -345,6 +351,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                     val f = c.outputFormat
                     sawFormat = true
                     Log.i(TAG, "output format: $f")
+                    Log.i(TAG, "[HDR] encoderFormat profile=${f.intOrUnknown(MediaFormat.KEY_PROFILE)} transfer=${f.intOrUnknown(MediaFormat.KEY_COLOR_TRANSFER)} primaries=${f.intOrUnknown(MediaFormat.KEY_COLOR_STANDARD)} range=${f.intOrUnknown(MediaFormat.KEY_COLOR_RANGE)}")
                     sink.onOutputFormat(f)
                 }
                 index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
@@ -369,6 +376,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                         val f = c.outputFormat
                         sawFormat = true
                         Log.i(TAG, "output format (late): $f")
+                        Log.i(TAG, "[HDR] encoderFormat profile=${f.intOrUnknown(MediaFormat.KEY_PROFILE)} transfer=${f.intOrUnknown(MediaFormat.KEY_COLOR_TRANSFER)} primaries=${f.intOrUnknown(MediaFormat.KEY_COLOR_STANDARD)} range=${f.intOrUnknown(MediaFormat.KEY_COLOR_RANGE)}")
                         sink.onOutputFormat(f)
                     }
                     if (info.size > 0) {

@@ -27,6 +27,7 @@ import java.util.concurrent.atomic.AtomicLong
 class UdpTsPacketSink(
     host: String,
     private val port: Int,
+    private val bitrateBps: Int = 0,
     private val maxDatagramBytes: Int = DEFAULT_DATAGRAM_BYTES,
     queueCapacity: Int = DEFAULT_QUEUE_CAPACITY,
 ) : TsPacketSink, Closeable {
@@ -54,6 +55,8 @@ class UdpTsPacketSink(
     private val datagramsSent = AtomicLong()
     private val bytesSent = AtomicLong()
     private val datagramsDropped = AtomicLong()
+    private val windowStartMs = System.currentTimeMillis()
+    @Volatile private var lastWindowLogMs = windowStartMs
 
     /** Consecutive send failures, so a dead receiver is visible without logging every packet. */
     @Volatile
@@ -68,10 +71,10 @@ class UdpTsPacketSink(
         repeat(queueCapacity) { free.add(Slot(ByteArray(maxDatagramBytes))) }
 
         senderThread = Thread({ sendLoop() }, "ts-udp-sender").also { it.start() }
-        Log.i(TAG, "streaming to $address:$port, $maxDatagramBytes bytes per datagram")
+        Log.i(TAG, "[UDP] host=$address port=$port bitrate=$bitrateBps bytesPerDatagram=$maxDatagramBytes; raw UDP has no remote pause/seek control")
     }
 
-    override fun onTsPacket(packet: ByteArray, length: Int) {
+    @Synchronized override fun onTsPacket(packet: ByteArray, length: Int) {
         if (!running) return
         if (length <= 0) return
         if (length % MpegTsMuxer.TS_PACKET_SIZE != 0) {
@@ -91,15 +94,28 @@ class UdpTsPacketSink(
     }
 
     /** Sends whatever is still in the staging buffer as a final, short datagram. */
-    fun flush() {
+    @Synchronized fun flush() {
         if (stagingLength > 0) emit()
     }
 
     private fun emit() {
         val slot = free.poll()
         if (slot == null) {
-            datagramsDropped.incrementAndGet()
+            discardOldestPending()
+            val reclaimed = free.poll()
+            if (reclaimed != null) {
+                System.arraycopy(staging, 0, reclaimed.buffer, 0, stagingLength)
+                reclaimed.length = stagingLength
+                stagingLength = 0
+                if (!pending.offer(reclaimed)) {
+                    reclaimed.length = 0
+                    free.offer(reclaimed)
+                    datagramsDropped.incrementAndGet()
+                }
+                return
+            }
             stagingLength = 0
+            datagramsDropped.incrementAndGet()
             return
         }
         System.arraycopy(staging, 0, slot.buffer, 0, stagingLength)
@@ -109,6 +125,23 @@ class UdpTsPacketSink(
             free.offer(slot)
             datagramsDropped.incrementAndGet()
         }
+    }
+
+    /** Clear packets produced before a seek/source discontinuity so they cannot trail the new frame. */
+    @Synchronized fun discardPending() {
+        stagingLength = 0
+        while (true) {
+            val slot = pending.poll() ?: break
+            slot.length = 0
+            free.offer(slot)
+        }
+    }
+
+    private fun discardOldestPending() {
+        val stale = pending.poll() ?: return
+        stale.length = 0
+        free.offer(stale)
+        datagramsDropped.incrementAndGet()
     }
 
     private fun sendLoop() {
@@ -124,6 +157,13 @@ class UdpTsPacketSink(
                 datagramsSent.incrementAndGet()
                 bytesSent.addAndGet(slot.length.toLong())
                 consecutiveFailures = 0
+                val now = System.currentTimeMillis()
+                if (now - lastWindowLogMs >= 5_000L) {
+                    val elapsed = (now - lastWindowLogMs).coerceAtLeast(1L)
+                    val rate = bytesSent.get() * 8.0 / ((now - windowStartMs).coerceAtLeast(1L) * 1000.0)
+                    Log.i(TAG, "[UDP] host=$address port=$port bitrate=$bitrateBps packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} dropped=${datagramsDropped.get()} windowMs=$elapsed")
+                    lastWindowLogMs = now
+                }
             } catch (interrupted: InterruptedException) {
                 Thread.currentThread().interrupt()
                 break
@@ -178,7 +218,7 @@ class UdpTsPacketSink(
          * instead of a stalled encoder, while not so large that a stalled link buffers minutes of
          * latency before anything gives.
          */
-        const val DEFAULT_QUEUE_CAPACITY = 512
+        const val DEFAULT_QUEUE_CAPACITY = 32
 
         /**
          * How long the sender parks between datagrams. Two milliseconds, not twenty: the whole

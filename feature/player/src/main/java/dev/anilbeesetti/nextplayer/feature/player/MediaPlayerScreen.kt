@@ -192,6 +192,8 @@ internal fun MediaPlayerContent(
     // out flat and milky. Read the source's transfer characteristic and tag the output with the
     // matching dataspace so the panel decodes it as HDR again.
     var outputDataSpace by remember { mutableIntStateOf(0) }
+    var sourceVideoFormat by remember { mutableStateOf<Triple<ColorInfo?, String?, String?>>(Triple(null, null, null)) }
+    var sourceFrameRate by remember { mutableStateOf(-1f) }
     // Source dimensions, reported by the same listener that publishes the colour metadata. The
     // encoder has to open at the size the processing stage draws, and this is the only place the
     // player hands that size to the UI.
@@ -205,9 +207,18 @@ internal fun MediaPlayerContent(
             Log.i(TAG, "Source output dataspace ($source): $detected")
             outputDataSpace = detected
         }
+        fun publishFormat(tracks: Tracks) {
+            val selected = tracks.groups.asSequence()
+                .filter { it.type == C.TRACK_TYPE_VIDEO }
+                .flatMap { group -> (0 until group.length).asSequence().filter(group::isTrackSelected).map(group::getTrackFormat) }
+                .firstOrNull()
+            sourceVideoFormat = Triple(selected?.colorInfo, selected?.sampleMimeType, selected?.codecs)
+            sourceFrameRate = selected?.frameRate ?: -1f
+        }
         val listener = object : Player.Listener {
             override fun onTracksChanged(tracks: Tracks) {
                 publish(tracks.outputDataSpace(), "tracks")
+                publishFormat(tracks)
             }
 
             // Tracks are only reported when they change, so a replay that reuses the same track
@@ -215,15 +226,20 @@ internal fun MediaPlayerContent(
             // signal that the colour metadata is now known.
             override fun onVideoSizeChanged(videoSize: VideoSize) {
                 publish(player.currentTracks.outputDataSpace(), "videoSize")
+                publishFormat(player.currentTracks)
                 clipSourceSize = videoSize.width to videoSize.height
             }
         }
         player.addListener(listener)
         publish(player.currentTracks.outputDataSpace(), "initial")
+        publishFormat(player.currentTracks)
         onDispose { player.removeListener(listener) }
     }
     LaunchedEffect(outputDataSpace) {
         rifeController.setOutputDataSpace(outputDataSpace)
+    }
+    LaunchedEffect(sourceVideoFormat, sourceFrameRate) {
+        rifeController.setSourceVideoColorInfo(sourceVideoFormat.first, sourceVideoFormat.second, sourceVideoFormat.third, sourceFrameRate)
     }
     LaunchedEffect(
         playerPreferences.rifeEnabled,

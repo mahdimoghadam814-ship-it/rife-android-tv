@@ -85,6 +85,7 @@ class PlayerActivity : ComponentActivity() {
     private var isIntentNew: Boolean = true
 
     private var mediaController by mutableStateOf<MediaController?>(null)
+    private var udpStreamingActive by mutableStateOf(false)
     private lateinit var playerApi: PlayerApi
     private var playbackRequestJob: Job? = null
 
@@ -173,6 +174,11 @@ class PlayerActivity : ComponentActivity() {
             val rifeInputSurface by rifeController.inputSurface.collectAsStateWithLifecycle()
             val rifeProcessingEnabled by rifeController.processingEnabled.collectAsStateWithLifecycle()
             val rifeErrorMessage by rifeController.error.collectAsStateWithLifecycle()
+            val udpStreaming by rifeController.udpEnabled.collectAsStateWithLifecycle()
+            LaunchedEffect(udpStreaming) {
+                udpStreamingActive = udpStreaming
+                updateKeepScreenOnFlag()
+            }
 
             // While a processing stage is enabled the decoder renders into the processor-owned
             // input surface instead of the PlayerSurface; the processed frames are rendered to the
@@ -472,6 +478,8 @@ class PlayerActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        udpStreamingActive = false
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         rifeController.stop()
         super.onDestroy()
     }
@@ -491,7 +499,7 @@ class PlayerActivity : ComponentActivity() {
     }
 
     private fun updateKeepScreenOnFlag() {
-        if (mediaController?.isPlaying == true) {
+        if (mediaController?.isPlaying == true || udpStreamingActive) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)

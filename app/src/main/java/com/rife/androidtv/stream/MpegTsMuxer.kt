@@ -6,6 +6,7 @@ import android.util.Log
 import com.rife.androidtv.encode.EncodedStreamSink
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
+import java.util.concurrent.locks.LockSupport
 
 /**
  * Where the muxer's finished 188-byte transport packets go.
@@ -117,6 +118,8 @@ class MpegTsMuxer(
     private var lastPtsUs = Long.MIN_VALUE
     private var fallbackActive = false
     private var unitsMuxed = 0L
+    private var paceAnchorPtsUs = Long.MIN_VALUE
+    private var paceAnchorNs = 0L
 
     override fun onOutputFormat(format: MediaFormat) {
         Log.i(TAG, "encoder format: $format")
@@ -157,7 +160,7 @@ class MpegTsMuxer(
         write(bytes)
     }
 
-    override fun onAccessUnit(data: ByteBuffer, info: MediaCodec.BufferInfo) {
+    @Synchronized override fun onAccessUnit(data: ByteBuffer, info: MediaCodec.BufferInfo) {
         if (info.size <= 0) return
 
         if ((info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
@@ -174,6 +177,7 @@ class MpegTsMuxer(
         data.duplicate().get(accessUnit)
 
         val ptsUs = nextPtsUs(info.presentationTimeUs)
+        paceToTimestamp(ptsUs)
         maybeWritePsi(ptsUs)
 
         val isKeyFrame = (info.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
@@ -199,6 +203,33 @@ class MpegTsMuxer(
 
         if ((info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
             Log.i(TAG, "end of stream after $unitsMuxed access units")
+        }
+    }
+
+    /** Re-anchor PTS and sender pacing after a seek; raw UDP cannot signal a remote seek command. */
+    @Synchronized fun resetForDiscontinuity() {
+        lastPtsUs = Long.MIN_VALUE
+        fallbackActive = false
+        lastPcr90 = Long.MIN_VALUE
+        lastPsiUs = Long.MIN_VALUE
+        paceAnchorPtsUs = Long.MIN_VALUE
+        paceAnchorNs = 0L
+        (output as? UdpTsPacketSink)?.discardPending()
+        Log.i(TAG, "stream timeline reset after discontinuity")
+    }
+
+    private fun paceToTimestamp(ptsUs: Long) {
+        if (paceAnchorPtsUs == Long.MIN_VALUE) {
+            paceAnchorPtsUs = ptsUs
+            paceAnchorNs = System.nanoTime()
+            return
+        }
+        val dueNs = paceAnchorNs + (ptsUs - paceAnchorPtsUs).coerceAtLeast(0L) * 1_000L
+        while (true) {
+            val remaining = dueNs - System.nanoTime()
+            if (remaining <= 0L) return
+            LockSupport.parkNanos(remaining)
+            if (Thread.currentThread().isInterrupted) return
         }
     }
 
