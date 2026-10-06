@@ -227,6 +227,7 @@ class RifeEngineController(
      */
     override fun setResolution(resolution: FeatureRifeResolution) {
         processor.resolution = RifeResolution.valueOf(resolution.name)
+        processor.invalidateProcessingSize()
     }
 
     /**
@@ -275,6 +276,7 @@ class RifeEngineController(
     override fun resetForDiscontinuity(reason: String) {
         processor.resetForNewStream(reason)
         activeMuxer?.resetForDiscontinuity()
+        encoder?.requestKeyFrame()
         // The block-matching pyramid holds state across frames; a seek/stream change invalidates it.
         NativeEngine.resetMemcState()
     }
@@ -307,12 +309,14 @@ class RifeEngineController(
     override fun startUdpStream(host: String, port: Int): Boolean {
         var sink: UdpTsPacketSink? = null
         try {
-            val (width, height) = getInputFrameSize()
-            if (width <= 0 || height <= 0) {
+            val (sourceWidth, sourceHeight) = getInputFrameSize()
+            val (width, height) = processor.currentProcessingSize()
+            if (sourceWidth <= 0 || sourceHeight <= 0 || width <= 0 || height <= 0) {
                 Log.w(TAG, "Cannot start UDP stream: input frame size not yet known")
                 return false
             }
-            val frameRate = processor.currentOutputFrameRate().roundToInt().coerceIn(1, 120)
+            val remoteOutputFps = processor.requestedRemoteOutputFrameRate()
+            val frameRate = remoteOutputFps.roundToInt().coerceIn(1, 60)
             val source = sourceColorInfo
             val dvProfile8 = sourceMimeType == "video/dolby-vision" &&
                 (sourceCodecs?.contains("dvhe.08", ignoreCase = true) == true || sourceCodecs?.contains("dvh1.08", ignoreCase = true) == true)
@@ -342,17 +346,34 @@ class RifeEngineController(
                 hdrStaticInfo = source?.hdrStaticInfo?.let { ByteBuffer.wrap(it) },
             )
             Log.i(TAG, "[HDR] inputColor=$source outputDataSpace=${processor.outputDataSpaceForDiagnostics()} encoderProfile=HEVCMain10 transfer=$transfer primaries=$standard range=$range")
-            val streamSink = UdpTsPacketSink(host, port, bitrateBps = config.effectiveBitrateBps())
+            val codecName = HdrHevcEncoder.pickCodec(config) ?: run {
+                Log.e(TAG, "No compatible HEVC encoder found for requested hdr10=$hdr10")
+                return false
+            }
+            processor.setRemoteOutputFrameRate(remoteOutputFps)
+            val profileName = if (hdr10) "HEVCProfileMain10HDR10" else "HEVCProfileMain10"
+            val streamSink = UdpTsPacketSink(
+                host = host,
+                port = port,
+                bitrateBps = config.effectiveBitrateBps(),
+                processingSize = "${width}x$height",
+                remoteOutputFps = remoteOutputFps,
+                encoderCodec = codecName,
+                encoderProfile = profileName,
+                droppedVideoFrames = processor::remoteDroppedOutputFrames,
+            )
             sink = streamSink
             if (!startEncoding(config, streamSink)) {
                 streamSink.close()
+                processor.setRemoteOutputFrameRate(0f)
                 Log.e(TAG, "Failed to start encoding for UDP stream")
                 return false
             }
             _udpSink = streamSink
             _udpRunning = true
             _udpEnabled.value = true
-            Log.i(TAG, "UDP streaming started to $host:$port at ${width}x$height@$frameRate")
+            Log.i(TAG, "[UDP] source=${sourceWidth}x$sourceHeight processing=${width}x$height encoder=${width}x$height sourceFps=${processor.currentSourceFrameRate()} requestedMultiplier=${processor.requestedInterpolationMultiplier()} remoteFps=$remoteOutputFps codec=$codecName/$profileName bitrate=${config.effectiveBitrateBps()} audio=unsupported subtitles=local-overlay-only")
+            Log.i(TAG, "UDP streaming started to $host:$port at ${width}x${height}@$frameRate")
             return true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start UDP streaming", e)
@@ -444,6 +465,7 @@ class RifeEngineController(
         activeMuxer = null
         encodeConfig = null
         processor.setEncodeSurface(null)
+        processor.setRemoteOutputFrameRate(0f)
         val eos = running.signalEndOfStream()
         val units = encodedUnits.get()
         val bytes = encodedBytes.get()

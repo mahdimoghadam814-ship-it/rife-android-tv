@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Bundle
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
@@ -183,6 +184,13 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
         fun pickCodec(config: Config): String? {
             val caps = capabilities()
             if (caps.isEmpty()) return null
+            if (config.hdr10) {
+                val hdrCandidates = caps.filter { it.main10Hdr10 }
+                hdrCandidates.firstOrNull { it.name == config.preferredCodec && it.hdrEditing }?.let { return it.name }
+                hdrCandidates.firstOrNull { it.hdrEditing }?.let { return it.name }
+                hdrCandidates.firstOrNull { it.name == config.preferredCodec }?.let { return it.name }
+                return hdrCandidates.firstOrNull()?.name
+            }
             caps.firstOrNull { it.name == config.preferredCodec }?.let { return it.name }
             return caps.firstOrNull()?.name
         }
@@ -200,7 +208,11 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                 setInteger(MediaFormat.KEY_BIT_RATE, config.effectiveBitrateBps())
                 setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.iFrameIntervalSec)
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
+                setInteger(
+                    MediaFormat.KEY_PROFILE,
+                    if (config.hdr10) MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10
+                    else MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10
+                )
                 setInteger(MediaFormat.KEY_LEVEL, config.level)
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, config.maxBFrames)
                 // Realtime, zero-latency: without these the codec is free to buffer frames and add
@@ -235,6 +247,8 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
     private var input: Surface? = null
 
     private var config: Config? = null
+    @Volatile var selectedCodecName: String? = null
+        private set
 
     /** The drain thread, read by [signalEndOfStream] outside the monitor, so it must be volatile. */
     @Volatile
@@ -255,6 +269,17 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
     val isRunning: Boolean
         get() = codec != null
 
+    fun requestKeyFrame(): Boolean {
+        return try {
+            val active = codec ?: return false
+            active.setParameters(Bundle().apply { putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0) })
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not request an IDR after stream discontinuity", t)
+            false
+        }
+    }
+
     /**
      * Opens the codec and returns the surface frames must be drawn into, or null on failure.
      * Safe to call from any thread, but the returned surface is an ordinary [Surface] and the
@@ -272,11 +297,15 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
             return null
         }
         val format = buildFormat(requested)
+        val hdrEditing = capabilities().firstOrNull { it.name == name }?.hdrEditing == true
+        if (requested.hdr10 && hdrEditing) format.setFeatureEnabled(MediaCodecInfo.CodecCapabilities.FEATURE_HdrEditing, true)
         Log.i(
             TAG,
             "opening $name for ${requested.width}x${requested.height}@${requested.frameRate} " +
                 "bitrate=${requested.effectiveBitrateBps()} hdr10=${requested.hdr10} " +
-                "profile=Main10 level=${requested.level}"
+                "profile=${format.getInteger(MediaFormat.KEY_PROFILE)} level=${requested.level} " +
+                "colorStandard=${requested.colorStandard} transfer=${requested.colorTransfer} " +
+                "range=${requested.colorRange} staticHdr=${requested.hdrStaticInfo != null} hdrEditing=$hdrEditing"
         )
         val created = try {
             MediaCodec.createByCodecName(name)
@@ -293,6 +322,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
             codec = created
             input = surface
             config = requested
+            selectedCodecName = name
             startDrain(name)
             return surface
         } catch (t: Throwable) {
@@ -320,6 +350,17 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
 
     private fun MediaFormat.intOrUnknown(key: String): Int =
         if (containsKey(key)) runCatching { getInteger(key) }.getOrDefault(-1) else -1
+
+    private fun logOutputFormat(format: MediaFormat) {
+        val profile = format.intOrUnknown(MediaFormat.KEY_PROFILE)
+        val transfer = format.intOrUnknown(MediaFormat.KEY_COLOR_TRANSFER)
+        val standard = format.intOrUnknown(MediaFormat.KEY_COLOR_STANDARD)
+        val range = format.intOrUnknown(MediaFormat.KEY_COLOR_RANGE)
+        val level = format.intOrUnknown(MediaFormat.KEY_LEVEL)
+        val hdr10Confirmed = profile == MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10HDR10 &&
+            standard == MediaFormat.COLOR_STANDARD_BT2020 && transfer == MediaFormat.COLOR_TRANSFER_ST2084
+        Log.i(TAG, "[HDR] output codec=$selectedCodecName profile=$profile level=$level colorStandard=$standard colorTransfer=$transfer colorRange=$range hdr10Confirmed=$hdr10Confirmed staticHdr=${format.containsKey(MediaFormat.KEY_HDR_STATIC_INFO)}")
+    }
 
     private fun loop() {
         val info = MediaCodec.BufferInfo()
@@ -351,7 +392,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                     val f = c.outputFormat
                     sawFormat = true
                     Log.i(TAG, "output format: $f")
-                    Log.i(TAG, "[HDR] encoderFormat profile=${f.intOrUnknown(MediaFormat.KEY_PROFILE)} transfer=${f.intOrUnknown(MediaFormat.KEY_COLOR_TRANSFER)} primaries=${f.intOrUnknown(MediaFormat.KEY_COLOR_STANDARD)} range=${f.intOrUnknown(MediaFormat.KEY_COLOR_RANGE)}")
+                    logOutputFormat(f)
                     sink.onOutputFormat(f)
                 }
                 index == MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
@@ -376,7 +417,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                         val f = c.outputFormat
                         sawFormat = true
                         Log.i(TAG, "output format (late): $f")
-                        Log.i(TAG, "[HDR] encoderFormat profile=${f.intOrUnknown(MediaFormat.KEY_PROFILE)} transfer=${f.intOrUnknown(MediaFormat.KEY_COLOR_TRANSFER)} primaries=${f.intOrUnknown(MediaFormat.KEY_COLOR_STANDARD)} range=${f.intOrUnknown(MediaFormat.KEY_COLOR_RANGE)}")
+                        logOutputFormat(f)
                         sink.onOutputFormat(f)
                     }
                     if (info.size > 0) {
@@ -447,6 +488,7 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
         }
         input?.release()
         input = null
+        selectedCodecName = null
         config = null
         Log.i(TAG, "encoder closed")
     }

@@ -97,6 +97,9 @@ class PlayerActivity : ComponentActivity() {
 
         override fun onIsPlayingChanged(isPlaying: Boolean) {
             updateKeepScreenOnFlag()
+            if (rifeController.udpEnabled.value) {
+                rifeController.resetForDiscontinuity(if (isPlaying) "udp_resume" else "udp_pause")
+            }
         }
 
         override fun onVideoSizeChanged(videoSize: VideoSize) {

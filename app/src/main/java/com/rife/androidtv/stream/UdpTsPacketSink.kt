@@ -28,6 +28,11 @@ class UdpTsPacketSink(
     host: String,
     private val port: Int,
     private val bitrateBps: Int = 0,
+    private val processingSize: String = "unknown",
+    private val remoteOutputFps: Float = 0f,
+    private val encoderCodec: String = "unknown",
+    private val encoderProfile: String = "unknown",
+    private val droppedVideoFrames: () -> Long = { 0L },
     private val maxDatagramBytes: Int = DEFAULT_DATAGRAM_BYTES,
     queueCapacity: Int = DEFAULT_QUEUE_CAPACITY,
 ) : TsPacketSink, Closeable {
@@ -57,6 +62,7 @@ class UdpTsPacketSink(
     private val datagramsDropped = AtomicLong()
     private val windowStartMs = System.currentTimeMillis()
     @Volatile private var lastWindowLogMs = windowStartMs
+    @Volatile private var lastWindowBytesSent = 0L
 
     /** Consecutive send failures, so a dead receiver is visible without logging every packet. */
     @Volatile
@@ -71,7 +77,7 @@ class UdpTsPacketSink(
         repeat(queueCapacity) { free.add(Slot(ByteArray(maxDatagramBytes))) }
 
         senderThread = Thread({ sendLoop() }, "ts-udp-sender").also { it.start() }
-        Log.i(TAG, "[UDP] host=$address port=$port bitrate=$bitrateBps bytesPerDatagram=$maxDatagramBytes; raw UDP has no remote pause/seek control")
+        Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=unsupported(no-compressed-sample-tap) subtitles=local-overlay-only queue=${pending.size} droppedVideo=${droppedVideoFrames()} bytesPerDatagram=$maxDatagramBytes; raw UDP has no remote pause/seek control")
     }
 
     @Synchronized override fun onTsPacket(packet: ByteArray, length: Int) {
@@ -160,8 +166,10 @@ class UdpTsPacketSink(
                 val now = System.currentTimeMillis()
                 if (now - lastWindowLogMs >= 5_000L) {
                     val elapsed = (now - lastWindowLogMs).coerceAtLeast(1L)
-                    val rate = bytesSent.get() * 8.0 / ((now - windowStartMs).coerceAtLeast(1L) * 1000.0)
-                    Log.i(TAG, "[UDP] host=$address port=$port bitrate=$bitrateBps packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} dropped=${datagramsDropped.get()} windowMs=$elapsed")
+                    val totalBytes = bytesSent.get()
+                    val rate = (totalBytes - lastWindowBytesSent).coerceAtLeast(0L) * 8.0 / (elapsed * 1000.0)
+                    lastWindowBytesSent = totalBytes
+                    Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=unsupported subtitles=local-overlay-only packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} droppedVideo=${droppedVideoFrames()} droppedPackets=${datagramsDropped.get()} windowMs=$elapsed")
                     lastWindowLogMs = now
                 }
             } catch (interrupted: InterruptedException) {

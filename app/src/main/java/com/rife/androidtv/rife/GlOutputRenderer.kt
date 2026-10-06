@@ -385,6 +385,17 @@ class GlOutputRenderer {
     private var context: EGLContext? = null
     private var windowSurface: EGLSurface? = null
     private var outputSurface: Surface? = null
+    private var mirrorSurface: Surface? = null
+    private var mirrorEglSurface: EGLSurface? = null
+    private var mirrorTexture = 0
+    private var mirrorTextureWidth = 0
+    private var mirrorTextureHeight = 0
+    private var mirrorWidth = 0
+    private var mirrorHeight = 0
+    private var remoteDroppedFrameCount = 0L
+    val droppedRemoteFrames: Long get() = remoteDroppedFrameCount
+    @Volatile private var remoteFrameIntervalNs = 0L
+    private var nextRemotePresentationNs = Long.MIN_VALUE
     private var surfaceWidth = 0
     private var surfaceHeight = 0
 
@@ -400,6 +411,7 @@ class GlOutputRenderer {
 
     val outputSurfaceHeight: Int
         get() = surfaceHeight
+    val mirrorOutputSurface: Surface? get() = mirrorSurface
 
     /**
      * Accumulated nanoseconds per phase of [render], in order: eglMakeCurrent (+ surface resize),
@@ -738,6 +750,35 @@ class GlOutputRenderer {
         )
     }
 
+    /** Adds a preview consumer while the primary window is the encoder input Surface. */
+    fun setMirrorOutputSurface(surface: Surface?) {
+        val eglDisplay = display ?: return
+        if (surface == mirrorSurface && mirrorEglSurface != null) return
+        releaseMirrorSurface()
+        mirrorSurface = surface
+        if (surface == null || !surface.isValid) return
+        val config = activeConfig ?: return
+        val egl = EGL14.eglCreateWindowSurface(eglDisplay, config, surface, intArrayOf(EGL14.EGL_NONE), 0)
+        if (egl == null || egl == EGL14.EGL_NO_SURFACE) {
+            Log.w(TAG, "Could not create preview mirror EGL surface: 0x${EGL14.eglGetError().toString(16)}")
+            mirrorSurface = null
+            return
+        }
+        mirrorEglSurface = egl
+        val w = IntArray(1); val h = IntArray(1)
+        if (EGL14.eglQuerySurface(eglDisplay, egl, EGL14.EGL_WIDTH, w, 0) &&
+            EGL14.eglQuerySurface(eglDisplay, egl, EGL14.EGL_HEIGHT, h, 0)
+        ) { mirrorWidth = w[0]; mirrorHeight = h[0] }
+        nextRemotePresentationNs = Long.MIN_VALUE
+        Log.i(TAG, "Preview mirror active ${mirrorWidth}x$mirrorHeight")
+    }
+
+    /** Timestamp ceiling for the encoder output only; zero leaves encoder submissions uncapped. */
+    fun setRemoteOutputFrameRate(frameRate: Float) {
+        remoteFrameIntervalNs = if (frameRate.isFinite() && frameRate > 0f) (1_000_000_000.0 / frameRate).toLong() else 0L
+        nextRemotePresentationNs = Long.MIN_VALUE
+    }
+
     /** The config the current [windowSurface] was created from; null before the first success. */
     private var activeConfig: EGLConfig? = null
 
@@ -848,14 +889,93 @@ class GlOutputRenderer {
      * the swap, with the surface current - which is exactly where every render path ends up.
      */
     private fun swapBuffers(eglDisplay: EGLDisplay, eglSurface: EGLSurface, label: String) {
-        if (outputTimestampNs != 0L) {
-            EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, outputTimestampNs)
+        val mirror = mirrorEglSurface
+        if (mirror != null && mirrorSurface?.isValid == true) {
+            ensureMirrorTexture()
         }
-        val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
-        val swapError = EGL14.eglGetError()
-        if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
-            Log.d(TAG, "eglSwapBuffers ($label): result=$swapResult error=0x${swapError.toString(16)}")
+        if (mirror != null && mirrorSurface?.isValid == true && mirrorTexture != 0) {
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mirrorTexture)
+            if (mirrorTextureWidth != surfaceWidth || mirrorTextureHeight != surfaceHeight) {
+                GLES20.glCopyTexImage2D(GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA, 0, 0, surfaceWidth, surfaceHeight, 0)
+                mirrorTextureWidth = surfaceWidth
+                mirrorTextureHeight = surfaceHeight
+            } else {
+                GLES20.glCopyTexSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, 0, 0, surfaceWidth, surfaceHeight)
+            }
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
         }
+
+        val interval = remoteFrameIntervalNs
+        val submitPrimary = interval <= 0L || outputTimestampNs == 0L ||
+            nextRemotePresentationNs == Long.MIN_VALUE || outputTimestampNs >= nextRemotePresentationNs
+        if (!submitPrimary) remoteDroppedFrameCount++
+        if (submitPrimary) {
+            if (outputTimestampNs != 0L) EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, outputTimestampNs)
+            val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
+            val swapError = EGL14.eglGetError()
+            if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
+                Log.d(TAG, "eglSwapBuffers ($label): result=$swapResult error=0x${swapError.toString(16)}")
+            }
+            if (interval > 0L && outputTimestampNs != 0L) {
+                if (nextRemotePresentationNs == Long.MIN_VALUE) nextRemotePresentationNs = outputTimestampNs + interval
+                else while (nextRemotePresentationNs <= outputTimestampNs) nextRemotePresentationNs += interval
+            }
+        }
+
+        if (mirror != null && mirrorTexture != 0 && mirrorWidth > 0 && mirrorHeight > 0 &&
+            EGL14.eglMakeCurrent(eglDisplay, mirror, mirror, context)
+        ) {
+            GLES20.glViewport(0, 0, mirrorWidth, mirrorHeight)
+            GLES20.glClearColor(0f, 0f, 0f, 1f)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            GLES20.glUseProgram(program)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mirrorTexture)
+            GLES20.glUniform1i(uTextureHandle, 0)
+            val srcAspect = mirrorTextureWidth.toFloat() / mirrorTextureHeight.coerceAtLeast(1)
+            val dstAspect = mirrorWidth.toFloat() / mirrorHeight.coerceAtLeast(1)
+            val scaleX = if (srcAspect > dstAspect) 1f else srcAspect / dstAspect
+            val scaleY = if (srcAspect > dstAspect) dstAspect / srcAspect else 1f
+            GLES20.glUniform2f(uContentScaleHandle, scaleX, scaleY)
+            vertexBuffer.position(0)
+            GLES20.glEnableVertexAttribArray(aPositionHandle)
+            GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+            texCoordBuffer.position(0)
+            GLES20.glEnableVertexAttribArray(aTextureCoordHandle)
+            GLES20.glVertexAttribPointer(aTextureCoordHandle, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+            GLES20.glDisableVertexAttribArray(aPositionHandle)
+            GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            if (outputTimestampNs != 0L) EGLExt.eglPresentationTimeANDROID(eglDisplay, mirror, outputTimestampNs)
+            EGL14.eglSwapBuffers(eglDisplay, mirror)
+            EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, context)
+        }
+    }
+
+    private fun releaseMirrorSurface() {
+        val eglDisplay = display
+        val egl = mirrorEglSurface
+        if (eglDisplay != null && egl != null && egl != EGL14.EGL_NO_SURFACE) {
+            EGL14.eglDestroySurface(eglDisplay, egl)
+        }
+        mirrorEglSurface = null
+        mirrorSurface = null
+        mirrorWidth = 0; mirrorHeight = 0
+        mirrorTextureWidth = 0; mirrorTextureHeight = 0
+    }
+
+    private fun ensureMirrorTexture() {
+        if (mirrorTexture != 0) return
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        mirrorTexture = ids[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, mirrorTexture)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
     }
 
     /**
@@ -1743,6 +1863,11 @@ class GlOutputRenderer {
      * [VideoFrameProcessor] and is deleted there while it is still current.
      */
     fun release() {
+        releaseMirrorSurface()
+        if (mirrorTexture != 0) {
+            GLES20.glDeleteTextures(1, intArrayOf(mirrorTexture), 0)
+            mirrorTexture = 0
+        }
         releaseWindowSurface()
         if (textureId != 0) {
             GLES20.glDeleteTextures(1, intArrayOf(textureId), 0)

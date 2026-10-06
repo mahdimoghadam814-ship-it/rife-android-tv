@@ -336,6 +336,31 @@ class VideoFrameProcessor(
         (1_000_000.0 / lastPairIntervalUs.toDouble() * memcLevelMultiplier).toFloat()
     } else 60f
 
+    fun requestedRemoteOutputFrameRate(): Float = currentOutputFrameRate().coerceAtMost(60f)
+    fun requestedInterpolationMultiplier(): Float = memcLevelMultiplier
+    fun currentProcessingSize(): Pair<Int, Int> {
+        if (processingWidth > 0 && processingHeight > 0) return processingWidth to processingHeight
+        val sourceW = inputWidth
+        val sourceH = inputHeight
+        if (sourceW <= 0 || sourceH <= 0) return 0 to 0
+        val effective = if (resolution == RifeResolution.AUTO) autoResolution(sourceW, sourceH) else resolution
+        var size = calculateTargetDimensions(sourceW, sourceH, effective)
+        if (size.first.toLong() * size.second * 4L * 13L > FRAME_MEMORY_BUDGET_BYTES) {
+            size = calculateTargetDimensions(sourceW, sourceH, RifeResolution.RES_1080P)
+        }
+        val surfaceW = outputRenderer?.outputSurfaceWidth ?: 0
+        val surfaceH = outputRenderer?.outputSurfaceHeight ?: 0
+        if (surfaceW > 0 && surfaceH > 0) size = fitWithin(size.first, size.second, surfaceW, surfaceH)
+        return size
+    }
+    fun invalidateProcessingSize() { processingWidth = 0; processingHeight = 0 }
+    fun currentSourceFrameRate(): Float = sourceFrameRateHint.takeIf { it > 0f }
+        ?: if (lastPairIntervalUs > 0L) 1_000_000f / lastPairIntervalUs else 0f
+    fun remoteDroppedOutputFrames(): Long = outputRenderer?.droppedRemoteFrames ?: 0L
+    fun setRemoteOutputFrameRate(frameRate: Float) {
+        runOnWorker("setRemoteOutputFrameRate") { outputRenderer?.setRemoteOutputFrameRate(frameRate) }
+    }
+
     /**
      * Interpolation ratio: how many output frames are synthesised per source frame. Two is one
      * interpolated frame between each pair, which is what the pipeline did before the level was
@@ -369,6 +394,8 @@ class VideoFrameProcessor(
     private var lastCaptureLogSrcH = -1
     private var lastCaptureLogW = 0
     private var lastCaptureLogH = 0
+    @Volatile private var processingWidth = 0
+    @Volatile private var processingHeight = 0
     private var lastCaptureLogRes: RifeResolution? = null
 
     /**
@@ -616,6 +643,7 @@ class VideoFrameProcessor(
         }
         inputWidth = width
         inputHeight = height
+        invalidateProcessingSize()
         Log.i(TAG, "Input frame size updated: ${width}x$height")
 
         // A resolution change invalidates anything already buffered, and the SurfaceTexture has to
@@ -774,6 +802,8 @@ class VideoFrameProcessor(
                 Log.i(TAG, "Output surface released")
                 if (encodeSurface == null) {
                     outputRenderer?.setOutputSurface(display, null)
+                } else {
+                    outputRenderer?.setMirrorOutputSurface(null)
                 }
             } else {
                 Log.i(
@@ -785,6 +815,9 @@ class VideoFrameProcessor(
                 // the renderer over to it mid-encode would tear the stream in half.
                 if (encodeSurface == null) {
                     outputRenderer?.setOutputSurface(display, outputSurfaceInfo.surface)
+                    applyOutputDataSpace()
+                } else {
+                    outputRenderer?.setMirrorOutputSurface(outputSurfaceInfo.surface)
                     applyOutputDataSpace()
                 }
             }
@@ -812,8 +845,11 @@ class VideoFrameProcessor(
                 else "Encode target set: ${target?.javaClass?.simpleName}"
             )
             if (target == null || !target.isValid) {
+                outputRenderer?.setMirrorOutputSurface(null)
                 outputRenderer?.setOutputSurface(display, null)
             } else {
+                if (surface == null) outputRenderer?.setMirrorOutputSurface(null)
+                else outputRenderer?.setMirrorOutputSurface(pendingOutputSurfaceInfo?.surface)
                 outputRenderer?.setOutputSurface(display, target)
                 applyOutputDataSpace()
             }
@@ -893,6 +929,7 @@ class VideoFrameProcessor(
             rc == 0 -> Unit
             else -> Log.w(TAG, "setOutputDataSpace($want) failed: ${dataSpaceError(rc)}")
         }
+        outputRenderer?.mirrorOutputSurface?.takeIf { it.isValid }?.let { NativeEngine.setOutputDataSpace(it, want) }
     }
 
     /**
@@ -1520,6 +1557,8 @@ class VideoFrameProcessor(
         val (captureWidth, captureHeight) = resolveCaptureDimensions(sourceWidth, sourceHeight)
         autoCaptureW = captureWidth
         autoCaptureH = captureHeight
+        processingWidth = captureWidth
+        processingHeight = captureHeight
 
         if (sourceWidth != lastCaptureLogSrcW ||
             sourceHeight != lastCaptureLogSrcH ||

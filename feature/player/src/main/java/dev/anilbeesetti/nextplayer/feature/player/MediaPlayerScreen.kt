@@ -208,6 +208,16 @@ internal fun MediaPlayerContent(
             outputDataSpace = detected
         }
         fun publishFormat(tracks: Tracks) {
+            val audio = tracks.groups.asSequence()
+                .filter { it.type == C.TRACK_TYPE_AUDIO }
+                .flatMap { group -> (0 until group.length).asSequence().filter(group::isTrackSelected).map(group::getTrackFormat) }
+                .firstOrNull()
+            val subtitleTracks = tracks.groups.asSequence()
+                .filter { it.type == C.TRACK_TYPE_TEXT }
+                .flatMap { group -> (0 until group.length).asSequence().map(group::getTrackFormat) }
+                .map { "${it.sampleMimeType ?: "unknown"}:${it.language ?: "und"}" }
+                .toList()
+            Log.i(TAG, "[UDP] sourceAudio=${audio?.sampleMimeType ?: "none"} audioMode=unsupported(no-compressed-sample-tap) subtitleTracks=${subtitleTracks.ifEmpty { listOf("none") }} subtitleMode=local-overlay-only")
             val selected = tracks.groups.asSequence()
                 .filter { it.type == C.TRACK_TYPE_VIDEO }
                 .flatMap { group -> (0 until group.length).asSequence().filter(group::isTrackSelected).map(group::getTrackFormat) }
