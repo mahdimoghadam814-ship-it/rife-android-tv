@@ -313,6 +313,10 @@ internal fun MediaPlayerContent(
             // comes up for the rest of the session (the keys above do not change again).
             var attempts = 0
             while (isActive && attempts < 60) {
+                // ExoPlayer is application-looper confined; snapshot its values before hopping
+                // to IO for the blocking encoder/socket startup.
+                val mediaUri = player.currentMediaItem?.localConfiguration?.uri
+                val startPositionMs = player.currentPosition
                 // Codec creation, extractor probing, socket setup and EGL surface handoff can
                 // block. LaunchedEffect runs on Main by default, so keep all of that work off the
                 // UI thread even when interpolation itself is disabled.
@@ -320,8 +324,8 @@ internal fun MediaPlayerContent(
                     rifeController.startUdpStream(
                         playerPreferences.udpStreamingHost,
                         playerPreferences.udpStreamingPort,
-                        player.currentMediaItem?.localConfiguration?.uri,
-                        player.currentPosition,
+                        mediaUri,
+                        startPositionMs,
                     )
                 }
                 if (started) break
