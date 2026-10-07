@@ -2935,7 +2935,7 @@ class VideoFrameProcessor(
         }
 
         try {
-            renderer.isHdr = isHdrMemcSource()
+            renderer.isHdr = isHdrSource()
             renderer.render(pixels, width, height, timestampNs)
             submittedOutputFrameCount++
         } catch (t: Throwable) {

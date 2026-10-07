@@ -267,12 +267,27 @@ private const val WARP_FRAGMENT_SHADER = """
             uniform vec2 uMotionGrid;
             uniform vec2 uMotionOffset;
             uniform float uHasHistory;
+            uniform int uIsHdr;
             // Multiplier on the history blend, from the denoise level. It scales how strongly a
             // pixel may be replaced by its own motion-compensated counterpart - the similarity
             // gate below still rejects the moment the two frames disagree by more than their own
             // noise does, so turning it up merges more of what agrees and does not soften what
             // does not.
             uniform float uStrength;
+
+            // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
+            vec3 linearToPQ(vec3 linear) {
+                const float m1 = 2610.0 / 4096.0;
+                const float m2 = 2523.0 / 4096.0 * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 4096.0 * 32.0;
+                const float c3 = 2392.0 / 4096.0 * 32.0;
+                vec3 cp = pow(max(linear, vec3(0.0)), vec3(m1));
+                vec3 numerator = vec3(c1) + vec3(c2) * cp;
+                vec3 denominator = vec3(1.0) + vec3(c3) * cp;
+                return pow(numerator / denominator, vec3(m2));
+            }
+
             void main() {
                 // The quad's V runs opposite to framebuffer row order: the vertex at the top of the
                 // viewport carries v = 0 but lands in framebuffer row height-1. Sampling at
@@ -298,6 +313,9 @@ private const val WARP_FRAGMENT_SHADER = """
                         float gate = 1.0 - clamp((d - 2.0 * f) / (3.0 * f), 0.0, 1.0);
                         merged = mix(cur, his, clamp(w * gate * uStrength, 0.0, 1.0));
                     }
+                }
+                if (uIsHdr != 0) {
+                    merged = linearToPQ(merged);
                 }
                 gl_FragColor = vec4(merged, 1.0);
             }
@@ -410,6 +428,7 @@ private const val WARP_FRAGMENT_SHADER = """
     private var denUMotionOffset = -1
     private var denUHasHistory = -1
     private var denUStrength = -1
+    private var denUIsHdr = -1
 
     /** The frame being denoised, uploaded once per call. Kept separate from the warp's pair. */
     private var denCurrentTex = 0
@@ -717,11 +736,13 @@ private const val WARP_FRAGMENT_SHADER = """
         denUMotionOffset = GLES20.glGetUniformLocation(newProgram, "uMotionOffset")
         denUHasHistory = GLES20.glGetUniformLocation(newProgram, "uHasHistory")
         denUStrength = GLES20.glGetUniformLocation(newProgram, "uStrength")
+        denUIsHdr = GLES20.glGetUniformLocation(newProgram, "uIsHdr")
         if (denDPosition < 0 || denDTexCoord < 0 || denUContentScale < 0 ||
             denUCurrent < 0 || denUHistory < 0 || denUMotion < 0 || denUMask < 0 ||
             denUTargetSize < 0 || denUMotionGrid < 0 || denUMotionOffset < 0 ||
             denUHasHistory < 0 ||
-            denUStrength < 0
+            denUStrength < 0 ||
+            denUIsHdr < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
             Log.w(TAG, "denoise program is missing a location; the stage keeps its own path")
@@ -1539,6 +1560,7 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glUniform2f(denUMotionOffset, motionOffset, motionOffset)
         GLES20.glUniform1f(denUHasHistory, if (src != 0) 1.0f else 0.0f)
         GLES20.glUniform1f(denUStrength, denoiseStrength)
+        GLES20.glUniform1i(denUIsHdr, if (isHdr) 1 else 0)
         // Always full frame: this pass writes a texture, it does not letterbox into a surface, so
         // it must not touch contentScaleX/Y - the present that follows shares those two.
         GLES20.glUniform2f(denUContentScale, 1.0f, 1.0f)
@@ -1826,6 +1848,7 @@ private const val WARP_FRAGMENT_SHADER = """
 
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
+        GLES20.glUniform1i(uIsHdrHandle, if (isHdr) 1 else 0)
 
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
