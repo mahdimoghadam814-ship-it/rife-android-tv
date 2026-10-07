@@ -81,7 +81,7 @@ class UdpTsPacketSink(
         repeat(queueCapacity) { free.add(Slot(ByteArray(maxDatagramBytes))) }
 
         senderThread = Thread({ sendLoop() }, "ts-udp-sender").also { it.start() }
-        Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=local-overlay-only queue=${pending.size} droppedVideo=${droppedVideoFrames()} bytesPerDatagram=$maxDatagramBytes; raw UDP has no remote pause/seek control")
+        Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=DVB-when-supported queue=${pending.size} droppedVideo=${droppedVideoFrames()} bytesPerDatagram=$maxDatagramBytes; raw UDP has no remote pause/seek control")
     }
 
     @Synchronized override fun onTsPacket(packet: ByteArray, length: Int) {
@@ -173,7 +173,7 @@ class UdpTsPacketSink(
                     val totalBytes = bytesSent.get()
                     val rate = (totalBytes - lastWindowBytesSent).coerceAtLeast(0L) * 8.0 / (elapsed * 1000.0)
                     lastWindowBytesSent = totalBytes
-                    Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=local-overlay-only packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} droppedVideo=${droppedVideoFrames()} droppedPackets=${datagramsDropped.get()} windowMs=$elapsed")
+                    Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=DVB-when-supported packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} droppedVideo=${droppedVideoFrames()} droppedPackets=${datagramsDropped.get()} windowMs=$elapsed")
                     lastWindowLogMs = now
                 }
             } catch (interrupted: InterruptedException) {

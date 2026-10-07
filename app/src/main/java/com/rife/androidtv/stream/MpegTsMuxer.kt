@@ -20,11 +20,12 @@ fun interface TsPacketSink {
 
 /**
  * Phase E/F: MPEG-TS muxing of the encoder's H.265 access units, plus the source's compressed
- * E-AC-3 track once [AudioPassthroughFeeder] supplies it.
+ * E-AC-3 audio and supported DVB subtitle tracks once their passthrough feeders supply them.
  *
  * ```
  * HdrHevcEncoder -> MpegTsMuxer -> TsPacketSink (file or UDP)
  * AudioPassthroughFeeder ------>/
+ * DvbSubtitlePassthroughFeeder ->/
  * ```
  *
  * What is emitted, per 188-byte packet:
@@ -79,6 +80,9 @@ class MpegTsMuxer(
          */
         const val STREAM_TYPE_AAC_ADTS = 0x0F
 
+        /** DVB subtitling carried as private PES with stream_type 0x06. */
+        const val STREAM_TYPE_DVB_SUBTITLE = 0x06
+
         private const val VIDEO_STREAM_ID = 0xE0
 
         /**
@@ -131,6 +135,7 @@ class MpegTsMuxer(
 
     private val packet = ByteArray(TS_PACKET_SIZE)
     private val sectionBuffer = ByteArray(64)
+    private val subtitlePid = 0x0102
 
     /** One PES packet, header and payload, reused across frames so 4K does not churn the heap. */
     private var pesBuffer = ByteArray(64 * 1024)
@@ -173,6 +178,12 @@ class MpegTsMuxer(
     /** True once the PMT must advertise the audio elementary stream. */
     @Volatile private var hasAudio = false
     private var lastAudioPtsUs = Long.MIN_VALUE
+    private var hasSubtitle = false
+    private var subtitleLanguage = "und"
+    private var subtitleType = 0x10
+    private var subtitleCompositionPageId = 0
+    private var subtitleAncillaryPageId = 0
+    private var lastSubtitlePtsUs = Long.MIN_VALUE
 
     /**
      * Codec of the stream that will be put on [audioPid], as declared by the feeder. Both the
@@ -190,6 +201,17 @@ class MpegTsMuxer(
         audioStreamType = streamType
         audioStreamId = streamId
         Log.i(TAG, "audio format: stream_type=0x${streamType.toString(16)} pes_stream_id=0x${streamId.toString(16)}")
+    }
+
+    /** Declares only a source DVB subtitle stream; unsupported text codecs are never advertised. */
+    fun setDvbSubtitleFormat(language: String, type: Int, compositionPageId: Int, ancillaryPageId: Int) {
+        subtitleLanguage = language.takeIf {
+            it.length == 3 && it.all { ch -> ch in 'a'..'z' || ch in 'A'..'Z' }
+        } ?: "und"
+        subtitleType = type and 0xFF
+        subtitleCompositionPageId = compositionPageId and 0xFFFF
+        subtitleAncillaryPageId = ancillaryPageId and 0xFFFF
+        Log.i(TAG, "DVB subtitle declared: language=$subtitleLanguage type=0x${subtitleType.toString(16)}")
     }
 
     override fun onOutputFormat(format: MediaFormat) {
@@ -336,6 +358,27 @@ class MpegTsMuxer(
         writePes(pesBuffer, header.size + data.size, withPcr = false, toTicks(ptsUs), audioPid, discontinuity = false)
     }
 
+    /** Muxes one DVB subtitle segment sample, preserving its original timing and segment bytes. */
+    @Synchronized fun onDvbSubtitleAccessUnit(data: ByteArray, rawPtsUs: Long) {
+        if (data.isEmpty() || data.size + 10 > 0xFFFF) return
+        val ptsUs = if (lastSubtitlePtsUs == Long.MIN_VALUE || rawPtsUs > lastSubtitlePtsUs) rawPtsUs
+        else lastSubtitlePtsUs + 1L
+        lastSubtitlePtsUs = ptsUs
+        hasSubtitle = true
+        maybeWritePsi(ptsUs)
+        // DVB EN 300 743 PES prefix: data_identifier in the DVB subtitling range, stream id 0.
+        val payload = ByteArray(data.size + 2)
+        payload[0] = 0x20
+        payload[1] = 0x00
+        System.arraycopy(data, 0, payload, 2, data.size)
+        val header = buildPesHeader(ptsUs, AUDIO_STREAM_ID, payload.size + 8)
+        val needed = header.size + payload.size
+        if (pesBuffer.size < needed) pesBuffer = ByteArray(needed)
+        System.arraycopy(header, 0, pesBuffer, 0, header.size)
+        System.arraycopy(payload, 0, pesBuffer, header.size, payload.size)
+        writePes(pesBuffer, needed, withPcr = false, toTicks(ptsUs), subtitlePid, discontinuity = false)
+    }
+
     /**
      * Re-anchor PTS and sender pacing after a seek; raw UDP cannot signal a remote seek command.
      * Also closes the stream until the next key frame ([dropUntilKeyFrame]) so the encoder's
@@ -356,6 +399,7 @@ class MpegTsMuxer(
         lastVideoPtsUs = Long.MIN_VALUE
         anchorGeneration = -1
         lastAudioPtsUs = Long.MIN_VALUE
+        lastSubtitlePtsUs = Long.MIN_VALUE
         (output as? UdpTsPacketSink)?.discardPending()
         Log.i(TAG, "stream timeline reset after discontinuity (generation=$timelineGeneration)")
     }
@@ -539,6 +583,21 @@ class MpegTsMuxer(
                 section[n++] = 0xF0.toByte() // ES_info_length = 0 (AAC ADTS)
                 section[n++] = 0x00.toByte()
             }
+        }
+        if (hasSubtitle) {
+            section[n++] = STREAM_TYPE_DVB_SUBTITLE.toByte()
+            section[n++] = (0xE0 or ((subtitlePid shr 8) and 0x1F)).toByte()
+            section[n++] = (subtitlePid and 0xFF).toByte()
+            section[n++] = 0xF0.toByte()
+            section[n++] = 0x0A.toByte() // descriptor total: tag + len + eight payload bytes
+            section[n++] = 0x59.toByte() // subtitling_descriptor
+            section[n++] = 0x08.toByte()
+            subtitleLanguage.forEach { section[n++] = it.code.toByte() }
+            section[n++] = subtitleType.toByte()
+            section[n++] = (subtitleCompositionPageId shr 8).toByte()
+            section[n++] = subtitleCompositionPageId.toByte()
+            section[n++] = (subtitleAncillaryPageId shr 8).toByte()
+            section[n++] = subtitleAncillaryPageId.toByte()
         }
         patchSectionLength(section, n)
         n = appendCrc(section, n)

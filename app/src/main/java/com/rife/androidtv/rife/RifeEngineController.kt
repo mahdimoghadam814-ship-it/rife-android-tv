@@ -18,6 +18,7 @@ import com.rife.androidtv.VulkanCapabilities
 import com.rife.androidtv.encode.EncodedStreamSink
 import com.rife.androidtv.encode.HdrHevcEncoder
 import com.rife.androidtv.stream.AudioPassthroughFeeder
+import com.rife.androidtv.stream.DvbSubtitlePassthroughFeeder
 import com.rife.androidtv.stream.FilePacketSink
 import com.rife.androidtv.stream.MpegTsMuxer
 import com.rife.androidtv.stream.TsPacketSink
@@ -288,6 +289,7 @@ class RifeEngineController(
         // The block-matching pyramid holds state across frames; a seek/stream change invalidates it.
         NativeEngine.resetMemcState()
         audioFeeder?.onDiscontinuity(positionMs)
+        subtitleFeeder?.onDiscontinuity(positionMs)
     }
 
     /**
@@ -311,6 +313,22 @@ class RifeEngineController(
     /** Phase F: taps the source container's audio track and gates it onto the muxed video timeline. */
     @Volatile
     private var audioFeeder: AudioPassthroughFeeder? = null
+    @Volatile private var subtitleFeeder: DvbSubtitlePassthroughFeeder? = null
+
+    private fun startSubtitleFeeder(mediaUri: Uri, startPositionMs: Long): Boolean {
+        stopSubtitleFeeder()
+        val muxer = activeMuxer ?: return false
+        val feeder = DvbSubtitlePassthroughFeeder(context, mediaUri, startPositionMs, muxer)
+        if (!feeder.start()) return false
+        subtitleFeeder = feeder
+        return true
+    }
+
+    private fun stopSubtitleFeeder() {
+        val feeder = subtitleFeeder ?: return
+        subtitleFeeder = null
+        feeder.stop()
+    }
 
     private fun startAudioFeeder(mediaUri: Uri, startPositionMs: Long) {
         stopAudioFeeder()
@@ -333,13 +351,11 @@ class RifeEngineController(
      * size; the encoder's frames go through [MpegTsMuxer] into the UDP sink, and [mediaUri]'s
      * E-AC-3 or AAC-LC track is muxed alongside when the container has one.
      *
-     * Two things this deliberately does not carry, and why:
+     * Subtitles are carried only when the source contains a standards-compatible DVB bitmap track;
+     * unsupported text/bitmap formats remain a local overlay and are never burned into video.
+     * Raw UDP still cannot carry remote pause/seek control:
      *
-     *  * **Subtitles** stay a local overlay. The only transports raw TS has are DVB/teletext
-     *    bitmap pages (stream_type 0x06 with a subtitling descriptor) or 608/708 captions folded
-     *    into the video SEI - both need a new encoder-side pipeline and a receiver that renders
-     *    them, and neither can be verified without the device on the other end.
-     *  * **Remote pause/seek** need a receiver that speaks back. This app only *sends*; the box
+     *  * Remote pause/seek need a receiver that speaks back. This app only *sends*; the box
      *    plays the stream in a third-party player, so there is no process on the far side to
      *    receive a control datagram. Locally, a seek is already fast because
      *    [MpegTsMuxer.resetForDiscontinuity] drops to the next key frame on request.
@@ -425,10 +441,12 @@ class RifeEngineController(
             _udpTargetPort = port
             _udpTargetUri = mediaUri
             _udpEnabled.value = true
-            Log.i(TAG, "[UDP] source=${sourceWidth}x$sourceHeight processing=${width}x$height encoder=${width}x$height sourceFps=${processor.currentSourceFrameRate()} requestedMultiplier=${processor.requestedInterpolationMultiplier()} remoteFps=$remoteOutputFps codec=$codecName/$profileName bitrate=${config.effectiveBitrateBps()} subtitles=local-overlay-only")
+            Log.i(TAG, "[UDP] source=${sourceWidth}x$sourceHeight processing=${width}x$height encoder=${width}x$height sourceFps=${processor.currentSourceFrameRate()} requestedMultiplier=${processor.requestedInterpolationMultiplier()} remoteFps=$remoteOutputFps codec=$codecName/$profileName bitrate=${config.effectiveBitrateBps()} subtitles=DVB-if-supported")
             // Phase F: parallel extractor that muxes the source's E-AC-3 track as-is.
             if (mediaUri != null) {
                 startAudioFeeder(mediaUri, startPositionMs)
+                val subtitleSupported = startSubtitleFeeder(mediaUri, startPositionMs)
+                Log.i(TAG, "[UDP] subtitleMode=${if (subtitleSupported) "DVB-separate-PID" else "local-overlay-only (unsupported source codec)"}")
             } else {
                 Log.i(TAG, "[UDP] no media uri; streaming video-only (audio=unsupported)")
             }
@@ -457,6 +475,7 @@ Log.e(TAG, "Failed to start UDP streaming", e)
         _udpSink = null
         _udpEnabled.value = false
         stopAudioFeeder()
+        stopSubtitleFeeder()
         stopEncoding() // Stops the encoder and closes the muxer/sink
         Log.i(TAG, "UDP streaming stopped")
     }
