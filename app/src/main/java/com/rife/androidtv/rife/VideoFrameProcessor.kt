@@ -1885,8 +1885,26 @@ class VideoFrameProcessor(
                         }
                     }
                 ) {
-                    // The owner thread is gone. Do not return buffers to its non-thread-safe pool;
-                    // allowing the two direct buffers to be collected is safer than racing release.
+                    // handler.post failed (handler null or looper gone): fall back to synchronous
+                    // processing on the owner thread to avoid a permanent stall. The motion field
+                    // is already computed; just process the pair directly.
+                    try {
+                        if (released || generation != streamGeneration) {
+                            if (previousFrame === prev) previousFrame = null
+                            releaseFrameBuffer(prev.pixels)
+                            releaseFrameBuffer(nextFrame.pixels)
+                        } else {
+                            processFramePair(prev, nextFrame, prepared)
+                        }
+                    } finally {
+                        val stillCurrent = inFlightPair?.first === prev &&
+                            inFlightPair?.second === nextFrame
+                        if (stillCurrent) {
+                            inFlightPair = null
+                            pairProcessing = false
+                            if (!released) processNextFramePair()
+                        }
+                    }
                 }
             }
             return
@@ -2128,7 +2146,9 @@ class VideoFrameProcessor(
         var src1Buf = in1Buf
         val gpuDenoiseWanted = !isHdrMemcSource() && fastDvdNetEngine.isEnabled &&
             outputRenderer?.isDenoiseInitialized == true
-        if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted) {
+        // Skip CPU denoise for HDR MEMC sources: the HDR composition path uses retained
+        // FP16 source textures directly, and CPU denoise would destroy HDR precision.
+        if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted && !isHdrMemcSource()) {
             val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(
                 in0Buf,
                 rifeInputW,

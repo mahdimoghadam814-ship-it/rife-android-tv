@@ -17,8 +17,10 @@ import com.rife.androidtv.DeviceProfile
 import com.rife.androidtv.VulkanCapabilities
 import com.rife.androidtv.encode.EncodedStreamSink
 import com.rife.androidtv.encode.HdrHevcEncoder
+import com.rife.androidtv.stream.AudioFallbackFeeder
 import com.rife.androidtv.stream.AudioPassthroughFeeder
 import com.rife.androidtv.stream.DvbSubtitlePassthroughFeeder
+import com.rife.androidtv.stream.SubtitleFallbackFeeder
 import com.rife.androidtv.stream.FilePacketSink
 import com.rife.androidtv.stream.MpegTsMuxer
 import com.rife.androidtv.stream.TsPacketSink
@@ -289,7 +291,9 @@ class RifeEngineController(
         // The block-matching pyramid holds state across frames; a seek/stream change invalidates it.
         NativeEngine.resetMemcState()
         audioFeeder?.onDiscontinuity(positionMs)
+        audioFallbackFeeder?.onDiscontinuity(positionMs)
         subtitleFeeder?.onDiscontinuity(positionMs)
+        subtitleFallbackFeeder?.onDiscontinuity(positionMs)
     }
 
     /**
@@ -313,21 +317,35 @@ class RifeEngineController(
     /** Phase F: taps the source container's audio track and gates it onto the muxed video timeline. */
     @Volatile
     private var audioFeeder: AudioPassthroughFeeder? = null
-    @Volatile private var subtitleFeeder: DvbSubtitlePassthroughFeeder? = null
+    @Volatile
+    private var audioFallbackFeeder: AudioFallbackFeeder? = null
+    @Volatile
+    private var subtitleFeeder: DvbSubtitlePassthroughFeeder? = null
+    @Volatile
+    private var subtitleFallbackFeeder: SubtitleFallbackFeeder? = null
 
     private fun startSubtitleFeeder(mediaUri: Uri, startPositionMs: Long): Boolean {
         stopSubtitleFeeder()
         val muxer = activeMuxer ?: return false
         val feeder = DvbSubtitlePassthroughFeeder(context, mediaUri, startPositionMs, muxer)
-        if (!feeder.start()) return false
-        subtitleFeeder = feeder
-        return true
+        if (feeder.start()) {
+            subtitleFeeder = feeder
+            return true
+        }
+        // Fallback: encode text subtitles to DVB bitmap
+        val fallback = SubtitleFallbackFeeder(context, mediaUri, startPositionMs, muxer)
+        if (fallback.start()) {
+            subtitleFallbackFeeder = fallback
+            return true
+        }
+        return false
     }
 
     private fun stopSubtitleFeeder() {
-        val feeder = subtitleFeeder ?: return
+        subtitleFeeder?.stop()
         subtitleFeeder = null
-        feeder.stop()
+        subtitleFallbackFeeder?.stop()
+        subtitleFallbackFeeder = null
     }
 
     private fun startAudioFeeder(mediaUri: Uri, startPositionMs: Long) {
@@ -336,13 +354,21 @@ class RifeEngineController(
         val feeder = AudioPassthroughFeeder(context, mediaUri, startPositionMs, muxer)
         if (feeder.start()) {
             audioFeeder = feeder
+            return
+        }
+        // Fallback: decode and re-encode to E-AC-3 5.1
+        val fallback = AudioFallbackFeeder(context, mediaUri, startPositionMs, muxer)
+        if (fallback.start()) {
+            audioFallbackFeeder = fallback
+            Log.i(TAG, "using audio fallback encoder (E-AC-3 5.1)")
         }
     }
 
     private fun stopAudioFeeder() {
-        val feeder = audioFeeder ?: return
+        audioFeeder?.stop()
         audioFeeder = null
-        feeder.stop()
+        audioFallbackFeeder?.stop()
+        audioFallbackFeeder = null
     }
 
     /**
