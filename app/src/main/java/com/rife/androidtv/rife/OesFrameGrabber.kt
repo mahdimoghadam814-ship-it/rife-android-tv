@@ -72,8 +72,29 @@ class OesFrameGrabber {
     private var copyPosition = -1
     private var copyTexCoord = -1
     private var copyTexture = -1
+    private var lastRefusalLogNs = 0L
     val isAsyncReadbackSupported: Boolean get() = pboSupported
     val isHdrSourceSupported: Boolean get() = hdrSourceSupported
+
+    /** Compact ring/lease summary so a silent capture stall is readable from a single log line. */
+    fun readbackState(): String =
+        "pbo=$pboSupported pending=${pendingPbos.size}/${pboSlots.size} " +
+            "hdrLeases=${hdrSourceSlots.count { it.inUse }}/${hdrSourceSlots.size} " +
+            "hdrTex=${hdrSourceSlots.count { it.textureId != 0 }} copy=$copyProgram"
+
+    /**
+     * Every `false` from [enqueueReadback] discards a decoded frame, so a persistent failure would
+     * blank playback with no other symptom. Rate-limited to one line per second so the reason stays
+     * visible without contributing to the per-frame log flood.
+     */
+    private fun refuse(reason: String): Boolean {
+        val nowNs = System.nanoTime()
+        if (nowNs - lastRefusalLogNs >= 1_000_000_000L) {
+            lastRefusalLogNs = nowNs
+            Log.w(TAG, "Readback refused: $reason; ${readbackState()}")
+        }
+        return false
+    }
 
     companion object {
         private const val TAG = "OesFrameGrabber"
@@ -257,9 +278,13 @@ class OesFrameGrabber {
         timestampUs: Long,
         retainHdrSource: Boolean = false,
     ): Boolean {
-        if (!pboSupported || width <= 0 || height <= 0) return false
+        if (!pboSupported || width <= 0 || height <= 0) {
+            return refuse("unsupported pbo=$pboSupported size=${width}x$height")
+        }
         val bytesLong = width.toLong() * height.toLong() * 4L
-        if (bytesLong <= 0L || bytesLong > Int.MAX_VALUE) return false
+        if (bytesLong <= 0L || bytesLong > Int.MAX_VALUE) {
+            return refuse("size overflow ${width}x$height")
+        }
         val bytes = bytesLong.toInt()
         if (pboBytes != bytes) {
             releasePbos()
@@ -273,21 +298,25 @@ class OesFrameGrabber {
                 return false
             }
         }
-        val slot = pboSlots.firstOrNull { it.info == null } ?: return false
+        val slot = pboSlots.firstOrNull { it.info == null }
+            ?: return refuse("pbo ring full")
         var sourceTextureId = 0
         if (retainHdrSource) {
-            if (!hdrSourceSupported || !ensureHdrSources(width, height)) return false
-            val source = hdrSourceSlots.firstOrNull { !it.inUse } ?: return false
+            if (!hdrSourceSupported || !ensureHdrSources(width, height)) {
+                return refuse("hdr sources unsupported=$hdrSourceSupported allocated=${hdrWidth}x$hdrHeight")
+            }
+            val source = hdrSourceSlots.firstOrNull { !it.inUse }
+                ?: return refuse("hdr source leases exhausted")
             source.inUse = true
             sourceTextureId = source.textureId
             if (!drawOesToFramebuffer(surfaceTexture, width, height, hdrFramebuffer, sourceTextureId) ||
                 !copyHdrToAnalysis(sourceTextureId, width, height)
             ) {
                 releaseSourceTexture(sourceTextureId)
-                return false
+                return refuse("hdr oes draw/copy")
             }
         } else if (!drawOesToFbo(surfaceTexture, width, height)) {
-            return false
+            return refuse("oes draw")
         }
         return try {
             GlUtil.schedulePixelBufferRead(fbo, width, height, slot.id)
@@ -302,6 +331,27 @@ class OesFrameGrabber {
             releaseSourceTexture(sourceTextureId)
             false
         }
+    }
+
+    /**
+     * Attempts to enqueue a readback. If the readback ring is stuck (all PBOs pending or HDR
+     * leases exhausted), clears the stuck state and retries once. This prevents a permanent
+     * capture blackout when the pipeline hits a transient resource exhaustion.
+     */
+    fun enqueueReadbackWithRecovery(
+        surfaceTexture: SurfaceTexture,
+        width: Int,
+        height: Int,
+        timestampUs: Long,
+        retainHdrSource: Boolean = false,
+    ): Boolean {
+        val queued = enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource)
+        if (!queued) {
+            // The ring/leases are stuck. Discard everything and try once more.
+            discardPendingReadbacks()
+            return enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource)
+        }
+        return true
     }
 
     fun nextReadbackInfo(): ReadbackFrameInfo? = pendingPbos.peekFirst()?.info

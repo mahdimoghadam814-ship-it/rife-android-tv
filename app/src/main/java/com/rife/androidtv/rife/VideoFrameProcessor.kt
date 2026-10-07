@@ -326,6 +326,7 @@ class VideoFrameProcessor(
     private var cachedOutBuf: ByteBuffer? = null
     private var cachedTargetSize = 0
     private var rejectedTargetSize = 0
+    private var lastMemoryBudgetLogNs = 0L
 
     /**
      * Packed motion field for the GPU warp: four bytes per 16x16 block, so a few kilobytes even
@@ -1760,7 +1761,7 @@ class VideoFrameProcessor(
             return
         }
         if (grabber.isAsyncReadbackSupported) {
-            val queued = grabber.enqueueReadback(
+            val queued = grabber.enqueueReadbackWithRecovery(
                 texture,
                 captureWidth,
                 captureHeight,
@@ -2939,7 +2940,11 @@ class VideoFrameProcessor(
             val safe = calculateTargetDimensions(srcW, srcH, RifeResolution.RES_1080P)
             targetW = safe.first
             targetH = safe.second
-            Log.w(TAG, "4K source -> selected processing resolution ${targetW}x$targetH -> estimated RGBA memory ${targetW.toLong() * targetH * 4L * 13L} bytes (requested ${estimated} bytes)")
+            val nowNs = System.nanoTime()
+            if (nowNs - lastMemoryBudgetLogNs >= 1_000_000_000L) {
+                lastMemoryBudgetLogNs = nowNs
+                Log.w(TAG, "4K source -> selected processing resolution ${targetW}x${targetH} -> estimated RGBA memory ${targetW.toLong() * targetH * 4L * 13L} bytes (requested ${estimated} bytes)")
+            }
         }
         val targetBytesInt = (targetW.toLong() * targetH * 4L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         if (rejectedTargetSize == targetBytesInt) {

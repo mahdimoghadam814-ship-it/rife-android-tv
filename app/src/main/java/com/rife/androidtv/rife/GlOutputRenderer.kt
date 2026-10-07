@@ -62,8 +62,23 @@ class GlOutputRenderer {
             #endif
             varying vec2 vTextureCoord;
             uniform sampler2D uTexture;
+
+            // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
+            vec3 linearToPQ(vec3 linear) {
+                const float m1 = 2610.0 / 4096.0;
+                const float m2 = 2523.0 / 4096.0 * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 4096.0 * 32.0;
+                const float c3 = 2392.0 / 4096.0 * 32.0;
+                vec3 cp = pow(max(linear, vec3(0.0)), vec3(m1));
+                vec3 numerator = vec3(c1) + vec3(c2) * cp;
+                vec3 denominator = vec3(1.0) + vec3(c3) * cp;
+                return pow(numerator / denominator, vec3(m2));
+            }
+
             void main() {
-                gl_FragColor = texture2D(uTexture, vTextureCoord);
+                vec3 color = texture2D(uTexture, vTextureCoord).rgb;
+                gl_FragColor = vec4(linearToPQ(color), 1.0);
             }
         """
 
@@ -119,7 +134,7 @@ class GlOutputRenderer {
          * to 2 by `NativeEngine.motionFieldBlendMode()` so that picking a different renderer
          * cannot move it.
          */
-        private const val WARP_FRAGMENT_SHADER = """
+private const val WARP_FRAGMENT_SHADER = """
             #ifdef GL_FRAGMENT_PRECISION_HIGH
             precision highp float;
             #else
@@ -143,10 +158,25 @@ class GlOutputRenderer {
             vec3 median3(vec3 a, vec3 b, vec3 c) {
                 return a + b + c - min(min(a, b), c) - max(max(a, b), c);
             }
+
+            // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
+            vec3 linearToPQ(vec3 linear) {
+                const float m1 = 2610.0 / 4096.0;
+                const float m2 = 2523.0 / 4096.0 * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 4096.0 * 32.0;
+                const float c3 = 2392.0 / 4096.0 * 32.0;
+                vec3 cp = pow(max(linear, vec3(0.0)), vec3(m1));
+                vec3 numerator = vec3(c1) + vec3(c2) * cp;
+                vec3 denominator = vec3(1.0) + vec3(c3) * cp;
+                return pow(numerator / denominator, vec3(m2));
+            }
+
             void main() {
                 vec2 p = vTextureCoord * uTargetSize - 0.5;
                 vec2 g = (p + uMotionOffset) / uMotionGrid;
                 vec4 mv = texture2D(uMotion, g);
+
                 vec2 mvf = (mv.rg * 255.0 - 128.0) * 0.5;
                 vec2 mvb = (mv.ba * 255.0 - 128.0) * 0.5;
                 vec2 pa = p - mvf * uTimestep;
@@ -188,10 +218,9 @@ class GlOutputRenderer {
                     }
                     blended = mix(termF, termB, uTimestep);
                 }
-                gl_FragColor = vec4(blended, 1.0);
+                gl_FragColor = vec4(linearToPQ(blended), 1.0);
             }
         """
-
         /**
          * Temporal denoiser: merge the frame being decoded into the history the previous call
          * produced, sampled where the motion field says that content has moved to.
@@ -1668,22 +1697,76 @@ class GlOutputRenderer {
         timesteps: FloatArray,
         timestamps: LongArray = LongArray(0)
     ): Boolean {
+        if (timesteps.isEmpty()) return false
+        if (!bindWindow(eglDisplay, eglSurface, context!!)) return false
+
+        // One-time setup for all timesteps: bind textures, upload static uniforms
+        GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
+        GLES20.glUseProgram(warpProgram)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frame0)
+        GLES20.glUniform1i(warpUFrame0, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, frame1)
+        GLES20.glUniform1i(warpUFrame1, 1)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMotionTex)
+        GLES20.glUniform1i(warpUMotion, 2)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE3)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, warpMaskTex)
+        GLES20.glUniform1i(warpUMask, 3)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+
+        GLES20.glUniform2f(warpUTargetSize, targetWidth.toFloat(), targetHeight.toFloat())
+        GLES20.glUniform2f(
+            warpUMotionGrid, (gridW * warpGridStep).toFloat(), (gridH * warpGridStep).toFloat()
+        )
+        val motionOffset = motionOffsetFor(warpGridStep)
+        GLES20.glUniform2f(warpUMotionOffset, motionOffset, motionOffset)
+        GLES20.glUniform1i(warpUBlendMode, warpBlendMode)
+
+        updateContentScale(targetWidth, targetHeight, surfaceWidth, surfaceHeight)
+        GLES20.glUniform2f(warpUContentScale, contentScaleX, contentScaleY)
+
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(warpAPosition)
+        GLES20.glVertexAttribPointer(warpAPosition, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(warpATexCoord)
+        GLES20.glVertexAttribPointer(warpATexCoord, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+
+        GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
+
+        // Per-timestep: only update timestep uniform, draw, swap
         for (index in timesteps.indices) {
             val timestep = timesteps[index]
             if (timestep < 0.0f || timestep > 1.0f) {
+                GLES20.glDisableVertexAttribArray(warpAPosition)
+                GLES20.glDisableVertexAttribArray(warpATexCoord)
                 return false
             }
             if (timestamps.isNotEmpty() && index < timestamps.size) {
                 outputTimestampNs = timestamps[index]
             }
-            val ok = drawWarp(
-                eglDisplay, eglSurface, frame0, frame1, srcWidth, srcHeight,
-                targetWidth, targetHeight, gridW, gridH, timestep
-            )
-            if (!ok) {
-                return false
+
+            GLES20.glUniform1f(warpUTimestep, timestep)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+
+            val error = GLES20.glGetError()
+            if (error != GLES20.GL_NO_ERROR) {
+                Log.e(TAG, "Warp blit failed with GL error 0x${error.toString(16)}")
             }
+
+            swapBuffers(eglDisplay, eglSurface, "warp")
+            renderCalls++
+            warpDrawCalls++
         }
+
+        GLES20.glDisableVertexAttribArray(warpAPosition)
+        GLES20.glDisableVertexAttribArray(warpATexCoord)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
         return true
     }
 
