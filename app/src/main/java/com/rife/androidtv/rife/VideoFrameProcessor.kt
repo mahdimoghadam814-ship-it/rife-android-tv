@@ -288,6 +288,18 @@ class VideoFrameProcessor(
         val elapsedNs: Long
     )
 
+    /** In-flight work item: motion computed, waiting for render on worker thread. */
+    private data class InFlightWork(
+        val prev: FrameData,
+        val next: FrameData,
+        val prepared: PreparedMotion,
+        val generation: Long,
+        val timestamps: LongArray,
+    )
+
+    /** Queue of work items whose motion is done, waiting for worker to render. */
+    private val pendingRenderQueue = ArrayDeque<InFlightWork>()
+
     private var previousFrame: FrameData? = null
 
     fun setInterpolationAlgorithmOrdinal(ordinal: Int) {
@@ -991,12 +1003,12 @@ class VideoFrameProcessor(
         }
     }
 
-    private fun isHdrMemcSource(): Boolean =
-        isRifeEnabled && interpolationAlgorithmOrdinal in 1..2 &&
-            ColorInfo.isTransferHdr(sourceColorInfo)
-
     /** True when the current source is HDR (PQ or HLG), regardless of interpolation state. */
     private fun isHdrSource(): Boolean = ColorInfo.isTransferHdr(sourceColorInfo)
+
+    /** True when HDR source AND MEMC/SVPlayer algorithm is active (for algorithm-specific decisions). */
+    private fun isHdrMemcSource(): Boolean =
+        isRifeEnabled && interpolationAlgorithmOrdinal in 1..2 && isHdrSource()
 
     /**
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
@@ -1259,6 +1271,16 @@ class VideoFrameProcessor(
         var discarded = 0
         streamGeneration++
         frameGrabber?.discardPendingReadbacks()
+
+        // Clean up pending render queue (motion done, waiting for render)
+        while (true) {
+            val work = pendingRenderQueue.removeFirstOrNull() ?: break
+            releaseFrameBuffer(work.prev.pixels)
+            releaseFrameBuffer(work.next.pixels)
+            discarded++
+        }
+
+        // Clean up in-flight pair (motion submitted, not yet done)
         val reservedPrevious = inFlightPair?.first
         if (inFlightPair == null) pairProcessing = false
         previousFrame?.let {
@@ -1753,7 +1775,7 @@ class VideoFrameProcessor(
         }
         val tCaptureStart = timingStartNs
         val timestampUs = texture.timestamp / 1000L
-        val retainHdrSource = isHdrMemcSource()
+        val retainHdrSource = isHdrSource()
         if (retainHdrSource && !grabber.isHdrSourceSupported) {
             if (!hdrCaptureUnavailableLogged) {
                 hdrCaptureUnavailableLogged = true
@@ -1847,80 +1869,115 @@ class VideoFrameProcessor(
     }
 
     private fun processNextFramePair() {
-        if (pairProcessing || released) return
+        if (released) return
         val nextFrame = frameQueue.poll() ?: return
         val prev = previousFrame
 
-        // The block matcher is the high-resolution CPU bottleneck. Capture/readback stays on the
-        // EGL owner thread, while this single-thread executor computes only the compact motion
-        // field. Rendering and all GL state remain on the EGL owner thread. The input pair is
-        // reserved until the result returns, and the existing bounded input queue drops old frames
-        // if analysis falls behind.
         val canPrepareMotionOffThread = prev != null &&
             interpolationAlgorithmOrdinal in 1..2 &&
             isRifeEnabled &&
             !fastDvdNetEngine.isEnabled &&
             prev.width == nextFrame.width && prev.height == nextFrame.height &&
             outputRenderer?.isWarpInitialized == true
-        if (canPrepareMotionOffThread) {
-            pairProcessing = true
-            inFlightPair = prev to nextFrame
-            val generation = streamGeneration
-            motionExecutor.execute {
-                val prepared = computeMotionFieldOffThread(prev, nextFrame)
-                val handler = workerHandler
-                if (handler == null || !handler.post {
-                        try {
-                            if (released || generation != streamGeneration) {
-                                if (previousFrame === prev) previousFrame = null
-                                releaseFrameBuffer(prev.pixels)
-                                releaseFrameBuffer(nextFrame.pixels)
-                            } else {
-                                processFramePair(prev, nextFrame, prepared)
-                            }
-                        } finally {
-                            val stillCurrent = inFlightPair?.first === prev &&
-                                inFlightPair?.second === nextFrame
-                            if (stillCurrent) {
-                                inFlightPair = null
-                                pairProcessing = false
-                                if (!released) processNextFramePair()
-                            }
-                        }
-                    }
-                ) {
-                    // handler.post failed (handler null or looper gone): fall back to synchronous
-                    // processing on the owner thread to avoid a permanent stall. The motion field
-                    // is already computed; just process the pair directly.
-                    try {
-                        if (released || generation != streamGeneration) {
-                            if (previousFrame === prev) previousFrame = null
-                            releaseFrameBuffer(prev.pixels)
-                            releaseFrameBuffer(nextFrame.pixels)
-                        } else {
-                            processFramePair(prev, nextFrame, prepared)
-                        }
-                    } finally {
-                        val stillCurrent = inFlightPair?.first === prev &&
-                            inFlightPair?.second === nextFrame
-                        if (stillCurrent) {
-                            inFlightPair = null
-                            pairProcessing = false
-                            if (!released) processNextFramePair()
-                        }
-                    }
-                }
-            }
+        if (!canPrepareMotionOffThread) {
+            processFramePair(prev, nextFrame, null)
             return
         }
 
-        pairProcessing = true
-        try {
-            processFramePair(prev, nextFrame, null)
-        } finally {
-            pairProcessing = false
-            if (!released) processNextFramePair()
+        // Motion can run off-thread. Submit motion work; render will happen when motion completes.
+        val generation = streamGeneration
+        motionExecutor.execute {
+            val prepared = computeMotionFieldOffThread(prev, nextFrame)
+            val handler = workerHandler
+            if (handler == null) {
+                // Handler gone; clean up and drop
+                if (generation == streamGeneration) {
+                    runOnWorker("async_motion_fallback") { processFramePair(prev, nextFrame, prepared) }
+                } else {
+                    releaseFrameBuffer(prev.pixels)
+                    releaseFrameBuffer(nextFrame.pixels)
+                }
+                return@execute
+            }
+            handler.post {
+                // Motion done. Enqueue for rendering, then IMMEDIATELY try to submit next motion.
+                val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
+                pendingRenderQueue.addLast(work)
+
+                // Try to render from queue (this will also submit next motion if available)
+                renderPendingQueue()
+            }
         }
+    }
+
+    /**
+     * Renders all ready work items from the pending queue.
+     * After each render, submits motion for the next queued frame (if any).
+     * Keeps motion executor 100% busy by starting next motion before current render finishes.
+     */
+    private fun renderPendingQueue() {
+        if (released) return
+        val work = pendingRenderQueue.removeFirstOrNull() ?: return
+        if (work.generation != streamGeneration) {
+            // Stream changed; clean up this work
+            releaseFrameBuffer(work.prev.pixels)
+            releaseFrameBuffer(work.next.pixels)
+            renderPendingQueue()
+            return
+        }
+
+        val prev = work.prev
+        val next = work.next
+        val prepared = work.prepared
+
+        // Submit motion for NEXT pair BEFORE rendering current pair.
+        // This keeps motion executor busy continuously.
+        trySubmitNextMotion()
+
+        // Render current pair
+        processFramePair(prev, next, prepared)
+
+        // Continue rendering queue if more work available
+        if (pendingRenderQueue.isNotEmpty()) {
+            renderPendingQueue()
+        }
+    }
+
+    /** Tries to submit motion for the next available frame pair. Does nothing if no pair ready. */
+    private fun trySubmitNextMotion() {
+        if (released) return
+        val nextFrame = frameQueue.peek() ?: return
+        val prev = previousFrame ?: return
+
+        val canPrepareMotionOffThread = interpolationAlgorithmOrdinal in 1..2 &&
+            isRifeEnabled &&
+            !fastDvdNetEngine.isEnabled &&
+            prev.width == nextFrame.width && prev.height == nextFrame.height &&
+            outputRenderer?.isWarpInitialized == true
+        if (!canPrepareMotionOffThread) return
+
+        val generation = streamGeneration
+        motionExecutor.execute {
+            val prepared = computeMotionFieldOffThread(prev, nextFrame)
+            val handler = workerHandler
+            if (handler == null) {
+                if (generation == streamGeneration) {
+                    runOnWorker("async_motion_fallback") { processFramePair(prev, nextFrame, prepared) }
+                } else {
+                    releaseFrameBuffer(prev.pixels)
+                    releaseFrameBuffer(nextFrame.pixels)
+                }
+                return@execute
+            }
+            handler.post {
+                val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
+                pendingRenderQueue.addLast(work)
+                // Note: we do NOT call renderPendingQueue() here to avoid re-entrancy.
+                // The current render will call it when it finishes.
+            }
+        }
+        // Remove the pair from queue now that motion is committed
+        frameQueue.poll()
     }
 
     private fun computeMotionFieldOffThread(prev: FrameData, nextFrame: FrameData): PreparedMotion {
@@ -1946,6 +2003,21 @@ class VideoFrameProcessor(
         } catch (t: Throwable) {
             Log.e(TAG, "Asynchronous MEMC motion estimation failed", t)
             PreparedMotion(null, false, System.nanoTime() - started)
+        }
+    }
+
+    private fun generateTimestamps(prev: FrameData, next: FrameData): LongArray {
+        val pairSpanUs = next.timestampUs - prev.timestampUs
+        val exactThreeTimes = memcLevelMultiplier == 3f &&
+            pairSpanUs in MIN_PAIR_INTERVAL_US..MAX_PAIR_INTERVAL_US
+        val count = (memcLevelMultiplier).toInt()
+        return LongArray(count) { i ->
+            if (exactThreeTimes && i < 2) {
+                prev.timestampUs * 1000L + (pairSpanUs * 1000L * (i + 1)) / 3L
+            } else {
+                prev.timestampUs * 1000L +
+                    ((i + 1).toDouble() / (count + 1).toDouble() * pairSpanUs * 1000.0).toLong()
+            }
         }
     }
 
@@ -2089,7 +2161,7 @@ class VideoFrameProcessor(
                     nsJni += System.nanoTime() - tFieldStart
                     if (fieldReady) {
                         val tRenderStart = System.nanoTime()
-                        outputRenderer?.isHdr = isHdrMemcSource()
+                        outputRenderer?.isHdr = isHdrSource()
                         presented = outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
                             outputRenderer?.presentDenoised(
                                 rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
@@ -2314,7 +2386,7 @@ class VideoFrameProcessor(
                 }
             }
 
-            outputRenderer?.isHdr = isHdrMemcSource()
+            outputRenderer?.isHdr = isHdrSource()
             var presented = intermediate.isEmpty()
             val hdrFrame0 = hdrTextureByAnalysisBuffer[prev.pixels] ?: 0
             val hdrFrame1 = hdrTextureByAnalysisBuffer[nextFrame.pixels] ?: 0
@@ -2801,7 +2873,7 @@ class VideoFrameProcessor(
     private fun renderFrameToOutput(frame: FrameData, timestampNs: Long = 0L) {
         val hdrTexture = hdrTextureByAnalysisBuffer[frame.pixels] ?: 0
         if (hdrTexture != 0) {
-            outputRenderer?.isHdr = isHdrMemcSource()
+            outputRenderer?.isHdr = isHdrSource()
             if (outputRenderer?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true) {
                 submittedOutputFrameCount++
             } else {
