@@ -97,7 +97,11 @@ class OesFrameGrabber {
 
         private const val FRAGMENT_SHADER = """
             #extension GL_OES_EGL_image_external : require
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
             precision mediump float;
+            #endif
             varying vec2 vTextureCoord;
             uniform samplerExternalOES uTexture;
             void main() {
