@@ -525,8 +525,20 @@ class MpegTsMuxer(
             section[n++] = audioStreamType.toByte()
             section[n++] = (0xE0 or ((audioPid shr 8) and 0x1F)).toByte()
             section[n++] = (audioPid and 0xFF).toByte()
-            section[n++] = 0xF0.toByte() // ES_info_length = 0
-            section[n++] = 0x00.toByte()
+            if (audioStreamType == STREAM_TYPE_EAC3) {
+                // DVB E-AC-3 descriptor (ETSI EN 300 468, tag 0x7A). The flags byte is zero:
+                // optional component type, bsid, main id and service type fields are absent.
+                // The original E-AC-3 access units remain untouched, including any Atmos/JOC
+                // signaling carried in-band.
+                section[n++] = 0xF0.toByte()
+                section[n++] = 0x03.toByte() // ES_info_length
+                section[n++] = 0x7A.toByte() // EAC3_descriptor
+                section[n++] = 0x01.toByte()
+                section[n++] = 0x00.toByte()
+            } else {
+                section[n++] = 0xF0.toByte() // ES_info_length = 0 (AAC ADTS)
+                section[n++] = 0x00.toByte()
+            }
         }
         patchSectionLength(section, n)
         n = appendCrc(section, n)
