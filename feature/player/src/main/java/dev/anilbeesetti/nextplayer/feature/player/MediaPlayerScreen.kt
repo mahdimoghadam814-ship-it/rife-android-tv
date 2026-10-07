@@ -59,8 +59,10 @@ import dev.anilbeesetti.nextplayer.feature.player.ui.PlayerVerticalGestureIndica
 import dev.anilbeesetti.nextplayer.feature.player.ui.SubtitleConfiguration
 import dev.anilbeesetti.nextplayer.feature.player.ui.preview.rememberPreviewPlayer
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import org.koin.compose.koinInject
 import kotlin.time.Duration.Companion.seconds
@@ -311,12 +313,17 @@ internal fun MediaPlayerContent(
             // comes up for the rest of the session (the keys above do not change again).
             var attempts = 0
             while (isActive && attempts < 60) {
-                val started = rifeController.startUdpStream(
-                    playerPreferences.udpStreamingHost,
-                    playerPreferences.udpStreamingPort,
-                    player.currentMediaItem?.localConfiguration?.uri,
-                    player.currentPosition,
-                )
+                // Codec creation, extractor probing, socket setup and EGL surface handoff can
+                // block. LaunchedEffect runs on Main by default, so keep all of that work off the
+                // UI thread even when interpolation itself is disabled.
+                val started = withContext(Dispatchers.IO) {
+                    rifeController.startUdpStream(
+                        playerPreferences.udpStreamingHost,
+                        playerPreferences.udpStreamingPort,
+                        player.currentMediaItem?.localConfiguration?.uri,
+                        player.currentPosition,
+                    )
+                }
                 if (started) break
                 attempts++
                 delay(500)
@@ -325,7 +332,9 @@ internal fun MediaPlayerContent(
                 Log.w(TAG, "UDP stream did not start after $attempts attempts; giving up until the settings change")
             }
         } else {
-            rifeController.stopUdpStream()
+            // stopUdpStream joins the passthrough feeder and drains/releases MediaCodec. Never
+            // make Compose wait for those synchronous shutdown operations.
+            withContext(Dispatchers.IO) { rifeController.stopUdpStream() }
         }
     }
 
