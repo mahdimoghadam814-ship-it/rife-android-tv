@@ -327,17 +327,22 @@ class RifeEngineController(
     private fun startSubtitleFeeder(mediaUri: Uri, startPositionMs: Long): Boolean {
         stopSubtitleFeeder()
         val muxer = activeMuxer ?: return false
+        Log.i(TAG, "[UDP] starting DVB subtitle passthrough feeder for $mediaUri")
         val feeder = DvbSubtitlePassthroughFeeder(context, mediaUri, startPositionMs, muxer)
         if (feeder.start()) {
             subtitleFeeder = feeder
+            Log.i(TAG, "[UDP] DVB subtitle passthrough feeder started successfully")
             return true
         }
+        Log.w(TAG, "[UDP] DVB subtitle passthrough feeder failed; trying text-to-DVB fallback")
         // Fallback: encode text subtitles to DVB bitmap
         val fallback = SubtitleFallbackFeeder(context, mediaUri, startPositionMs, muxer)
         if (fallback.start()) {
             subtitleFallbackFeeder = fallback
+            Log.i(TAG, "[UDP] using subtitle fallback encoder (text -> DVB bitmap)")
             return true
         }
+        Log.e(TAG, "[UDP] subtitle fallback feeder also failed to start; streaming without remote subtitles")
         return false
     }
 
@@ -351,16 +356,21 @@ class RifeEngineController(
     private fun startAudioFeeder(mediaUri: Uri, startPositionMs: Long) {
         stopAudioFeeder()
         val muxer = activeMuxer ?: return
+        Log.i(TAG, "[UDP] starting audio passthrough feeder for $mediaUri")
         val feeder = AudioPassthroughFeeder(context, mediaUri, startPositionMs, muxer)
         if (feeder.start()) {
             audioFeeder = feeder
+            Log.i(TAG, "[UDP] audio passthrough feeder started successfully")
             return
         }
+        Log.w(TAG, "[UDP] audio passthrough feeder failed to start; trying fallback")
         // Fallback: decode and re-encode to E-AC-3 5.1
         val fallback = AudioFallbackFeeder(context, mediaUri, startPositionMs, muxer)
         if (fallback.start()) {
             audioFallbackFeeder = fallback
-            Log.i(TAG, "using audio fallback encoder (E-AC-3 5.1)")
+            Log.i(TAG, "[UDP] using audio fallback encoder (E-AC-3 5.1)")
+        } else {
+            Log.e(TAG, "[UDP] audio fallback feeder also failed to start; streaming video-only")
         }
     }
 

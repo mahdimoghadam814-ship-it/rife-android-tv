@@ -995,6 +995,9 @@ class VideoFrameProcessor(
         isRifeEnabled && interpolationAlgorithmOrdinal in 1..2 &&
             ColorInfo.isTransferHdr(sourceColorInfo)
 
+    /** True when the current source is HDR (PQ or HLG), regardless of interpolation state. */
+    private fun isHdrSource(): Boolean = ColorInfo.isTransferHdr(sourceColorInfo)
+
     /**
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
      * next pair already emits at the new cadence; the emission phase is re-anchored from that
@@ -2086,6 +2089,7 @@ class VideoFrameProcessor(
                     nsJni += System.nanoTime() - tFieldStart
                     if (fieldReady) {
                         val tRenderStart = System.nanoTime()
+                        outputRenderer?.isHdr = isHdrMemcSource()
                         presented = outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
                             outputRenderer?.presentDenoised(
                                 rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
@@ -2145,11 +2149,10 @@ class VideoFrameProcessor(
         // silently going out undenoised.
         var src0Buf = in0Buf
         var src1Buf = in1Buf
-        val gpuDenoiseWanted = !isHdrMemcSource() && fastDvdNetEngine.isEnabled &&
+        val gpuDenoiseWanted = !isHdrSource() && fastDvdNetEngine.isEnabled &&
             outputRenderer?.isDenoiseInitialized == true
-        // Skip CPU denoise for HDR MEMC sources: the HDR composition path uses retained
-        // FP16 source textures directly, and CPU denoise would destroy HDR precision.
-        if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted && !isHdrMemcSource()) {
+        // Skip CPU denoise for HDR sources: denoise operates in 8-bit and destroys HDR precision.
+        if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted && !isHdrSource()) {
             val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(
                 in0Buf,
                 rifeInputW,
@@ -2311,8 +2314,8 @@ class VideoFrameProcessor(
                 }
             }
 
-            var presented = intermediate.isEmpty()
             outputRenderer?.isHdr = isHdrMemcSource()
+            var presented = intermediate.isEmpty()
             val hdrFrame0 = hdrTextureByAnalysisBuffer[prev.pixels] ?: 0
             val hdrFrame1 = hdrTextureByAnalysisBuffer[nextFrame.pixels] ?: 0
             val hdrComposition = hdrFrame0 != 0 && hdrFrame1 != 0
