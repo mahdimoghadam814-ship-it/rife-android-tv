@@ -4,8 +4,10 @@ import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
+import android.opengl.GLES30
 import android.util.Log
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.common.util.GlUtil
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -42,6 +44,20 @@ import java.nio.FloatBuffer
  */
 @UnstableApi
 class OesFrameGrabber {
+
+    data class ReadbackFrameInfo(val timestampUs: Long, val width: Int, val height: Int)
+
+    private data class PboSlot(
+        var id: Int = 0,
+        var fence: Long = 0L,
+        var info: ReadbackFrameInfo? = null,
+    )
+
+    private val pboSlots = Array(3) { PboSlot() }
+    private val pendingPbos = java.util.ArrayDeque<PboSlot>()
+    private var pboBytes = 0
+    private var pboSupported = false
+    val isAsyncReadbackSupported: Boolean get() = pboSupported
 
     companion object {
         private const val TAG = "OesFrameGrabber"
@@ -180,6 +196,7 @@ class OesFrameGrabber {
 
         program = newProgram
         this.externalTextureId = externalTextureId
+        pboSupported = (GLES20.glGetString(GLES20.GL_VERSION) ?: "").contains("OpenGL ES 3")
 
         aPositionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         aTextureCoordHandle = GLES20.glGetAttribLocation(program, "aTextureCoord")
@@ -198,6 +215,127 @@ class OesFrameGrabber {
         GLES20.glDisable(GLES20.GL_CULL_FACE)
 
         Log.i(TAG, "External texture program ready (externalTexId=$externalTextureId)")
+    }
+
+    /** Queues an asynchronous RGBA readback. The returned analysis frame is polled later. */
+    fun enqueueReadback(
+        surfaceTexture: SurfaceTexture,
+        width: Int,
+        height: Int,
+        timestampUs: Long,
+    ): Boolean {
+        if (!pboSupported || width <= 0 || height <= 0) return false
+        val bytesLong = width.toLong() * height.toLong() * 4L
+        if (bytesLong <= 0L || bytesLong > Int.MAX_VALUE) return false
+        val bytes = bytesLong.toInt()
+        if (pboBytes != bytes) {
+            releasePbos()
+            try {
+                pboSlots.forEach { it.id = GlUtil.createPixelBufferObject(bytes) }
+                pboBytes = bytes
+            } catch (t: Throwable) {
+                Log.w(TAG, "Pixel-buffer readback unavailable; using synchronous readback", t)
+                releasePbos()
+                pboSupported = false
+                return false
+            }
+        }
+        val slot = pboSlots.firstOrNull { it.info == null } ?: return false
+        if (!drawOesToFbo(surfaceTexture, width, height)) return false
+        return try {
+            GlUtil.schedulePixelBufferRead(fbo, width, height, slot.id)
+            slot.info = ReadbackFrameInfo(timestampUs, width, height)
+            slot.fence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+            check(slot.fence != 0L) { "glFenceSync returned no fence" }
+            GLES30.glFlush()
+            pendingPbos.addLast(slot)
+            true
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not queue pixel-buffer readback", t)
+            false
+        }
+    }
+
+    fun nextReadbackInfo(): ReadbackFrameInfo? = pendingPbos.peekFirst()?.info
+
+    /** Called only at stream discontinuities; makes queued GPU writes safe to discard. */
+    fun discardPendingReadbacks() {
+        if (pendingPbos.isEmpty()) return
+        GLES30.glFinish()
+        pendingPbos.forEach { slot ->
+            if (slot.fence != 0L) GLES30.glDeleteSync(slot.fence)
+            slot.fence = 0L
+            slot.info = null
+        }
+        pendingPbos.clear()
+    }
+
+    /** Maps only a signaled PBO, copies into the reusable CPU analysis buffer, then releases it. */
+    fun pollReadback(out: ByteBuffer): ReadbackFrameInfo? {
+        val slot = pendingPbos.peekFirst() ?: return null
+        val info = slot.info ?: return null
+        val sync = slot.fence
+        if (sync != 0L) {
+            val wait = GLES30.glClientWaitSync(sync, 0, 0L)
+            if (wait != GLES30.GL_CONDITION_SATISFIED &&
+                wait != GLES30.GL_ALREADY_SIGNALED
+            ) return null
+        }
+        val byteCount = info.width.toLong() * info.height.toLong() * 4L
+        if (byteCount > out.capacity()) {
+            discardHeadPbo(slot)
+            return null
+        }
+        try {
+            val mapped = GlUtil.mapPixelBufferObject(slot.id, byteCount.toInt())
+                ?: return null
+            out.clear()
+            out.limit(byteCount.toInt())
+            mapped.position(0)
+            mapped.limit(byteCount.toInt())
+            out.put(mapped)
+            out.position(0)
+            GlUtil.unmapPixelBufferObject(slot.id)
+        } catch (t: Throwable) {
+            Log.w(TAG, "Could not map completed pixel-buffer readback", t)
+            discardHeadPbo(slot)
+            return null
+        }
+        discardHeadPbo(slot)
+        return info
+    }
+
+    private fun discardHeadPbo(slot: PboSlot) {
+        if (pendingPbos.peekFirst() === slot) pendingPbos.removeFirst()
+        if (slot.fence != 0L) GLES30.glDeleteSync(slot.fence)
+        slot.fence = 0L
+        slot.info = null
+    }
+
+    private fun drawOesToFbo(surfaceTexture: SurfaceTexture, width: Int, height: Int): Boolean {
+        if (!isInitialized || width <= 0 || height <= 0) return false
+        surfaceTexture.getTransformMatrix(stMatrix)
+        ensureFbo(width, height)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glUseProgram(program)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + TEXTURE_UNIT)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
+        GLES20.glUniform1i(uTextureHandle, TEXTURE_UNIT)
+        GLES20.glUniformMatrix4fv(uStMatrixHandle, 1, false, stMatrix, 0)
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPositionHandle)
+        GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aTextureCoordHandle)
+        GLES20.glVertexAttribPointer(aTextureCoordHandle, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        val error = GLES20.glGetError()
+        GLES20.glDisableVertexAttribArray(aPositionHandle)
+        GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        return error == GLES20.GL_NO_ERROR
     }
 
     /**
@@ -455,11 +593,25 @@ class OesFrameGrabber {
         fboHeight = 0
     }
 
+    private fun releasePbos() {
+        pendingPbos.forEach { slot ->
+            if (slot.fence != 0L) GLES30.glDeleteSync(slot.fence)
+            slot.fence = 0L
+            slot.info = null
+        }
+        pendingPbos.clear()
+        val ids = pboSlots.map { it.id }.filter { it != 0 }.toIntArray()
+        if (ids.isNotEmpty()) GLES30.glDeleteBuffers(ids.size, ids, 0)
+        pboSlots.forEach { it.id = 0; it.info = null; it.fence = 0L }
+        pboBytes = 0
+    }
+
     /**
      * Releases every GL object this grabber created. The external texture itself is owned by
      * [VideoFrameProcessor] and is deleted there while its EGL context is still current.
      */
     fun release() {
+        releasePbos()
         releaseFbo()
         if (program != 0) {
             GLES20.glDeleteProgram(program)

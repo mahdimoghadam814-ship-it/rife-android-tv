@@ -1245,6 +1245,7 @@ class VideoFrameProcessor(
     private fun resetPipelineOnWorker(reason: String) {
         var discarded = 0
         streamGeneration++
+        frameGrabber?.discardPendingReadbacks()
         val reservedPrevious = inFlightPair?.first
         if (inFlightPair == null) pairProcessing = false
         previousFrame?.let {
@@ -1429,8 +1430,21 @@ class VideoFrameProcessor(
             releaseGlObjectsForBundle(inputBundle, frameGrabber)
             frameGrabber = null
 
-            val display = GlUtil.getDefaultEglDisplay()
-            val context = GlUtil.createEglContext(display)
+            var display = GlUtil.getDefaultEglDisplay()
+            val context = try {
+                // ES3 pixel-pack buffers allow GPU readback to overlap decoder acquisition.
+                GlUtil.createEglContext(
+                    EGL14.EGL_NO_CONTEXT,
+                    display,
+                    3,
+                    GlUtil.EGL_CONFIG_ATTRIBUTES_RGBA_8888,
+                )
+            } catch (t: Throwable) {
+                // Keep the established ES2 path for drivers without an ES3 context/config.
+                Log.w(TAG, "GLES3 unavailable; retaining synchronous capture fallback", t)
+                display = GlUtil.getDefaultEglDisplay()
+                GlUtil.createEglContext(display)
+            }
             val eglSurface = GlUtil.createFocusedPlaceholderEglSurface(context, display)
             val textureId = GlUtil.createExternalTexture()
             val texture = SurfaceTexture(textureId)
@@ -1725,6 +1739,41 @@ class VideoFrameProcessor(
             droppedOutputAtWindowStart = droppedOutputFrameCount
         }
         val tCaptureStart = timingStartNs
+        val timestampUs = texture.timestamp / 1000L
+        if (grabber.isAsyncReadbackSupported) {
+            val queued = grabber.enqueueReadback(
+                texture,
+                captureWidth,
+                captureHeight,
+                timestampUs,
+            )
+            var completed = 0
+            while (true) {
+                val info = grabber.nextReadbackInfo() ?: break
+                val completedPixels = obtainFrameBuffer(info.width, info.height)
+                val ready = grabber.pollReadback(completedPixels)
+                if (ready == null) {
+                    releaseFrameBuffer(completedPixels)
+                    break
+                }
+                queueCapturedFrame(
+                    FrameData(
+                        pixels = completedPixels,
+                        timestampUs = ready.timestampUs,
+                        width = ready.width,
+                        height = ready.height,
+                    )
+                )
+                completed++
+            }
+            nsReadback += System.nanoTime() - tCaptureStart
+            if (!queued) droppedFrameCount++
+            // Three bounded PBOs allow capture to run ahead of readback completion. A full ring
+            // drops this input instead of waiting for the GPU or growing memory/latency.
+            if (queued && completed == 0) return
+            return
+        }
+
         val pixels = obtainFrameBuffer(captureWidth, captureHeight)
         val readOk = pixels.capacity() > 0 &&
             grabber.read(texture, captureWidth, captureHeight, pixels)
@@ -1734,8 +1783,6 @@ class VideoFrameProcessor(
             droppedFrameCount++
             return
         }
-
-        frameCountInput++
 
         if (VERBOSE_DIAGNOSTICS) {
             Log.d(
@@ -1747,17 +1794,23 @@ class VideoFrameProcessor(
 
         val frame = FrameData(
             pixels = pixels,
-            timestampUs = texture.timestamp / 1000L,
+            timestampUs = timestampUs,
             width = captureWidth,
             height = captureHeight
         )
+
+        queueCapturedFrame(frame)
+    }
+
+    private fun queueCapturedFrame(frame: FrameData) {
+        frameCountInput++
 
         // Bounded queue with explicit backpressure: drop the oldest frame rather than growing.
         if (!frameQueue.offer(frame)) {
             droppedFrameCount++
             frameQueue.poll()?.let { releaseFrameBuffer(it.pixels) }
             if (!frameQueue.offer(frame)) {
-                releaseFrameBuffer(pixels)
+                releaseFrameBuffer(frame.pixels)
                 return
             }
         }
