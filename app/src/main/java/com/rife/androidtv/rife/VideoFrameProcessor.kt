@@ -2312,6 +2312,7 @@ class VideoFrameProcessor(
             }
 
             var presented = intermediate.isEmpty()
+            outputRenderer?.isHdr = isHdrMemcSource()
             val hdrFrame0 = hdrTextureByAnalysisBuffer[prev.pixels] ?: 0
             val hdrFrame1 = hdrTextureByAnalysisBuffer[nextFrame.pixels] ?: 0
             val hdrComposition = hdrFrame0 != 0 && hdrFrame1 != 0
@@ -2797,6 +2798,7 @@ class VideoFrameProcessor(
     private fun renderFrameToOutput(frame: FrameData, timestampNs: Long = 0L) {
         val hdrTexture = hdrTextureByAnalysisBuffer[frame.pixels] ?: 0
         if (hdrTexture != 0) {
+            outputRenderer?.isHdr = isHdrMemcSource()
             if (outputRenderer?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true) {
                 submittedOutputFrameCount++
             } else {
@@ -2858,6 +2860,7 @@ class VideoFrameProcessor(
         }
 
         try {
+            renderer.isHdr = isHdrMemcSource()
             renderer.render(pixels, width, height, timestampNs)
             submittedOutputFrameCount++
         } catch (t: Throwable) {
@@ -2900,13 +2903,7 @@ class VideoFrameProcessor(
      *    dropped (see [reportStageTiming]).
      */
     private fun autoResolution(srcW: Int, srcH: Int): RifeResolution {
-        val longEdge = maxOf(srcW, srcH)
-        if (longEdge < 1280) return RifeResolution.ORIGINAL
-        if (longEdge < 1920) return if (isRifeEnabled) RifeResolution.RES_480P else RifeResolution.ORIGINAL
-        if (longEdge < auto4kMinDim) return if (isRifeEnabled) RifeResolution.RES_720P else RifeResolution.ORIGINAL
-        if (isRifeEnabled) return RifeResolution.RES_1080P
-        if (!isDenoiseEnabled) return RifeResolution.ORIGINAL
-        return autoDegradeLadder[autoDegradeLevel.coerceIn(0, autoDegradeLadder.lastIndex)]
+        return RifeResolution.ORIGINAL
     }
 
     /**

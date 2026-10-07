@@ -62,6 +62,7 @@ class GlOutputRenderer {
             #endif
             varying vec2 vTextureCoord;
             uniform sampler2D uTexture;
+            uniform int uIsHdr;
 
             // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
             vec3 linearToPQ(vec3 linear) {
@@ -78,7 +79,10 @@ class GlOutputRenderer {
 
             void main() {
                 vec3 color = texture2D(uTexture, vTextureCoord).rgb;
-                gl_FragColor = vec4(linearToPQ(color), 1.0);
+                if (uIsHdr != 0) {
+                    color = linearToPQ(color);
+                }
+                gl_FragColor = vec4(color, 1.0);
             }
         """
 
@@ -154,6 +158,7 @@ private const val WARP_FRAGMENT_SHADER = """
             // NativeEngine.motionFieldBlendMode(), the same accessor the CPU warp uses, so the
             // fallback path and this one can never disagree about what they are rendering.
             uniform int uBlendMode;
+            uniform int uIsHdr;
             // Per-channel median of three, as a + b + c - min - max.
             vec3 median3(vec3 a, vec3 b, vec3 c) {
                 return a + b + c - min(min(a, b), c) - max(max(a, b), c);
@@ -218,7 +223,10 @@ private const val WARP_FRAGMENT_SHADER = """
                     }
                     blended = mix(termF, termB, uTimestep);
                 }
-                gl_FragColor = vec4(linearToPQ(blended), 1.0);
+                if (uIsHdr != 0) {
+                    blended = linearToPQ(blended);
+                }
+                gl_FragColor = vec4(blended, 1.0);
             }
         """
         /**
@@ -386,6 +394,12 @@ private const val WARP_FRAGMENT_SHADER = """
     @Volatile
     var denoiseStrength = 1f
 
+    @Volatile
+    var isHdr = false
+
+    private var uIsHdrHandle = -1
+    private var warpUIsHdr = -1
+
     private var denUContentScale = -1
     private var denUCurrent = -1
     private var denUHistory = -1
@@ -552,6 +566,7 @@ private const val WARP_FRAGMENT_SHADER = """
         aTextureCoordHandle = GLES20.glGetAttribLocation(program, "aTextureCoord")
         uTextureHandle = GLES20.glGetUniformLocation(program, "uTexture")
         uContentScaleHandle = GLES20.glGetUniformLocation(program, "uContentScale")
+        uIsHdrHandle = GLES20.glGetUniformLocation(program, "uIsHdr")
 
         if (aPositionHandle < 0 || aTextureCoordHandle < 0 || uTextureHandle < 0 ||
             uContentScaleHandle < 0
@@ -630,6 +645,7 @@ private const val WARP_FRAGMENT_SHADER = """
         warpUMotionOffset = GLES20.glGetUniformLocation(newProgram, "uMotionOffset")
         warpUBlendMode = GLES20.glGetUniformLocation(newProgram, "uBlendMode")
         warpUTimestep = GLES20.glGetUniformLocation(newProgram, "uTimestep")
+        warpUIsHdr = GLES20.glGetUniformLocation(newProgram, "uIsHdr")
 
         if (warpAPosition < 0 || warpATexCoord < 0 || warpUContentScale < 0 ||
             warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 || warpUMask < 0 ||
@@ -1148,6 +1164,7 @@ private const val WARP_FRAGMENT_SHADER = """
         // difference is a stretched or invisible frame, and one glUniform2f is not worth it.
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
+        GLES20.glUniform1i(uIsHdrHandle, if (isHdr) 1 else 0)
 
         // The quad no longer covers the whole surface whenever the aspect ratios differ, so the
         // bars are painted black instead of leaving the previous frame's contents on screen.
@@ -1240,6 +1257,7 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glUniform1i(uTextureHandle, 0)
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
+        GLES20.glUniform1i(uIsHdrHandle, if (isHdr) 1 else 0)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         vertexBuffer.position(0)
@@ -1725,6 +1743,7 @@ private const val WARP_FRAGMENT_SHADER = """
         val motionOffset = motionOffsetFor(warpGridStep)
         GLES20.glUniform2f(warpUMotionOffset, motionOffset, motionOffset)
         GLES20.glUniform1i(warpUBlendMode, warpBlendMode)
+        GLES20.glUniform1i(warpUIsHdr, if (isHdr) 1 else 0)
 
         updateContentScale(targetWidth, targetHeight, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(warpUContentScale, contentScaleX, contentScaleY)
