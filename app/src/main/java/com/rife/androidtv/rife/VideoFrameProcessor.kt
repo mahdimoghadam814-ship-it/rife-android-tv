@@ -26,6 +26,7 @@ import com.rife.androidtv.NativeEngine
 import java.nio.ByteBuffer
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import androidx.media3.common.VideoFrameProcessor as Media3VideoFrameProcessor
 
@@ -269,7 +270,26 @@ class VideoFrameProcessor(
     private val frameQueue = ArrayBlockingQueue<FrameData>(FRAME_QUEUE_CAPACITY)
     private val frameBufferPool = java.util.ArrayDeque<ByteBuffer>(MAX_POOLED_FRAME_BUFFERS)
 
+    /** MEMC/SVPlayer's CPU SAD search runs away from the decoder/GL handler. */
+    private val motionExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "MemcMotionWorker").apply { isDaemon = true }
+    }
+    private var pairProcessing = false
+    private var streamGeneration = 0L
+    private var inFlightPair: Pair<FrameData, FrameData>? = null
+    @Volatile private var interpolationAlgorithmOrdinal = 1
+
+    private data class PreparedMotion(
+        val field: ByteBuffer?,
+        val ready: Boolean,
+        val elapsedNs: Long
+    )
+
     private var previousFrame: FrameData? = null
+
+    fun setInterpolationAlgorithmOrdinal(ordinal: Int) {
+        interpolationAlgorithmOrdinal = ordinal.coerceIn(0, 2)
+    }
 
     private var frameCountInput = 0
     private var frameCountOutput = 0
@@ -1224,8 +1244,11 @@ class VideoFrameProcessor(
      */
     private fun resetPipelineOnWorker(reason: String) {
         var discarded = 0
+        streamGeneration++
+        val reservedPrevious = inFlightPair?.first
+        if (inFlightPair == null) pairProcessing = false
         previousFrame?.let {
-            releaseFrameBuffer(it.pixels)
+            if (it !== reservedPrevious) releaseFrameBuffer(it.pixels)
             discarded++
         }
         previousFrame = null
@@ -1743,8 +1766,95 @@ class VideoFrameProcessor(
     }
 
     private fun processNextFramePair() {
+        if (pairProcessing || released) return
         val nextFrame = frameQueue.poll() ?: return
         val prev = previousFrame
+
+        // The block matcher is the high-resolution CPU bottleneck. Capture/readback stays on the
+        // EGL owner thread, while this single-thread executor computes only the compact motion
+        // field. Rendering and all GL state remain on the EGL owner thread. The input pair is
+        // reserved until the result returns, and the existing bounded input queue drops old frames
+        // if analysis falls behind.
+        val canPrepareMotionOffThread = prev != null &&
+            interpolationAlgorithmOrdinal in 1..2 &&
+            isRifeEnabled &&
+            !fastDvdNetEngine.isEnabled &&
+            prev.width == nextFrame.width && prev.height == nextFrame.height &&
+            outputRenderer?.isWarpInitialized == true
+        if (canPrepareMotionOffThread) {
+            pairProcessing = true
+            inFlightPair = prev to nextFrame
+            val generation = streamGeneration
+            motionExecutor.execute {
+                val prepared = computeMotionFieldOffThread(prev, nextFrame)
+                val handler = workerHandler
+                if (handler == null || !handler.post {
+                        try {
+                            if (released || generation != streamGeneration) {
+                                if (previousFrame === prev) previousFrame = null
+                                releaseFrameBuffer(prev.pixels)
+                                releaseFrameBuffer(nextFrame.pixels)
+                            } else {
+                                processFramePair(prev, nextFrame, prepared)
+                            }
+                        } finally {
+                            val stillCurrent = inFlightPair?.first === prev &&
+                                inFlightPair?.second === nextFrame
+                            if (stillCurrent) {
+                                inFlightPair = null
+                                pairProcessing = false
+                                if (!released) processNextFramePair()
+                            }
+                        }
+                    }
+                ) {
+                    // The owner thread is gone. Do not return buffers to its non-thread-safe pool;
+                    // allowing the two direct buffers to be collected is safer than racing release.
+                }
+            }
+            return
+        }
+
+        pairProcessing = true
+        try {
+            processFramePair(prev, nextFrame, null)
+        } finally {
+            pairProcessing = false
+            if (!released) processNextFramePair()
+        }
+    }
+
+    private fun computeMotionFieldOffThread(prev: FrameData, nextFrame: FrameData): PreparedMotion {
+        val started = System.nanoTime()
+        return try {
+            val step = NativeEngine.motionFieldStep().coerceAtLeast(1)
+            val gridW = (nextFrame.width + step - 1) / step
+            val gridH = (nextFrame.height + step - 1) / step
+            val bytes = gridW.toLong() * gridH.toLong() * 8L
+            if (bytes <= 0L || bytes > Int.MAX_VALUE) {
+                PreparedMotion(null, false, System.nanoTime() - started)
+            } else {
+                val field = ByteBuffer.allocateDirect(bytes.toInt())
+                val ready = NativeEngine.computeMotionField(
+                    prev.pixels, nextFrame.pixels,
+                    nextFrame.width, nextFrame.height,
+                    nextFrame.width, nextFrame.height,
+                    field,
+                    forwardOnly = false,
+                )
+                PreparedMotion(field.takeIf { ready }, ready, System.nanoTime() - started)
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Asynchronous MEMC motion estimation failed", t)
+            PreparedMotion(null, false, System.nanoTime() - started)
+        }
+    }
+
+    private fun processFramePair(
+        prev: FrameData?,
+        nextFrame: FrameData,
+        preparedMotion: PreparedMotion?
+    ) {
 
         if (prev == null) {
             // First frame: log checksum before rendering
@@ -2001,7 +2111,7 @@ class VideoFrameProcessor(
         // overlap setting shrinks the grid pitch so its search windows overlap each other.
         // computeMotionField() reports false when the algorithm produces no field at all, so
         // the RIFE path keeps working without this layer knowing about the switch.
-        val motionBuf = cachedMotionBuf
+        val motionBuf = preparedMotion?.field ?: cachedMotionBuf
 
         // The emission schedule has to be known before the engine call, not after it. When the
         // warp cannot draw this pair the per-timestep CPU loop further down is the stage that
@@ -2017,8 +2127,8 @@ class VideoFrameProcessor(
         }
 
         val tJniStart = System.nanoTime()
-        var motionReady = false
-        if (motionBuf != null && outputRenderer?.isWarpInitialized == true) {
+        var motionReady = preparedMotion?.ready ?: false
+        if (preparedMotion == null && motionBuf != null && outputRenderer?.isWarpInitialized == true) {
             motionReady = NativeEngine.computeMotionField(
                 src0Buf,
                 src1Buf,
@@ -2049,7 +2159,7 @@ class VideoFrameProcessor(
             // twice. It reports its own failure rather than the probe reporting it for it.
             else -> true
         }
-        nsJni += System.nanoTime() - tJniStart
+        nsJni += System.nanoTime() - tJniStart + (preparedMotion?.elapsedNs ?: 0L)
 
         lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
 

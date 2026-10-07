@@ -164,6 +164,7 @@ class RifeEngineController(
      */
     override fun setInterpolationAlgorithm(algorithm: FeatureInterpolationAlgorithm) {
         interpolationAlgorithm = algorithm
+        processor.setInterpolationAlgorithmOrdinal(algorithm.ordinal)
         // The Kotlin ordinals are the native InterpolationAlgorithm values: RIFE 0, MEMC 1,
         // SVPLAYER 2, so the engine can tell the two block-matching backends apart.
         NativeEngine.setInterpolationAlgorithm(algorithm.ordinal)
