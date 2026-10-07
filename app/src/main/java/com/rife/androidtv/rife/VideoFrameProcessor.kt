@@ -24,6 +24,7 @@ import androidx.media3.common.util.TimestampIterator
 import androidx.media3.common.util.UnstableApi
 import com.rife.androidtv.NativeEngine
 import java.nio.ByteBuffer
+import java.util.IdentityHashMap
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
@@ -269,6 +270,8 @@ class VideoFrameProcessor(
 
     private val frameQueue = ArrayBlockingQueue<FrameData>(FRAME_QUEUE_CAPACITY)
     private val frameBufferPool = java.util.ArrayDeque<ByteBuffer>(MAX_POOLED_FRAME_BUFFERS)
+    /** High-precision source textures live until their analysis buffer leaves the frame pipeline. */
+    private val hdrTextureByAnalysisBuffer = IdentityHashMap<ByteBuffer, Int>()
 
     /** MEMC/SVPlayer's CPU SAD search runs away from the decoder/GL handler. */
     private val motionExecutor = Executors.newSingleThreadExecutor { task ->
@@ -465,6 +468,7 @@ class VideoFrameProcessor(
     private var outputDataSpace: Int = 0
     @Volatile private var currentOutputDataSpace: Int = 0
     @Volatile private var sourceColorInfo: ColorInfo? = null
+    private var hdrCaptureUnavailableLogged = false
 
     /**
      * Dataspace MediaCodec stamped on its own output window, read back through
@@ -981,9 +985,14 @@ class VideoFrameProcessor(
     fun setSourceColorInfo(colorInfo: ColorInfo?) {
         sourceColorInfo = colorInfo
         runOnWorker("setSourceColorInfo") {
+            hdrCaptureUnavailableLogged = false
             Log.i(TAG, "[HDR] inputColor=${colorInfo ?: "unknown"} outputDataSpace=$outputDataSpace")
         }
     }
+
+    private fun isHdrMemcSource(): Boolean =
+        isRifeEnabled && interpolationAlgorithmOrdinal in 1..2 &&
+            ColorInfo.isTransferHdr(sourceColorInfo)
 
     /**
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
@@ -1740,12 +1749,23 @@ class VideoFrameProcessor(
         }
         val tCaptureStart = timingStartNs
         val timestampUs = texture.timestamp / 1000L
+        val retainHdrSource = isHdrMemcSource()
+        if (retainHdrSource && !grabber.isHdrSourceSupported) {
+            if (!hdrCaptureUnavailableLogged) {
+                hdrCaptureUnavailableLogged = true
+                Log.e(TAG, "HDR MEMC capture requires GLES3 RGBA16F render-target support; refusing the RGBA8 HDR path")
+                reportError("HDR interpolation unavailable: this GLES driver cannot retain a high-precision source")
+            }
+            droppedFrameCount++
+            return
+        }
         if (grabber.isAsyncReadbackSupported) {
             val queued = grabber.enqueueReadback(
                 texture,
                 captureWidth,
                 captureHeight,
                 timestampUs,
+                retainHdrSource,
             )
             var completed = 0
             while (true) {
@@ -1754,6 +1774,8 @@ class VideoFrameProcessor(
                 val ready = grabber.pollReadback(completedPixels)
                 if (ready == null) {
                     releaseFrameBuffer(completedPixels)
+                    // The PBO remains queued while its fence is unsignaled. Its retained FP16
+                    // source lease must stay owned by that queue entry until pollReadback removes it.
                     break
                 }
                 queueCapturedFrame(
@@ -1762,7 +1784,8 @@ class VideoFrameProcessor(
                         timestampUs = ready.timestampUs,
                         width = ready.width,
                         height = ready.height,
-                    )
+                    ),
+                    ready.sourceTextureId,
                 )
                 completed++
             }
@@ -1802,8 +1825,9 @@ class VideoFrameProcessor(
         queueCapturedFrame(frame)
     }
 
-    private fun queueCapturedFrame(frame: FrameData) {
+    private fun queueCapturedFrame(frame: FrameData, sourceTextureId: Int = 0) {
         frameCountInput++
+        if (sourceTextureId != 0) hdrTextureByAnalysisBuffer[frame.pixels] = sourceTextureId
 
         // Bounded queue with explicit backpressure: drop the oldest frame rather than growing.
         if (!frameQueue.offer(frame)) {
@@ -2102,7 +2126,7 @@ class VideoFrameProcessor(
         // silently going out undenoised.
         var src0Buf = in0Buf
         var src1Buf = in1Buf
-        val gpuDenoiseWanted = fastDvdNetEngine.isEnabled &&
+        val gpuDenoiseWanted = !isHdrMemcSource() && fastDvdNetEngine.isEnabled &&
             outputRenderer?.isDenoiseInitialized == true
         if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted) {
             val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(
@@ -2267,6 +2291,9 @@ class VideoFrameProcessor(
             }
 
             var presented = intermediate.isEmpty()
+            val hdrFrame0 = hdrTextureByAnalysisBuffer[prev.pixels] ?: 0
+            val hdrFrame1 = hdrTextureByAnalysisBuffer[nextFrame.pixels] ?: 0
+            val hdrComposition = hdrFrame0 != 0 && hdrFrame1 != 0
             if (!presented && motionReady && motionBuf != null) {
                 // From the denoised pair when there is one. The first cycle after a reset has no
                 // denoised history to warp from, so it blends the raw pair, and the present below
@@ -2282,18 +2309,27 @@ class VideoFrameProcessor(
                         intermediate,
                         timestamps
                     ) == true
+                } else if (hdrComposition) {
+                    outputRenderer?.renderWarpTextures(
+                        hdrFrame0, hdrFrame1, motionBuf,
+                        rifeInputW, rifeInputH, rifeOutputW, rifeOutputH,
+                        intermediate, timestamps
+                    ) == true
                 } else {
                     outputRenderer?.renderWarp(
-                        src0Buf,
-                        src1Buf,
-                        motionBuf,
-                        rifeInputW,
-                        rifeInputH,
-                        rifeOutputW,
-                        rifeOutputH,
-                        intermediate,
-                        timestamps
+                        src0Buf, src1Buf, motionBuf,
+                        rifeInputW, rifeInputH, rifeOutputW, rifeOutputH,
+                        intermediate, timestamps
                     ) == true
+                }
+            }
+            if (!presented) {
+                if (hdrComposition) {
+                    // The 8-bit readback is analysis-only. If GPU composition fails, skip these
+                    // intermediate frames and present the retained HDR source at the pair time.
+                    Log.w(TAG, "HDR MEMC GPU composition failed; presenting retained source frame")
+                    renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
+                    presented = true
                 }
             }
             if (!presented) {
@@ -2686,9 +2722,9 @@ class VideoFrameProcessor(
      * of every frame buffer, so nothing can still be reading it.
      */
     private fun releaseFrameBuffer(buffer: ByteBuffer?) {
-        if (buffer == null || frameBufferPool.size >= minOf(MAX_POOLED_FRAME_BUFFERS, 2)) {
-            return
-        }
+        if (buffer == null) return
+        hdrTextureByAnalysisBuffer.remove(buffer)?.let { frameGrabber?.releaseSourceTexture(it) }
+        if (frameBufferPool.size >= minOf(MAX_POOLED_FRAME_BUFFERS, 2)) return
         buffer.clear()
         frameBufferPool.add(buffer)
     }
@@ -2738,6 +2774,16 @@ class VideoFrameProcessor(
     }
 
     private fun renderFrameToOutput(frame: FrameData, timestampNs: Long = 0L) {
+        val hdrTexture = hdrTextureByAnalysisBuffer[frame.pixels] ?: 0
+        if (hdrTexture != 0) {
+            if (outputRenderer?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true) {
+                submittedOutputFrameCount++
+            } else {
+                droppedOutputFrameCount++
+                Log.e(TAG, "HDR source texture presentation failed; refusing RGBA8 fallback")
+            }
+            return
+        }
         frame.pixels.clear()
         renderBufferToOutput(frame.pixels, frame.width, frame.height, timestampNs)
     }

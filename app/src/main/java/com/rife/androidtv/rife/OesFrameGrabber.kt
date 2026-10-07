@@ -45,7 +45,12 @@ import java.nio.FloatBuffer
 @UnstableApi
 class OesFrameGrabber {
 
-    data class ReadbackFrameInfo(val timestampUs: Long, val width: Int, val height: Int)
+    data class ReadbackFrameInfo(
+        val timestampUs: Long,
+        val width: Int,
+        val height: Int,
+        val sourceTextureId: Int = 0,
+    )
 
     private data class PboSlot(
         var id: Int = 0,
@@ -57,7 +62,18 @@ class OesFrameGrabber {
     private val pendingPbos = java.util.ArrayDeque<PboSlot>()
     private var pboBytes = 0
     private var pboSupported = false
+    private data class HdrSourceSlot(var textureId: Int = 0, var inUse: Boolean = false)
+    private val hdrSourceSlots = Array(3) { HdrSourceSlot() }
+    private var hdrFramebuffer = 0
+    private var hdrWidth = 0
+    private var hdrHeight = 0
+    private var hdrSourceSupported = false
+    private var copyProgram = 0
+    private var copyPosition = -1
+    private var copyTexCoord = -1
+    private var copyTexture = -1
     val isAsyncReadbackSupported: Boolean get() = pboSupported
+    val isHdrSourceSupported: Boolean get() = hdrSourceSupported
 
     companion object {
         private const val TAG = "OesFrameGrabber"
@@ -197,6 +213,18 @@ class OesFrameGrabber {
         program = newProgram
         this.externalTextureId = externalTextureId
         pboSupported = (GLES20.glGetString(GLES20.GL_VERSION) ?: "").contains("OpenGL ES 3")
+        hdrSourceSupported = pboSupported && (
+            extensions.contains("GL_EXT_color_buffer_half_float") ||
+                extensions.contains("GL_EXT_color_buffer_float")
+            )
+        if (hdrSourceSupported) {
+            try {
+                initializeCopyProgram()
+            } catch (t: Throwable) {
+                hdrSourceSupported = false
+                Log.w(TAG, "RGBA16F analysis-copy shader unavailable", t)
+            }
+        }
 
         aPositionHandle = GLES20.glGetAttribLocation(program, "aPosition")
         aTextureCoordHandle = GLES20.glGetAttribLocation(program, "aTextureCoord")
@@ -223,6 +251,7 @@ class OesFrameGrabber {
         width: Int,
         height: Int,
         timestampUs: Long,
+        retainHdrSource: Boolean = false,
     ): Boolean {
         if (!pboSupported || width <= 0 || height <= 0) return false
         val bytesLong = width.toLong() * height.toLong() * 4L
@@ -241,10 +270,24 @@ class OesFrameGrabber {
             }
         }
         val slot = pboSlots.firstOrNull { it.info == null } ?: return false
-        if (!drawOesToFbo(surfaceTexture, width, height)) return false
+        var sourceTextureId = 0
+        if (retainHdrSource) {
+            if (!hdrSourceSupported || !ensureHdrSources(width, height)) return false
+            val source = hdrSourceSlots.firstOrNull { !it.inUse } ?: return false
+            source.inUse = true
+            sourceTextureId = source.textureId
+            if (!drawOesToFramebuffer(surfaceTexture, width, height, hdrFramebuffer, sourceTextureId) ||
+                !copyHdrToAnalysis(sourceTextureId, width, height)
+            ) {
+                releaseSourceTexture(sourceTextureId)
+                return false
+            }
+        } else if (!drawOesToFbo(surfaceTexture, width, height)) {
+            return false
+        }
         return try {
             GlUtil.schedulePixelBufferRead(fbo, width, height, slot.id)
-            slot.info = ReadbackFrameInfo(timestampUs, width, height)
+            slot.info = ReadbackFrameInfo(timestampUs, width, height, sourceTextureId)
             slot.fence = GLES30.glFenceSync(GLES30.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
             check(slot.fence != 0L) { "glFenceSync returned no fence" }
             GLES30.glFlush()
@@ -252,17 +295,24 @@ class OesFrameGrabber {
             true
         } catch (t: Throwable) {
             Log.w(TAG, "Could not queue pixel-buffer readback", t)
+            releaseSourceTexture(sourceTextureId)
             false
         }
     }
 
     fun nextReadbackInfo(): ReadbackFrameInfo? = pendingPbos.peekFirst()?.info
 
+    fun releaseSourceTexture(textureId: Int) {
+        if (textureId == 0) return
+        hdrSourceSlots.firstOrNull { it.textureId == textureId }?.inUse = false
+    }
+
     /** Called only at stream discontinuities; makes queued GPU writes safe to discard. */
     fun discardPendingReadbacks() {
         if (pendingPbos.isEmpty()) return
         GLES30.glFinish()
         pendingPbos.forEach { slot ->
+            slot.info?.let { releaseSourceTexture(it.sourceTextureId) }
             if (slot.fence != 0L) GLES30.glDeleteSync(slot.fence)
             slot.fence = 0L
             slot.info = null
@@ -301,22 +351,37 @@ class OesFrameGrabber {
             discardHeadPbo(slot)
             return null
         }
-        discardHeadPbo(slot)
+        discardHeadPbo(slot, releaseSource = false)
         return info
     }
 
-    private fun discardHeadPbo(slot: PboSlot) {
+    private fun discardHeadPbo(slot: PboSlot, releaseSource: Boolean = true) {
         if (pendingPbos.peekFirst() === slot) pendingPbos.removeFirst()
+        if (releaseSource) slot.info?.let { releaseSourceTexture(it.sourceTextureId) }
         if (slot.fence != 0L) GLES30.glDeleteSync(slot.fence)
         slot.fence = 0L
         slot.info = null
     }
 
     private fun drawOesToFbo(surfaceTexture: SurfaceTexture, width: Int, height: Int): Boolean {
+        ensureFbo(width, height)
+        return drawOesToFramebuffer(surfaceTexture, width, height, fbo, fboTex)
+    }
+
+    private fun drawOesToFramebuffer(
+        surfaceTexture: SurfaceTexture,
+        width: Int,
+        height: Int,
+        framebuffer: Int,
+        targetTexture: Int,
+    ): Boolean {
         if (!isInitialized || width <= 0 || height <= 0) return false
         surfaceTexture.getTransformMatrix(stMatrix)
-        ensureFbo(width, height)
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, framebuffer)
+        GLES20.glFramebufferTexture2D(
+            GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+            GLES20.GL_TEXTURE_2D, targetTexture, 0,
+        )
         GLES20.glViewport(0, 0, width, height)
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + TEXTURE_UNIT)
@@ -336,6 +401,120 @@ class OesFrameGrabber {
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         return error == GLES20.GL_NO_ERROR
+    }
+
+    private fun ensureHdrSources(width: Int, height: Int): Boolean {
+        if (hdrWidth == width && hdrHeight == height && hdrSourceSlots.all { it.textureId != 0 }) return true
+        if (hdrSourceSlots.any { it.inUse }) return false
+        releaseHdrSources()
+        val fboIds = IntArray(1)
+        GLES20.glGenFramebuffers(1, fboIds, 0)
+        hdrFramebuffer = fboIds[0]
+        val textureIds = IntArray(hdrSourceSlots.size)
+        GLES20.glGenTextures(textureIds.size, textureIds, 0)
+        try {
+            hdrSourceSlots.forEachIndexed { index, slot ->
+                slot.textureId = textureIds[index]
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, slot.textureId)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                GLES30.glTexImage2D(
+                    GLES20.GL_TEXTURE_2D, 0, GLES30.GL_RGBA16F, width, height, 0,
+                    GLES20.GL_RGBA, GLES30.GL_HALF_FLOAT, null,
+                )
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, hdrFramebuffer)
+                GLES20.glFramebufferTexture2D(
+                    GLES20.GL_FRAMEBUFFER, GLES20.GL_COLOR_ATTACHMENT0,
+                    GLES20.GL_TEXTURE_2D, slot.textureId, 0,
+                )
+                check(GLES20.glCheckFramebufferStatus(GLES20.GL_FRAMEBUFFER) == GLES20.GL_FRAMEBUFFER_COMPLETE) {
+                    "RGBA16F source framebuffer is incomplete"
+                }
+            }
+            hdrWidth = width
+            hdrHeight = height
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            return true
+        } catch (t: Throwable) {
+            Log.w(TAG, "RGBA16F source capture unavailable", t)
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            releaseHdrSources()
+            hdrSourceSupported = false
+            return false
+        }
+    }
+
+    private fun initializeCopyProgram() {
+        val vertex = compileShader(GLES20.GL_VERTEX_SHADER, """
+            attribute vec4 aPosition;
+            attribute vec4 aTextureCoord;
+            varying vec2 vTextureCoord;
+            void main() { gl_Position = aPosition; vTextureCoord = aTextureCoord.xy; }
+        """.trimIndent())
+        val fragment = compileShader(GLES20.GL_FRAGMENT_SHADER, """
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
+            precision mediump float;
+            #endif
+            varying vec2 vTextureCoord;
+            uniform sampler2D uTexture;
+            void main() { gl_FragColor = texture2D(uTexture, vTextureCoord); }
+        """.trimIndent())
+        copyProgram = GLES20.glCreateProgram()
+        GLES20.glAttachShader(copyProgram, vertex)
+        GLES20.glAttachShader(copyProgram, fragment)
+        GLES20.glLinkProgram(copyProgram)
+        GLES20.glDeleteShader(vertex)
+        GLES20.glDeleteShader(fragment)
+        val status = IntArray(1)
+        GLES20.glGetProgramiv(copyProgram, GLES20.GL_LINK_STATUS, status, 0)
+        if (status[0] != GLES20.GL_TRUE) {
+            val log = GLES20.glGetProgramInfoLog(copyProgram)
+            GLES20.glDeleteProgram(copyProgram)
+            copyProgram = 0
+            throw IllegalStateException("RGBA16F analysis-copy shader failed: $log")
+        }
+        copyPosition = GLES20.glGetAttribLocation(copyProgram, "aPosition")
+        copyTexCoord = GLES20.glGetAttribLocation(copyProgram, "aTextureCoord")
+        copyTexture = GLES20.glGetUniformLocation(copyProgram, "uTexture")
+    }
+
+    private fun copyHdrToAnalysis(sourceTextureId: Int, width: Int, height: Int): Boolean {
+        if (copyProgram == 0) return false
+        ensureFbo(width, height)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
+        GLES20.glViewport(0, 0, width, height)
+        GLES20.glUseProgram(copyProgram)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, sourceTextureId)
+        GLES20.glUniform1i(copyTexture, 0)
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(copyPosition)
+        GLES20.glVertexAttribPointer(copyPosition, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(copyTexCoord)
+        GLES20.glVertexAttribPointer(copyTexCoord, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        val error = GLES20.glGetError()
+        GLES20.glDisableVertexAttribArray(copyPosition)
+        GLES20.glDisableVertexAttribArray(copyTexCoord)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+        return error == GLES20.GL_NO_ERROR
+    }
+
+    private fun releaseHdrSources() {
+        val ids = hdrSourceSlots.map { it.textureId }.filter { it != 0 }.toIntArray()
+        if (ids.isNotEmpty()) GLES20.glDeleteTextures(ids.size, ids, 0)
+        hdrSourceSlots.forEach { it.textureId = 0; it.inUse = false }
+        if (hdrFramebuffer != 0) GLES20.glDeleteFramebuffers(1, intArrayOf(hdrFramebuffer), 0)
+        hdrFramebuffer = 0
+        hdrWidth = 0
+        hdrHeight = 0
     }
 
     /**
@@ -595,6 +774,7 @@ class OesFrameGrabber {
 
     private fun releasePbos() {
         pendingPbos.forEach { slot ->
+            slot.info?.let { releaseSourceTexture(it.sourceTextureId) }
             if (slot.fence != 0L) GLES30.glDeleteSync(slot.fence)
             slot.fence = 0L
             slot.info = null
@@ -612,6 +792,9 @@ class OesFrameGrabber {
      */
     fun release() {
         releasePbos()
+        releaseHdrSources()
+        if (copyProgram != 0) GLES20.glDeleteProgram(copyProgram)
+        copyProgram = 0
         releaseFbo()
         if (program != 0) {
             GLES20.glDeleteProgram(program)

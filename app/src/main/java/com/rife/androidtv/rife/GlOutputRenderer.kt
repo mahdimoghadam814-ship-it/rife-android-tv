@@ -55,7 +55,11 @@ class GlOutputRenderer {
         """
 
         private const val FRAGMENT_SHADER = """
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
             precision mediump float;
+            #endif
             varying vec2 vTextureCoord;
             uniform sampler2D uTexture;
             void main() {
@@ -1191,6 +1195,42 @@ class GlOutputRenderer {
         renderCalls++
     }
 
+    /** Presents a retained GPU source texture without converting it through the RGBA8 analysis buffer. */
+    fun renderTexture(sourceTexture: Int, width: Int, height: Int, timestampNs: Long = 0L): Boolean {
+        val eglDisplay = display ?: return false
+        val eglContext = context ?: return false
+        val eglSurface = windowSurface ?: return false
+        if (program == 0 || sourceTexture == 0 || width <= 0 || height <= 0 ||
+            !bindWindow(eglDisplay, eglSurface, eglContext)
+        ) return false
+        if (surfaceWidth != width || surfaceHeight != height) updateSurfaceSize()
+        GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
+        GLES20.glUseProgram(program)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, sourceTexture)
+        GLES20.glUniform1i(uTextureHandle, 0)
+        updateContentScale(width, height, surfaceWidth, surfaceHeight)
+        GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
+        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        vertexBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aPositionHandle)
+        GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        texCoordBuffer.position(0)
+        GLES20.glEnableVertexAttribArray(aTextureCoordHandle)
+        GLES20.glVertexAttribPointer(aTextureCoordHandle, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+        val error = GLES20.glGetError()
+        GLES20.glDisableVertexAttribArray(aPositionHandle)
+        GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        if (error != GLES20.GL_NO_ERROR) return false
+        outputTimestampNs = timestampNs
+        swapBuffers(eglDisplay, eglSurface, "hdr-source")
+        renderCalls++
+        return true
+    }
+
     /**
      * Motion-compensated blend of [frame0] and [frame1] using the packed field in [motion], then
      * presents it. Buffer layout and calling-thread contract match [render].
@@ -1536,7 +1576,8 @@ class GlOutputRenderer {
         srcHeight: Int,
         targetWidth: Int,
         targetHeight: Int,
-        timesteps: FloatArray
+        timesteps: FloatArray,
+        timestamps: LongArray = LongArray(0),
     ): Boolean {
         if (timesteps.isEmpty()) {
             return false
@@ -1581,8 +1622,32 @@ class GlOutputRenderer {
 
         return drawWarps(
             eglDisplay, eglSurface, frame0, frame1, srcWidth, srcHeight,
-            targetWidth, targetHeight, gridW, gridH, timesteps
+            targetWidth, targetHeight, gridW, gridH, timesteps, timestamps
         )
+    }
+
+    /** Motion-compensates retained FP16 source textures; only the compact native field is uploaded. */
+    fun renderWarpTextures(
+        frame0Texture: Int,
+        frame1Texture: Int,
+        motion: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        timesteps: FloatArray,
+        timestamps: LongArray = LongArray(0),
+    ): Boolean {
+        if (frame0Texture == 0 || frame1Texture == 0 || timesteps.isEmpty()) return false
+        val gridStep = NativeEngine.motionFieldStep()
+        val gridW = (targetWidth + gridStep - 1) / gridStep
+        val gridH = (targetHeight + gridStep - 1) / gridStep
+        if (!renderWarpWithTextures(
+                frame0Texture, frame1Texture, motion, srcWidth, srcHeight,
+                targetWidth, targetHeight, timesteps, timestamps
+            )
+        ) return false
+        return true
     }
 
     /**
