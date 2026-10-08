@@ -321,6 +321,8 @@ class VideoFrameProcessor(
     private var droppedOutputFrameCount = 0L
     private var submittedOutputFrameCount = 0L
     private var surfaceRecoveryRequested = false
+    private var lastCaptureContentLogNs = 0L
+    private var lastRenderContentLogNs = 0L
     private var diagnosticOutputStartCount = 0L
     private var diagnosticWindowStartNs = 0L
     private var droppedOutputAtWindowStart = 0L
@@ -1872,6 +1874,19 @@ class VideoFrameProcessor(
         frameCountInput++
         if (sourceTextureId != 0) hdrTextureByAnalysisBuffer[frame.pixels] = sourceTextureId
 
+        // Rate-limited content probe: distinguishes "capture produced black pixels" from
+        // "presentation shows black". Zero here means the decoder/OES feed is black even though
+        // every per-stage counter looks healthy.
+        val captureProbeNs = System.nanoTime()
+        if (captureProbeNs - lastCaptureContentLogNs >= 1_000_000_000L) {
+            lastCaptureContentLogNs = captureProbeNs
+            Log.i(
+                TAG,
+                "[CONTENT] capture ${frame.width}x${frame.height} checksum=" +
+                    calculateChecksum(frame.pixels, frame.width, frame.height)
+            )
+        }
+
         // Bounded queue with explicit backpressure: drop the oldest frame rather than growing.
         if (!frameQueue.offer(frame)) {
             droppedFrameCount++
@@ -2954,6 +2969,18 @@ class VideoFrameProcessor(
         }
         pixels.position(0)
         pixels.limit(requiredBytes.toInt())
+
+        // Rate-limited content probe at the render boundary: non-zero here with a black screen
+        // means the pixels are fine and the fault is presentation-side (EGL/SurfaceView/colour).
+        val renderProbeNs = System.nanoTime()
+        if (renderProbeNs - lastRenderContentLogNs >= 1_000_000_000L) {
+            lastRenderContentLogNs = renderProbeNs
+            Log.i(
+                TAG,
+                "[CONTENT] renderInput ${width}x${height} checksum=" +
+                    calculateChecksum(pixels, width, height)
+            )
+        }
 
         // DIAGNOSTICS: Log checksum before sending to GlOutputRenderer
         if (VERBOSE_DIAGNOSTICS) {

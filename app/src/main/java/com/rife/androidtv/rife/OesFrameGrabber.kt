@@ -63,7 +63,11 @@ class OesFrameGrabber {
     private var pboBytes = 0
     private var pboSupported = false
     private data class HdrSourceSlot(var textureId: Int = 0, var inUse: Boolean = false)
-    private val hdrSourceSlots = Array(3) { HdrSourceSlot() }
+    // Sized for the deepest in-flight set the pipelined motion/render path can hold at once:
+    // previousFrame(1) + pair in flight(2) + pendingRenderQueue(2) + the frame being captured(1).
+    // With only 3 slots every other capture was refused ("hdr source leases exhausted"), pinning
+    // HDR capture at half rate and eventually spiraling into health-check resets.
+    private val hdrSourceSlots = Array(6) { HdrSourceSlot() }
     private var hdrFramebuffer = 0
     private var hdrWidth = 0
     private var hdrHeight = 0
