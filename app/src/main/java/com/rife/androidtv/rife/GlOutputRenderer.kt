@@ -112,8 +112,8 @@ class GlOutputRenderer {
          *    (the anchor is the centre of the 16 px search window, not half the pitch), so the
          *    effective texel is `(p - 8)/step`. `uMotionGrid` is `step * gridW` and
          *    `uMotionOffset` is `step/2 - 8`, which is exactly zero at `step == 16` - so with
-         *    SVPlayer's overlap off, or with MEMC, the expression collapses back to `p / uMotionGrid`
-         *    unchanged. CLAMP_TO_EDGE is the border clamp rather than an extrapolation.
+         *    SVPlayer's overlap off the expression collapses back to `p / uMotionGrid` unchanged.
+         *    CLAMP_TO_EDGE is the border clamp rather than an extrapolation.
          *  * the two sample positions are the native `x - mv*t` and `x - mv*(1-t)`; adding the
          *    half texel back converts pixel index to texture coordinate. The packed field is in
          *    half-pel, so `* 0.5` in the decode below is what turns it back into pixels.

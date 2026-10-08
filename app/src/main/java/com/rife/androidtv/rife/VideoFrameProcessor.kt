@@ -114,8 +114,23 @@ class VideoFrameProcessor(
 
         /** Pooled capture buffers. Bounded so a 4K stream cannot inflate the heap. */
         private const val MAX_POOLED_FRAME_BUFFERS = 2
-        private const val FRAME_MEMORY_BUDGET_BYTES = 128L * 1024L * 1024L
-        private const val MAX_CAPTURE_FRAMES_BUDGETED = 8L
+
+        /**
+         * Worst-case number of full-resolution RGBA frames the pipeline can own at the same
+         * instant: 4 in the frame queue + 1 previous frame + 2 pooled + 3 working buffers
+         * (input0, input1, output). The denoiser's 2 scratch buffers are added only while the
+         * denoiser is on, because they are allocated only while it is on.
+         */
+        private const val LIVE_CAPTURE_FRAMES = 10L
+        private const val LIVE_CAPTURE_FRAMES_DENOISED = 12L
+
+        /**
+         * Upper bound on that frame set before the pipeline gives up and passes frames through
+         * instead of interpolating. It is sized so a 4K frame set (~330 MB) is attempted, and so
+         * anything clearly beyond it (6K and up) is not. It is a refusal, never a downscale: the
+         * capture size is never changed because of it.
+         */
+        private const val FRAME_MEMORY_BUDGET_BYTES = 512L * 1024L * 1024L
 
         private const val WORKER_TASK_TIMEOUT_MS = 3000L
 
@@ -142,8 +157,8 @@ class VideoFrameProcessor(
         private const val MAX_PAIR_INTERVAL_US = 1_000_000L
 
         /** The supported interpolation ratios, matching the clamp in setMemcLevel(). */
-        private const val MIN_MEMC_RATIO = 2.0
-        private const val MAX_MEMC_RATIO = 4.0
+        private const val MIN_INTERPOLATION_RATIO = 2.0
+        private const val MAX_INTERPOLATION_RATIO = 4.0
 
         /** Hard stop on one pair's emission list, so a bad timestamp cannot loop forever. */
         private const val MAX_OUTPUTS_PER_PAIR = 8
@@ -243,6 +258,12 @@ class VideoFrameProcessor(
     // ---------------------------------------------------------------------------------------
 
     private var workerThread: HandlerThread? = null
+
+    /**
+     * Read from the motion thread to decide where it may hand a finished result back, so it has to
+     * be visible across threads.
+     */
+    @Volatile
     private var workerHandler: Handler? = null
 
     /** All of the following are only touched on the worker thread. */
@@ -284,9 +305,29 @@ class VideoFrameProcessor(
     /** High-precision source textures live until their analysis buffer leaves the frame pipeline. */
     private val hdrTextureByAnalysisBuffer = IdentityHashMap<ByteBuffer, Int>()
 
-    /** MEMC/SVPlayer's CPU SAD search runs away from the decoder/GL handler. */
+    /**
+     * Buffers the motion thread is reading right now, with a count per buffer. Worker-owned.
+     *
+     * Motion runs on its own executor, so `resetPipelineOnWorker()` can drain `previousFrame`
+     * and `frameQueue` while a task is still walking those pixels. Returning such a buffer to
+     * the pool lets `obtainFrameBuffer()` hand the very same memory to the capture path, which
+     * then overwrites it with a newer frame underneath the reader - a torn motion field, which
+     * shows up as warping rather than as anything the logs would call an error.
+     */
+    private val motionLeasedBuffers = IdentityHashMap<ByteBuffer, Int>()
+
+    /**
+     * Buffers whose release was deferred because a motion task still holds a lease on them.
+     * Identity-keyed on purpose: `ByteBuffer.hashCode()`/`equals()` walk the whole pixel
+     * payload, which for a 4K frame is a 33 MB hash on every deferral, and two frames holding
+     * identical pixels would be mistaken for each other.
+     */
+    private val motionDeferredReleases: MutableSet<ByteBuffer> =
+        java.util.Collections.newSetFromMap(IdentityHashMap<ByteBuffer, Boolean>())
+
+    /** SVPlayer's CPU SAD search runs away from the decoder/GL handler. */
     private val motionExecutor = Executors.newSingleThreadExecutor { task ->
-        Thread(task, "MemcMotionWorker").apply { isDaemon = true }
+        Thread(task, "SvpMotionWorker").apply { isDaemon = true }
     }
 
     /** CPU denoise (FastDVDnet) runs on a separate executor to keep the worker free for capture/render. */
@@ -295,8 +336,10 @@ class VideoFrameProcessor(
     }
 
     private var pairProcessing = false
+
+    /** Snapshotted on the worker but compared from the motion thread, so it must be visible. */
+    @Volatile
     private var streamGeneration = 0L
-    private var inFlightPair: Pair<FrameData, FrameData>? = null
 
     private data class PreparedMotion(
         val field: ByteBuffer?,
@@ -353,6 +396,16 @@ class VideoFrameProcessor(
     private var cachedOutBuf: ByteBuffer? = null
     private var cachedTargetSize = 0
     private var rejectedTargetSize = 0
+
+    /**
+     * Frame size whose *interpolation* scratch set was refused (over the budget above, or an
+     * allocation failure). At this size the pipeline keeps capturing and keeps showing video but
+     * skips the interpolation call. Deliberately a different flag from [rejectedTargetSize]:
+     * that one means the capture buffer itself could not be allocated, which leaves nothing to
+     * read back and is what produces a black screen.
+     */
+    private var bypassTargetSize = 0
+    private var bypassReportedForSize = 0
 
     /**
      * Packed motion field for the GPU warp: four bytes per 16x16 block, so a few kilobytes even
@@ -1005,9 +1058,6 @@ class VideoFrameProcessor(
     /** True when the current source is HDR (PQ or HLG), regardless of interpolation state. */
     private fun isHdrSource(): Boolean = ColorInfo.isTransferHdr(sourceColorInfo)
 
-    /** True when the pipeline is interpolating and the source is HDR (algorithm-specific decisions). */
-    private fun isHdrMemcSource(): Boolean = isRifeEnabled && isHdrSource()
-
     /**
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
      * next pair already emits at the new cadence; the emission phase is re-anchored from that
@@ -1278,11 +1328,12 @@ class VideoFrameProcessor(
             discarded++
         }
 
-        // Clean up in-flight pair (motion submitted, not yet done)
-        val reservedPrevious = inFlightPair?.first
-        if (inFlightPair == null) pairProcessing = false
+        // Motion submitted but not yet rendered now lives only in the motion task's own closure
+        // and in the lease table below; there is no separate "in-flight pair" reservation to
+        // drop, so the previous frame is released outright.
+        pairProcessing = false
         previousFrame?.let {
-            if (it !== reservedPrevious) releaseFrameBuffer(it.pixels)
+            releaseFrameBuffer(it.pixels)
             discarded++
         }
         previousFrame = null
@@ -1309,6 +1360,8 @@ class VideoFrameProcessor(
         frameBufferPool.clear()
         cachedTargetSize = 0
         rejectedTargetSize = 0
+        bypassTargetSize = 0
+        bypassReportedForSize = 0
         readbackInProgress = false
 
         frameCountInput = 0
@@ -1338,6 +1391,10 @@ class VideoFrameProcessor(
     }
 
     private fun releaseStateOnWorker() {
+        // Motion tasks may still be holding leases on buffers this teardown just discarded; the
+        // tables are worthless from here on and must not outlive the pipeline they describe.
+        motionLeasedBuffers.clear()
+        motionDeferredReleases.clear()
         pendingOutputSurfaceInfo = null
         // The renderer this pointed at is about to go away; the owner stops the encoder itself,
         // so dropping the reference here only stops us drawing into a Surface nobody owns.
@@ -1750,7 +1807,7 @@ class VideoFrameProcessor(
                 "RES POLICY: src=${sourceWidth}x$sourceHeight " +
                     "surface=${outputRenderer?.outputSurfaceWidth ?: 0}x" +
                     "${outputRenderer?.outputSurfaceHeight ?: 0} " +
-                    "res=$resolution memc=$isRifeEnabled denoise=$isDenoiseEnabled " +
+                    "res=$resolution interpolation=$isRifeEnabled denoise=$isDenoiseEnabled " +
                     "-> capture=${captureWidth}x$captureHeight" + hdrInfo
             )
         }
@@ -1875,6 +1932,7 @@ class VideoFrameProcessor(
             droppedFrameCount++
             frameQueue.poll()?.let { releaseFrameBuffer(it.pixels) }
             if (!frameQueue.offer(frame)) {
+                droppedFrameCount++
                 releaseFrameBuffer(frame.pixels)
                 return
             }
@@ -1920,26 +1978,35 @@ class VideoFrameProcessor(
 
         // Motion can run off-thread. Submit motion work; render will happen when motion completes.
         val generation = streamGeneration
+        leaseForMotion(prev.pixels)
+        leaseForMotion(nextFrame.pixels)
         motionExecutor.execute {
             val prepared = computeMotionFieldOffThread(prev, nextFrame)
             val handler = workerHandler
             if (handler == null) {
-                // Handler gone; clean up and drop
+                // `workerHandler` only becomes null after `stop()` has already run
+                // releaseStateOnWorker() and drained the pipeline, so there is no worker left to
+                // race and no pool worth returning to: drop the lease without recycling, and do
+                // not touch worker-owned buffers from this thread.
+                dropMotionLeases(prev, nextFrame, recycle = false)
                 if (generation == streamGeneration) {
                     runOnWorker("async_motion_fallback") { processFramePair(prev, nextFrame, prepared) }
-                } else {
-                    releaseFrameBuffer(prev.pixels)
-                    releaseFrameBuffer(nextFrame.pixels)
                 }
                 return@execute
             }
-            handler.post {
+            val posted = handler.post {
                 // Motion done. Enqueue for rendering, then IMMEDIATELY try to submit next motion.
+                dropMotionLeases(prev, nextFrame)
                 val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
                 pendingRenderQueue.addLast(work)
 
                 // Try to render from queue (this will also submit next motion if available)
                 renderPendingQueue()
+            }
+            if (!posted) {
+                // The looper only stops quitting after releaseStateOnWorker() drained the
+                // pipeline, so this is teardown: drop the lease without recycling.
+                dropMotionLeases(prev, nextFrame, recycle = false)
             }
         }
     }
@@ -1955,7 +2022,11 @@ class VideoFrameProcessor(
         if (released) return
         val work = pendingRenderQueue.removeFirstOrNull() ?: return
         if (work.generation != streamGeneration) {
-            // Stream changed; clean up this work
+            // Stream changed since the motion task was submitted; clean up this work. Counted
+            // here as well as in the reset itself because a reset only counts what it drained -
+            // this item was queued after the drain.
+            droppedFrameCount++
+            Log.d(TAG, "Dropping work computed against an older stream generation")
             releaseFrameBuffer(work.prev.pixels)
             releaseFrameBuffer(work.next.pixels)
             // Schedule next render attempt
@@ -1994,23 +2065,29 @@ class VideoFrameProcessor(
         if (!canPrepareMotionOffThread) return
 
         val generation = streamGeneration
+        leaseForMotion(prev.pixels)
+        leaseForMotion(nextFrame.pixels)
         motionExecutor.execute {
             val prepared = computeMotionFieldOffThread(prev, nextFrame)
             val handler = workerHandler
             if (handler == null) {
+                // See the sibling submit site: teardown, so drop without recycling.
+                dropMotionLeases(prev, nextFrame, recycle = false)
                 if (generation == streamGeneration) {
                     runOnWorker("async_motion_fallback") { processFramePair(prev, nextFrame, prepared) }
-                } else {
-                    releaseFrameBuffer(prev.pixels)
-                    releaseFrameBuffer(nextFrame.pixels)
                 }
                 return@execute
             }
-            handler.post {
+            val posted = handler.post {
+                dropMotionLeases(prev, nextFrame)
                 val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
                 pendingRenderQueue.addLast(work)
                 // Note: we do NOT call renderPendingQueue() here to avoid re-entrancy.
                 // The current render will call it when it finishes.
+            }
+            if (!posted) {
+                // See the sibling submit site: teardown, so drop without recycling.
+                dropMotionLeases(prev, nextFrame, recycle = false)
             }
         }
         // Remove the pair from queue now that motion is committed
@@ -2117,8 +2194,12 @@ class VideoFrameProcessor(
             return
         }
 
-        val den0Buf = cachedDenoised0Buf!!
-        val den1Buf = cachedDenoised1Buf!!
+        // Present only while the denoiser is on; ensureCachedBuffers() above just allocated or
+        // trimmed them for this exact cycle, and the toggles are switched on the worker so they
+        // cannot move underneath this cycle. Both consumers below still check for null so a
+        // missing scratch buffer degrades to the undenoised frame instead of throwing.
+        val den0Buf = cachedDenoised0Buf
+        val den1Buf = cachedDenoised1Buf
         val outBuf = cachedOutBuf!!
 
         prev.pixels.clear()
@@ -2178,7 +2259,7 @@ class VideoFrameProcessor(
         if (!isRifeEnabled) {
             // State 2: denoise-only. The current frame is cleaned and rendered as-is; no
             // interpolation is attempted and no extra frame is invented.
-            if (fastDvdNetEngine.isEnabled) {
+            if (fastDvdNetEngine.isEnabled && den1Buf != null) {
                 // Nothing else on this path asks for the field, but the denoiser's whole premise
                 // is that it samples the history where this pair's content moved to, so it computes
                 // one here. computeMotionField() reports success for the block-matching search, so
@@ -2217,11 +2298,18 @@ class VideoFrameProcessor(
                     return
                 }
                 noteDenoiseUnavailable()
-                // Offload CPU denoise to separate executor
-                val denoiseFuture = denoiseExecutor.submit {
-                    fastDvdNetEngine.denoiseFrameBuffer(nextFrame.pixels, rifeInputW, rifeInputH, den1Buf)
+                // Same refusal as the interpolation path below: the CPU denoiser works in 8-bit
+                // and would destroy the precision this capture exists to keep. Reporting false
+                // takes the branch that presents the retained high-precision texture instead.
+                val denoised = if (isHdrSource()) {
+                    false
+                } else {
+                    // Offload CPU denoise to separate executor
+                    val denoiseFuture = denoiseExecutor.submit {
+                        fastDvdNetEngine.denoiseFrameBuffer(nextFrame.pixels, rifeInputW, rifeInputH, den1Buf)
+                    }
+                    denoiseFuture.get() as Boolean
                 }
-                val denoised = denoiseFuture.get() as Boolean
                 if (denoised) {
                     // DIAGNOSTICS: Log checksum after FastDVDnet pass-through
                     if (VERBOSE_DIAGNOSTICS) {
@@ -2233,8 +2321,9 @@ class VideoFrameProcessor(
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
                 }
             } else {
-                // Both stages were switched off between capture and processing: forward the frame
-                // instead of leaving a stale picture on the output surface.
+                // The denoiser was switched off between capture and processing, or its scratch
+                // buffer could not be kept: forward the frame instead of leaving a stale picture
+                // on the output surface.
                 renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             }
             lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
@@ -2259,7 +2348,9 @@ class VideoFrameProcessor(
         val gpuDenoiseWanted = !isHdrSource() && fastDvdNetEngine.isEnabled &&
             outputRenderer?.isDenoiseInitialized == true
         // Skip CPU denoise for HDR sources: denoise operates in 8-bit and destroys HDR precision.
-        if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted && !isHdrSource()) {
+        if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted && !isHdrSource() &&
+            den0Buf != null && den1Buf != null
+        ) {
             // Offload CPU denoise to separate executor to keep worker free for capture/render
             val denoiseFuture = denoiseExecutor.submit {
                 val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(in0Buf, rifeInputW, rifeInputH, den0Buf)
@@ -2388,6 +2479,7 @@ class VideoFrameProcessor(
             // describe the filter's output, and running the stage's own pass on top would denoise
             // the same frame twice.
             var denoiseReady = false
+            outputRenderer?.isHdr = isHdrSource()
             if (gpuDenoiseWanted) {
                 denoiseReady = motionReady && motionBuf != null &&
                     outputRenderer?.renderDenoise(
@@ -2419,7 +2511,6 @@ class VideoFrameProcessor(
                 }
             }
 
-            outputRenderer?.isHdr = isHdrSource()
             var presented = intermediate.isEmpty()
             val hdrFrame0 = hdrTextureByAnalysisBuffer[prev.pixels] ?: 0
             val hdrFrame1 = hdrTextureByAnalysisBuffer[nextFrame.pixels] ?: 0
@@ -2578,7 +2669,7 @@ class VideoFrameProcessor(
         // there instead of from the frame on the far side of the jump.
         val discontinuity = realGapUs != intervalUs
         val baseUs = if (discontinuity) nextUs - intervalUs else prevUs
-        val ratio = memcLevelMultiplier.toDouble().coerceIn(MIN_MEMC_RATIO, MAX_MEMC_RATIO)
+        val ratio = memcLevelMultiplier.toDouble().coerceIn(MIN_INTERPOLATION_RATIO, MAX_INTERPOLATION_RATIO)
         val stepUs = maxOf(1L, (intervalUs / ratio).toLong())
 
         // At exactly 3x, each source pair owns exactly two synthesized moments. Pin them to
@@ -2594,7 +2685,7 @@ class VideoFrameProcessor(
         if (discontinuity ||
             nextOutputUs == Long.MIN_VALUE ||
             nextOutputUs <= baseUs ||
-            nextOutputUs > baseUs + (MAX_MEMC_RATIO * intervalUs).toLong()
+            nextOutputUs > baseUs + (MAX_INTERPOLATION_RATIO * intervalUs).toLong()
         ) {
             nextOutputUs = baseUs + stepUs
         }
@@ -2748,7 +2839,11 @@ class VideoFrameProcessor(
             return false
         }
         val requiredBytesInt = requiredBytes.toInt()
-        if (rejectedTargetSize == requiredBytesInt) return false
+        // Two distinct refusals, and only one of them may poison capture. `rejectedTargetSize`
+        // makes obtainFrameBuffer return a zero-capacity buffer, which stops the read-back
+        // entirely; it is set only by a genuine capture allocation failure. `bypassTargetSize`
+        // only skips the interpolation call for this pair while video keeps flowing.
+        if (bypassTargetSize == requiredBytesInt || rejectedTargetSize == requiredBytesInt) return false
         val gridStep = NativeEngine.motionFieldStep()
         val gridW = (inputWidth + gridStep - 1) / gridStep
         val gridH = (inputHeight + gridStep - 1) / gridStep
@@ -2756,10 +2851,30 @@ class VideoFrameProcessor(
         // blend weight and its noise floor. Mirrors MemcInterpolator::motionFieldBytes(), which the
         // JNI side re-checks against the buffer capacity before it writes anything.
         val motionBytes = gridW.toLong() * gridH.toLong() * 8L
-        val estimatedMemory = requiredBytes * (5L + MAX_CAPTURE_FRAMES_BUDGETED) + motionBytes
+        // Denoiser scratch exists only while the denoiser is on, so it must not be counted while
+        // it is off. The previous figure of "5 + 8" counted every capture buffer the queue could
+        // ever have held plus five working buffers and still never matched what is actually live;
+        // this one is the real peak below.
+        val liveFrames = if (fastDvdNetEngine.isEnabled) {
+            LIVE_CAPTURE_FRAMES_DENOISED
+        } else {
+            LIVE_CAPTURE_FRAMES
+        }
+        val estimatedMemory = requiredBytes * liveFrames + motionBytes
         if (estimatedMemory > FRAME_MEMORY_BUDGET_BYTES) {
-            rejectedTargetSize = requiredBytes.toInt()
-            Log.e(TAG, "Direct frame budget rejects ${inputWidth}x${inputHeight}: estimated=${estimatedMemory} budget=$FRAME_MEMORY_BUDGET_BYTES")
+            bypassTargetSize = requiredBytesInt
+            Log.e(
+                TAG,
+                "Interpolation skipped at ${inputWidth}x${inputHeight}: live frame set needs $estimatedMemory bytes " +
+                    "over the $FRAME_MEMORY_BUDGET_BYTES byte budget; frames pass through uninterpolated"
+            )
+            if (bypassReportedForSize != requiredBytesInt) {
+                bypassReportedForSize = requiredBytesInt
+                reportError(
+                    "Interpolation needs more memory than available at ${inputWidth}x${inputHeight}; " +
+                        "playing through without interpolation"
+                )
+            }
             return false
         }
         if (motionBytes > Int.MAX_VALUE) {
@@ -2768,16 +2883,18 @@ class VideoFrameProcessor(
         }
         // Read into a local: a mutable property can never be smart-cast across the null check.
         val motionCapacity = cachedMotionBuf?.capacity() ?: 0
-        if (cachedIn0Buf == null || cachedIn1Buf == null || cachedDenoised0Buf == null ||
-            cachedDenoised1Buf == null || cachedOutBuf == null ||
+        val denoiseOn = fastDvdNetEngine.isEnabled
+        val needsDenoiseScratch = denoiseOn && (cachedDenoised0Buf == null || cachedDenoised1Buf == null)
+        if (cachedIn0Buf == null || cachedIn1Buf == null || cachedOutBuf == null ||
             motionCapacity < motionBytes ||
-            cachedTargetSize != requiredBytesInt
+            cachedTargetSize != requiredBytesInt ||
+            needsDenoiseScratch
         ) {
             try {
                 val in0 = ByteBuffer.allocateDirect(requiredBytesInt)
                 val in1 = ByteBuffer.allocateDirect(requiredBytesInt)
-                val den0 = ByteBuffer.allocateDirect(requiredBytesInt)
-                val den1 = ByteBuffer.allocateDirect(requiredBytesInt)
+                val den0 = if (denoiseOn) ByteBuffer.allocateDirect(requiredBytesInt) else null
+                val den1 = if (denoiseOn) ByteBuffer.allocateDirect(requiredBytesInt) else null
                 val out = ByteBuffer.allocateDirect(requiredBytesInt)
                 val motion = ByteBuffer.allocateDirect(motionBytes.toInt())
                 cachedIn0Buf = in0; cachedIn1Buf = in1
@@ -2787,8 +2904,18 @@ class VideoFrameProcessor(
                 cachedIn0Buf = null; cachedIn1Buf = null
                 cachedDenoised0Buf = null; cachedDenoised1Buf = null
                 cachedOutBuf = null; cachedMotionBuf = null; cachedTargetSize = 0
-                rejectedTargetSize = requiredBytesInt
-                Log.e(TAG, "Direct buffer allocation failed at ${inputWidth}x${inputHeight}; frame will bypass", oom)
+                // Bypass, not reject: capture is unaffected, so the picture keeps moving.
+                bypassTargetSize = requiredBytesInt
+                Log.e(
+                    TAG,
+                    "Interpolation buffer allocation failed at ${inputWidth}x${inputHeight}; " +
+                        "frames pass through uninterpolated",
+                    oom
+                )
+                if (bypassReportedForSize != requiredBytesInt) {
+                    bypassReportedForSize = requiredBytesInt
+                    reportError("Not enough memory to interpolate at ${inputWidth}x${inputHeight}; playing through")
+                }
                 return false
             }
             cachedTargetSize = requiredBytesInt
@@ -2796,6 +2923,13 @@ class VideoFrameProcessor(
                 TAG,
                 "Allocated interpolation buffers ($requiredBytesInt bytes each, motion field $motionBytes bytes)"
             )
+        } else if (!denoiseOn && (cachedDenoised0Buf != null || cachedDenoised1Buf != null)) {
+            // Two full-resolution scratch buffers were held while no code path could write to
+            // them. They are only touched by the denoise stage, which runs on this worker inside
+            // the same cycle as this check, so nothing can be reading them here.
+            cachedDenoised0Buf = null
+            cachedDenoised1Buf = null
+            Log.i(TAG, "Released denoiser scratch (disabled): $requiredBytesInt bytes each")
         }
         return true
     }
@@ -2840,10 +2974,60 @@ class VideoFrameProcessor(
      */
     private fun releaseFrameBuffer(buffer: ByteBuffer?) {
         if (buffer == null) return
+        if (motionLeasedBuffers.containsKey(buffer)) {
+            // A motion task is still reading these pixels. Keep the buffer out of the pool -
+            // and keep its HDR source texture from being handed to the next capture - until
+            // that task drops its lease, then run the release that was held back.
+            motionDeferredReleases.add(buffer)
+            return
+        }
+        finishFrameBufferRelease(buffer)
+    }
+
+    /** Returns [buffer] to its owner. Called directly only when no motion task can be reading it. */
+    private fun finishFrameBufferRelease(buffer: ByteBuffer) {
         hdrTextureByAnalysisBuffer.remove(buffer)?.let { frameGrabber?.releaseSourceTexture(it) }
+        // One buffer can be offered twice: the motion task drops its lease on a frame a reset
+        // deferred, and the stale-work branch then releases the very same frame a few lines
+        // later. ArrayDeque has no duplicate check, so without this the buffer would occupy two
+        // slots and `obtainFrameBuffer()` could hand the same memory to two live frames.
+        if (frameBufferPool.any { it === buffer }) return
         if (frameBufferPool.size >= minOf(MAX_POOLED_FRAME_BUFFERS, 2)) return
         buffer.clear()
         frameBufferPool.add(buffer)
+    }
+
+    /**
+     * Marks [buffer] as being read by the motion thread. Worker thread only, and always before
+     * the task is submitted so the task can never finish first and drop a lease nobody has taken.
+     */
+    private fun leaseForMotion(buffer: ByteBuffer?) {
+        if (buffer == null) return
+        motionLeasedBuffers[buffer] = (motionLeasedBuffers[buffer] ?: 0) + 1
+    }
+
+    /**
+     * Drops one lease and performs any release that was deferred while it was held. Reached from
+     * the worker when the task can be handed back, and from the motion thread only once the worker
+     * is unreachable - at that point `stop()` has already run `releaseStateOnWorker()` and quit the
+     * looper, so no worker can be inside these tables, and a stale drop is an inert no-op.
+     */
+    private fun dropMotionLease(buffer: ByteBuffer?, recycle: Boolean) {
+        if (buffer == null) return
+        val remaining = (motionLeasedBuffers[buffer] ?: 0) - 1
+        if (remaining > 0) {
+            motionLeasedBuffers[buffer] = remaining
+            return
+        }
+        motionLeasedBuffers.remove(buffer)
+        if (motionDeferredReleases.remove(buffer) && recycle) {
+            finishFrameBufferRelease(buffer)
+        }
+    }
+
+    private fun dropMotionLeases(prev: FrameData, next: FrameData, recycle: Boolean = true) {
+        dropMotionLease(prev.pixels, recycle)
+        dropMotionLease(next.pixels, recycle)
     }
 
     /**
