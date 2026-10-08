@@ -68,6 +68,16 @@ class UdpTsPacketSink(
     @Volatile private var lastWindowLogMs = windowStartMs
     @Volatile private var lastWindowBytesSent = 0L
 
+    /**
+     * Wall clock spent inside `DatagramSocket.send` over the current report window, plus the
+     * worst single send. Measurement only - the transport, the queue discipline and the drop
+     * policy are untouched - but it is the difference between "the network is slow" and "the
+     * socket blocked the drain thread", which look identical from the outside.
+     */
+    private var windowSendNs = 0L
+    private var windowSendCount = 0L
+    private var windowSendMaxNs = 0L
+
     /** Consecutive send failures, so a dead receiver is visible without logging every packet. */
     @Volatile
     private var consecutiveFailures = 0
@@ -163,7 +173,12 @@ class UdpTsPacketSink(
                 break
             } ?: continue
             try {
+                val tSendNs = System.nanoTime()
                 socket.send(DatagramPacket(slot.buffer, slot.length, address, port))
+                val costNs = System.nanoTime() - tSendNs
+                windowSendNs += costNs
+                windowSendCount++
+                if (costNs > windowSendMaxNs) windowSendMaxNs = costNs
                 datagramsSent.incrementAndGet()
                 bytesSent.addAndGet(slot.length.toLong())
                 consecutiveFailures = 0
@@ -173,7 +188,13 @@ class UdpTsPacketSink(
                     val totalBytes = bytesSent.get()
                     val rate = (totalBytes - lastWindowBytesSent).coerceAtLeast(0L) * 8.0 / (elapsed * 1000.0)
                     lastWindowBytesSent = totalBytes
-                    Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=DVB-when-supported packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} queue=${pending.size} droppedVideo=${droppedVideoFrames()} droppedPackets=${datagramsDropped.get()} windowMs=$elapsed")
+                    val sendAvgUs = if (windowSendCount > 0) windowSendNs / windowSendCount / 1000 else 0L
+                    val sendMaxUs = windowSendMaxNs / 1000
+                    val sendCalls = windowSendCount
+                    windowSendNs = 0
+                    windowSendCount = 0
+                    windowSendMaxNs = 0
+                    Log.i(TAG, "[UDP] host=$address port=$port processing=$processingSize remoteFps=$remoteOutputFps encoder=$encoderCodec/$encoderProfile bitrate=$bitrateBps audio=passthrough(E-AC-3|AAC-ADTS) subtitles=DVB-when-supported packetsSent=${datagramsSent.get()} sendRateMbps=${String.format(java.util.Locale.US, "%.2f", rate)} sendAvgUs=$sendAvgUs sendMaxUs=$sendMaxUs sendCalls=$sendCalls queue=${pending.size} droppedVideo=${droppedVideoFrames()} droppedPackets=${datagramsDropped.get()} windowMs=$elapsed")
                     lastWindowLogMs = now
                 }
             } catch (interrupted: InterruptedException) {

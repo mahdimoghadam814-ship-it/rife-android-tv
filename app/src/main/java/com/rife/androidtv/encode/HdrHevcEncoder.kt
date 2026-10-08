@@ -102,6 +102,9 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
          */
         private const val EOS_QUIET_TIMEOUT_NS = 500_000_000L
 
+        /** Cadence of the [ENCODE] drain-thread report; long enough not to drown the pipeline. */
+        private const val DRAIN_LOG_INTERVAL_NS = 5_000_000_000L
+
         /**
          * ~0.1 bit per pixel, which lands near 50 Mbps for 4K60 and near 5 Mbps for 1080p24 -
          * the bottom of the 40-80 Mbps band the plan asks to start testing in, deliberately below
@@ -262,6 +265,23 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
     @Volatile
     private var eosRequestedAtNs = 0L
 
+    /**
+     * Drain-thread timing over the current report window, written only by the drain thread.
+     *
+     * Two numbers, and they answer different questions. [statDequeueNs] is time spent waiting for
+     * the codec to produce something - which is expected to dominate, because the loop polls with
+     * a 10 ms timeout and an idle encoder is the healthy case. [statHandoffNs] is time spent
+     * handing an access unit to the muxer, and that is the one that reveals backpressure: if the
+     * muxer or the network below it is behind, this is where the encoder's drain thread stalls.
+     */
+    private var statDequeueNs = 0L
+    private var statDequeueMaxNs = 0L
+    private var statHandoffNs = 0L
+    private var statHandoffMaxNs = 0L
+    private var statTryAgain = 0L
+    private var statOutputs = 0L
+    private var statLastLogNs = 0L
+
     /** The surface rendering must target; null until [open] has succeeded. */
     val inputSurface: Surface?
         get() = input
@@ -362,11 +382,51 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
         Log.i(TAG, "[HDR] output codec=$selectedCodecName profile=$profile level=$level colorStandard=$standard colorTransfer=$transfer colorRange=$range hdr10Confirmed=$hdr10Confirmed staticHdr=${format.containsKey(MediaFormat.KEY_HDR_STATIC_INFO)}")
     }
 
+    /**
+     * Periodic drain-thread report. Deliberately every few seconds rather than per frame: this
+     * thread runs for the whole stream and a per-frame line would bury the pipeline timings it
+     * exists to explain. The window counters are reset here so each line describes one interval.
+     */
+    private fun maybeLogDrainStats() {
+        val now = System.nanoTime()
+        if (statLastLogNs == 0L) {
+            statLastLogNs = now
+            return
+        }
+        val elapsedNs = now - statLastLogNs
+        if (elapsedNs < DRAIN_LOG_INTERVAL_NS) return
+        val seconds = elapsedNs / 1_000_000_000.0
+        val outputs = statOutputs
+        val dequeueCalls = outputs + statTryAgain
+        val dequeueAvgMs = if (dequeueCalls > 0) statDequeueNs / dequeueCalls / 1_000_000.0 else 0.0
+        val dequeueMaxMs = statDequeueMaxNs / 1_000_000.0
+        val handoffAvgUs = if (outputs > 0) statHandoffNs / outputs / 1_000.0 else 0.0
+        val handoffMaxUs = statHandoffMaxNs / 1_000.0
+        Log.i(
+            TAG,
+            "[ENCODE] codec=$selectedCodecName outputs=$outputs " +
+                "outFps=${String.format(java.util.Locale.US, "%.1f", outputs / seconds)} " +
+                "dequeueAvgMs=${String.format(java.util.Locale.US, "%.2f", dequeueAvgMs)} " +
+                "dequeueMaxMs=${String.format(java.util.Locale.US, "%.2f", dequeueMaxMs)} " +
+                "handoffAvgUs=${String.format(java.util.Locale.US, "%.1f", handoffAvgUs)} " +
+                "handoffMaxUs=${String.format(java.util.Locale.US, "%.1f", handoffMaxUs)} " +
+                "tryAgain=$statTryAgain windowS=${String.format(java.util.Locale.US, "%.1f", seconds)}"
+        )
+        statDequeueNs = 0
+        statDequeueMaxNs = 0
+        statHandoffNs = 0
+        statHandoffMaxNs = 0
+        statTryAgain = 0
+        statOutputs = 0
+        statLastLogNs = now
+    }
+
     private fun loop() {
         val info = MediaCodec.BufferInfo()
         var sawFormat = false
         while (true) {
             val c = codec ?: return
+            val tDequeueNs = System.nanoTime()
             val index = try {
                 c.dequeueOutputBuffer(info, CODEC_TIMEOUT_US)
             } catch (t: Throwable) {
@@ -374,8 +434,12 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                 sink.onError(t)
                 return
             }
+            val dequeueNs = System.nanoTime() - tDequeueNs
+            statDequeueNs += dequeueNs
+            if (dequeueNs > statDequeueMaxNs) statDequeueMaxNs = dequeueNs
             when {
                 index == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                    statTryAgain++
                     if (eosRequested) {
                         val waitedNs = System.nanoTime() - eosRequestedAtNs
                         if (waitedNs > EOS_QUIET_TIMEOUT_NS) {
@@ -423,11 +487,17 @@ class HdrHevcEncoder(private val sink: EncodedStreamSink) {
                     if (info.size > 0) {
                         buf.position(info.offset)
                         buf.limit(info.offset + info.size)
+                        val tHandoffNs = System.nanoTime()
                         try {
                             sink.onAccessUnit(buf, info)
                         } catch (t: Throwable) {
                             Log.e(TAG, "sink rejected an access unit", t)
                         }
+                        val handoffNs = System.nanoTime() - tHandoffNs
+                        statHandoffNs += handoffNs
+                        if (handoffNs > statHandoffMaxNs) statHandoffMaxNs = handoffNs
+                        statOutputs++
+                        maybeLogDrainStats()
                     }
                     val eos = (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0
                     try {

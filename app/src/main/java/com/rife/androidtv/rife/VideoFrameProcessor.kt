@@ -6,6 +6,7 @@ import android.opengl.EGL14
 import android.opengl.EGLContext
 import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
+import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
@@ -191,6 +192,13 @@ class VideoFrameProcessor(
          * Keep 2 frames of latency headroom = ~8ms. Frames older than this are stale.
          */
         private const val MAX_QUEUE_LATENCY_MS = 16L
+
+        /** Dataspace the source probe could not read: API below 33, or the getter threw. */
+        private const val DATA_SPACE_NOT_QUERIED = -2
+        private const val DATA_SPACE_UNKNOWN = -1
+
+        /** How often a stable HDR source re-reports its evidence; SDR reports once. */
+        private const val HDR_PROBE_REPEAT_NS = 10_000_000_000L
     }
 
     /**
@@ -538,6 +546,19 @@ class VideoFrameProcessor(
     private var codecDataSpaceProbed = false
     private var codecDataSpaceProbeLogged = false
 
+    /**
+     * Source-side HDR evidence log state. Reset whenever the decoder's identity or the colour
+     * metadata changes, so a new stream always reports fresh evidence instead of inheriting the
+     * previous one's.
+     */
+    private var hdrProbeLogged = false
+    private var hdrProbeLastKey = ""
+    private var hdrProbeLastNs = 0L
+
+    /** Observational only; measures the retained FP16 source without touching the render path. */
+    private var hdrRepresentationProbe: HdrRepresentationProbe? = null
+    private var hdrOutputInvariantReported = false
+
     /** Set once the GPU warp has refused a pair, so the fallback is reported without spamming. */
     private var warnedGpuWarpFallback = false
 
@@ -563,6 +584,29 @@ class VideoFrameProcessor(
     private var nsCopy = 0L
     private var nsChecksum = 0L
     private var nsJni = 0L
+    // nsJni alone could not say which half of the native work was expensive, so the two native
+    // stages are timed separately: the motion search (which may have run on another thread and is
+    // folded in through its own elapsed time) and the interpolator/warp called on this thread.
+    private var nsMotion = 0L
+    private var nsInterp = 0L
+    // Time inside the readback-completion step only: fence check, PBO map and copy. Distinct from
+    // nsReadback, which also covers submitting the next capture, so a stall here is a GPU/CPU
+    // synchronisation cost and a stall there is a capture cost.
+    private var nsPoll = 0L
+    // Time between this callback returning and the next one starting. Anything not explained by
+    // the measured stages lives here: handler dispatch, other messages on the worker, OS
+    // scheduling.
+    private var nsWorkerGap = 0L
+    private var workerGapSamples = 0
+    private var maxWorkerGapNs = 0L
+    private var lastCallbackExitNs = 0L
+    // Decoder cadence measured from callback arrivals: the wall-clock interval between one
+    // decoded frame becoming available and the next. It is the only number here that is outside
+    // this class's control, so it is what an in-process stage time has to be judged against.
+    private var lastArrivalNs = 0L
+    private var nsDecodeInterval = 0L
+    private var decodeIntervalCount = 0
+    private var maxDecodeIntervalNs = 0L
     private var nsRender = 0L
     private var nsPair = 0L
     private var nsQueueLatency = 0L
@@ -1051,7 +1095,26 @@ class VideoFrameProcessor(
         sourceColorInfo = colorInfo
         runOnWorker("setSourceColorInfo") {
             hdrCaptureUnavailableLogged = false
+            hdrProbeLogged = false
+            hdrRepresentationProbe?.reset()
             Log.i(TAG, "[HDR] inputColor=${colorInfo ?: "unknown"} outputDataSpace=$outputDataSpace")
+        }
+    }
+
+    /**
+     * The decoder's own identity: its MIME and the codec-capabilities string Media3 hands us,
+     * which is where the profile and level live (for example `hvc1.2.4.L120.90` or `dvhe.08.06`).
+     * Stored only so the source probe can quote evidence rather than infer HDR from branding.
+     */
+    @Volatile private var sourceMimeType: String? = null
+    @Volatile private var sourceCodecs: String? = null
+
+    fun setSourceStreamInfo(mime: String?, codecs: String?) {
+        val changed = sourceMimeType != mime || sourceCodecs != codecs
+        sourceMimeType = mime
+        sourceCodecs = codecs
+        if (changed) {
+            runOnWorker("setSourceStreamInfo") { hdrProbeLogged = false }
         }
     }
 
@@ -1400,6 +1463,9 @@ class VideoFrameProcessor(
         // so dropping the reference here only stops us drawing into a Surface nobody owns.
         encodeSurface = null
         resetPipelineOnWorker("release")
+        hdrRepresentationProbe?.release()
+        hdrRepresentationProbe = null
+        hdrOutputInvariantReported = false
         outputRenderer?.release()
         outputRenderer = null
 
@@ -1571,12 +1637,24 @@ class VideoFrameProcessor(
             // context is released first so its program and texture do not leak.
             outputRenderer?.release()
             outputRenderer = null
+            hdrRepresentationProbe?.release()
+            hdrRepresentationProbe = null
             val renderer = GlOutputRenderer()
             renderer.init(context)
             // A renderer recreated for a new surface has to come up with the level the user
             // picked, not with the shader's own default.
             renderer.denoiseStrength = denoiseStrength
+            // An HDR source presented into an 8-bit window surface would look like a fix and be
+            // a silent precision loss, so the renderer escalates it instead of keeping it to
+            // itself. One report per stream, never per frame.
+            renderer.onHdrOutputInvariant = { message ->
+                if (!hdrOutputInvariantReported) {
+                    hdrOutputInvariantReported = true
+                    reportError(message)
+                }
+            }
             outputRenderer = renderer
+            hdrRepresentationProbe = HdrRepresentationProbe()
 
             // The replaced EGL/SurfaceTexture state has to outlive the handover, so it is retired
             // here and destroyed by onInputSurfaceAttached() once the player has the new surface.
@@ -1664,9 +1742,37 @@ class VideoFrameProcessor(
      * SurfaceTexture. This is where real decoded pixels become available.
      */
     private fun onInputFrameAvailableOnWorker(texture: SurfaceTexture) {
+        // Bracketing the whole callback is what makes the inter-callback gap measurable: every
+        // exit path, including the early returns, has to close the window or the number would
+        // drift with whichever branch a frame happened to take. The gap is where anything not
+        // covered by a stage timer shows up - handler dispatch, other worker messages, OS
+        // scheduling - which is the difference between "the pipeline is slow" and "the worker
+        // never got scheduled".
+        try {
+            handleInputFrameAvailableOnWorker(texture)
+        } finally {
+            lastCallbackExitNs = System.nanoTime()
+        }
+    }
+
+    private fun handleInputFrameAvailableOnWorker(texture: SurfaceTexture) {
         // Counted first: this is the decoder-arrival rate the audit asks for, and it must be
         // visible even when every later stage rejects the frame.
         frameCountArrival++
+        val entryNs = System.nanoTime()
+        if (lastCallbackExitNs != 0L) {
+            val gap = entryNs - lastCallbackExitNs
+            nsWorkerGap += gap
+            workerGapSamples++
+            if (gap > maxWorkerGapNs) maxWorkerGapNs = gap
+        }
+        if (lastArrivalNs != 0L) {
+            val interval = entryNs - lastArrivalNs
+            nsDecodeInterval += interval
+            decodeIntervalCount++
+            if (interval > maxDecodeIntervalNs) maxDecodeIntervalNs = interval
+        }
+        lastArrivalNs = entryNs
         if (released) {
             return
         }
@@ -1728,6 +1834,7 @@ class VideoFrameProcessor(
             // Acquires the frame the decoder has just queued. It must be called exactly once per
             // available frame, before the texture is sampled.
             texture.updateTexImage()
+            probeSourceTexture(texture)
             captureFrameFromInputSurface(texture)
         } catch (t: Throwable) {
             droppedFrameCount++
@@ -1735,6 +1842,135 @@ class VideoFrameProcessor(
             reportError("Frame capture failed: ${t.message}")
         } finally {
             readbackInProgress = false
+        }
+    }
+
+    /**
+     * One-shot-per-stream evidence for the HDR root cause, taken AFTER `updateTexImage()` so it
+     * describes the frame the OES sampler is actually about to read rather than a value observed
+     * before the buffer was acquired.
+     *
+     * Purely observational: nothing here feeds into [isHdrSource], the encoder's colour config,
+     * the render path, or the shaders. It exists because "it is HDR" so far rests on Media3's
+     * [ColorInfo] and on Dolby Vision branding; the dataspace the producer actually stamped on the
+     * buffer is a different, independently checkable fact.
+     */
+    private fun probeSourceTexture(texture: SurfaceTexture) {
+        val color = sourceColorInfo
+        val mime = sourceMimeType
+        val codecs = sourceCodecs
+        val hdr = isHdrSource()
+        // SurfaceTexture.getDataSpace() only exists from API 33; below that the producer's answer
+        // is simply not reachable through this API and the log says so instead of guessing.
+        val surfaceDataSpace = if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                texture.dataSpace
+            } catch (t: Throwable) {
+                DATA_SPACE_UNKNOWN
+            }
+        } else {
+            DATA_SPACE_NOT_QUERIED
+        }
+        val shaderHdr = outputRenderer?.isHdr ?: false
+        val retained = hdr && frameGrabber?.isHdrSourceSupported == true
+        val key = "$mime|$codecs|$color|$surfaceDataSpace|$outputDataSpace|$hdr|$shaderHdr|$retained"
+        val now = System.nanoTime()
+        val first = !hdrProbeLogged
+        val changed = key != hdrProbeLastKey
+        // HDR keeps reporting every ten seconds so a mid-stream metadata change cannot hide;
+        // a stable SDR source only ever reports once, which is all a baseline needs.
+        val due = hdr && now - hdrProbeLastNs >= HDR_PROBE_REPEAT_NS
+        if (!first && !changed && !due) return
+        hdrProbeLogged = true
+        hdrProbeLastKey = key
+        hdrProbeLastNs = now
+        Log.i(
+            TAG,
+            "[HDRPROBE] mime=$mime codecs=$codecs profile=${describeCodecProfile(codecs)} " +
+                "colorInfo=${color ?: "unknown"} " +
+                "surfaceDataSpace=$surfaceDataSpace(${describeDataSpace(surfaceDataSpace)}) " +
+                "outputDataSpace=$outputDataSpace(${describeDataSpace(outputDataSpace)}) " +
+                "codecDataSpace=$codecDataSpace(${describeDataSpace(codecDataSpace)}) " +
+                "isHdrSource=$hdr shaderIsHdr=$shaderHdr " +
+                "captureFormat=${if (retained) "GL_RGBA16F" else "GL_RGBA8"} " +
+                "fp16Retained=$retained"
+        )
+    }
+
+    /**
+     * Human-readable decode of an Android dataspace: standard, transfer, range. The layout has
+     * been stable since O, and the same decode is used for every dataspace this class quotes so
+     * that two lines with the same shape can be compared directly.
+     */
+    private fun describeDataSpace(value: Int): String = when (value) {
+        DATA_SPACE_UNKNOWN -> "unknown"
+        DATA_SPACE_NOT_QUERIED -> "not-queried(api<33)"
+        0 -> "UNSPECIFIED"
+        else -> {
+            val standard = (value shr 16) and 0x3F
+            val transfer = (value shr 22) and 0x1F
+            val range = (value shr 27) and 0x1F
+            val s = when (standard) {
+                1 -> "BT709"
+                2 -> "BT601_625"
+                3 -> "BT601_525"
+                6 -> "BT2020"
+                10 -> "DCI_P3"
+                else -> "std$standard"
+            }
+            val t = when (transfer) {
+                1 -> "LINEAR"
+                2 -> "SRGB"
+                3 -> "SMPTE_170M"
+                7 -> "ST2084_PQ"
+                8 -> "HLG"
+                else -> "tr$transfer"
+            }
+            val r = when (range) {
+                1 -> "FULL"
+                2 -> "LIMITED"
+                else -> "r$range"
+            }
+            "$s/$t/$r"
+        }
+    }
+
+    /**
+     * Best-effort profile label from a codec-capabilities string. `hvc1.2.4.L120.90` and
+     * `dvhe.08.06` both carry it in the second field, so the raw string is always logged next to
+     * this and a decode this class does not know simply falls back to `unknown`.
+     */
+    private fun describeCodecProfile(codecs: String?): String {
+        if (codecs.isNullOrBlank()) return "unknown"
+        val fields = codecs.split('.')
+        if (fields.size < 2) return "unknown"
+        val tag = fields[0].lowercase()
+        val profile = fields[1]
+        return when {
+            tag.startsWith("hvc") || tag.startsWith("hev") -> when (profile) {
+                "1" -> "Main"
+                "2" -> "Main10"
+                "3" -> "MainStill"
+                else -> "HEVC-profile-$profile"
+            }
+            tag.startsWith("dv") -> when (profile) {
+                "0" -> "dv-mel"
+                "1" -> "dv-bl"
+                "4" -> "dv-profile4"
+                "5" -> "dv-profile5"
+                "7" -> "dv-profile7"
+                "8" -> "dv-profile8"
+                "9" -> "dv-profile9"
+                else -> "dv-profile-$profile"
+            }
+            tag.startsWith("av01") -> "av1-profile-$profile"
+            tag.startsWith("avc") -> when (profile) {
+                "64" -> "High"
+                "100" -> "High10"
+                "244" -> "High444"
+                else -> "avc-profile-$profile"
+            }
+            else -> "profile-$profile"
         }
     }
 
@@ -1855,6 +2091,7 @@ class VideoFrameProcessor(
             // Only poll ONCE per frame to avoid blocking the worker. If no PBO is ready,
             // we'll try again on the next frame. This prevents the worker from blocking
             // on PBO fences and allows true pipelining.
+            val tPollStart = System.nanoTime()
             val info = grabber.nextReadbackInfo()
             if (info != null) {
                 val completedPixels = obtainFrameBuffer(info.width, info.height)
@@ -1875,6 +2112,7 @@ class VideoFrameProcessor(
                     // PBO not ready yet, will retry next frame
                 }
             }
+            nsPoll += System.nanoTime() - tPollStart
             nsReadback += System.nanoTime() - tCaptureStart
             if (!queued) droppedFrameCount++
             // If we queued but didn't complete any, we'll poll again next frame
@@ -2275,7 +2513,9 @@ class VideoFrameProcessor(
                         motionBuf,
                         forwardOnly = true,
                     )
-                    nsJni += System.nanoTime() - tFieldStart
+                    val fieldNs = System.nanoTime() - tFieldStart
+                    nsMotion += fieldNs
+                    nsJni += fieldNs
                     if (fieldReady) {
                         val tRenderStart = System.nanoTime()
                         outputRenderer?.isHdr = isHdrSource()
@@ -2423,9 +2663,9 @@ class VideoFrameProcessor(
             times
         }
 
-        val tJniStart = System.nanoTime()
         var motionReady = preparedMotion?.ready ?: false
         if (preparedMotion == null && motionBuf != null && outputRenderer?.isWarpInitialized == true) {
+            val tMotionStart = System.nanoTime()
             motionReady = NativeEngine.computeMotionField(
                 src0Buf,
                 src1Buf,
@@ -2436,7 +2676,18 @@ class VideoFrameProcessor(
                 motionBuf,
                 forwardOnly = false,
             )
+            val motionNs = System.nanoTime() - tMotionStart
+            nsMotion += motionNs
+            nsJni += motionNs
         }
+        // The search may already have run on another thread while this pair waited, so its cost
+        // is real even though this thread did not spend it. Folding it into the motion total is
+        // what stops an off-thread submission from making the motion stage look free.
+        preparedMotion?.elapsedNs?.let { elapsed ->
+            nsMotion += elapsed
+            nsJni += elapsed
+        }
+        val tInterpStart = System.nanoTime()
         val success = when {
             // The warp path renders every point itself; nothing else has to run.
             motionReady -> true
@@ -2456,7 +2707,9 @@ class VideoFrameProcessor(
             // twice. It reports its own failure rather than the probe reporting it for it.
             else -> true
         }
-        nsJni += System.nanoTime() - tJniStart + (preparedMotion?.elapsedNs ?: 0L)
+        val interpNs = System.nanoTime() - tInterpStart
+        nsInterp += interpNs
+        nsJni += interpNs
 
         lastProcTimeMs = SystemClock.elapsedRealtime() - startTime
 
@@ -2512,6 +2765,12 @@ class VideoFrameProcessor(
             }
 
             var presented = intermediate.isEmpty()
+            // The warp presents every intermediate point in a single call, so nothing inside the
+            // renderer knows how many frames it produced. Counting them here is what keeps
+            // generatedOutFps honest: without it only the plain present is ever counted, which at
+            // 3x means one frame per pair gets attributed and the reported rate reads as a third
+            // of the rate actually reaching the surface.
+            var warpPresentedPoints = 0
             val hdrFrame0 = hdrTextureByAnalysisBuffer[prev.pixels] ?: 0
             val hdrFrame1 = hdrTextureByAnalysisBuffer[nextFrame.pixels] ?: 0
             val hdrComposition = hdrFrame0 != 0 && hdrFrame1 != 0
@@ -2543,7 +2802,9 @@ class VideoFrameProcessor(
                         intermediate, timestamps
                     ) == true
                 }
+                if (presented) warpPresentedPoints = intermediate.size
             }
+            submittedOutputFrameCount += warpPresentedPoints
             if (!presented) {
                 if (hdrComposition) {
                     // The 8-bit readback is analysis-only. If GPU composition fails, skip these
@@ -2571,6 +2832,7 @@ class VideoFrameProcessor(
                 var renderedPoints = 0
                 for (i in intermediate.indices) {
                     val t = intermediate[i]
+                    val tFallbackInterp = System.nanoTime()
                     val ok = NativeEngine.interpolateFrameBuffers(
                         src0Buf,
                         src1Buf,
@@ -2581,6 +2843,9 @@ class VideoFrameProcessor(
                         t,
                         outBuf
                     )
+                    val fallbackNs = System.nanoTime() - tFallbackInterp
+                    nsInterp += fallbackNs
+                    nsJni += fallbackNs
                     if (!ok) {
                         continue
                     }
@@ -2750,9 +3015,11 @@ class VideoFrameProcessor(
             TAG,
             "PIPELINE TIMING: n=$timingCycles " +
                 "readback=${fmtMs(nsReadback / n)} " +
+                "poll=${fmtMs(nsPoll / n)} " +
                 "copy=${fmtMs(nsCopy / n)} " +
                 "checksum=${fmtMs(nsChecksum / n)} " +
                 "jni=${fmtMs(nsJni / n)} " +
+                "motion=${fmtMs(nsMotion / n)} interp=${fmtMs(nsInterp / n)} " +
                 "render=${fmtMs(nsRender / n)} " +
                 "total=${fmtMs(nsPair / n)} ms/cycle | " +
                 "renderSplit calls=$renderCalls cur=${fmtMs(nsRenderCurrent / n)} " +
@@ -2776,7 +3043,30 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} motionMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
+        // Scheduling evidence rather than stage cost: how long the worker actually went quiet
+        // between callbacks, how regularly the decoder delivered, and how much wall clock each
+        // output frame was entitled to. A stage time that fits its budget with room to spare
+        // while the gap dominates is a scheduling problem, and a stage time that exceeds the
+        // budget on its own is not one.
+        val gapSamples = workerGapSamples.coerceAtLeast(1)
+        val decodeSamples = decodeIntervalCount.coerceAtLeast(1)
+        val decodeIntervalMs = nsDecodeInterval / decodeSamples / 1_000_000.0
+        val frameBudgetMs = if (sourceFps > 0.0) 1000.0 / (sourceFps * memcLevelMultiplier) else 0.0
+        val pairPerCycleMs = (nsPair / n) / 1_000_000.0
+        Log.i(
+            TAG,
+            "[SCHED] workerGapMs=${fmtMs((nsWorkerGap / gapSamples).toDouble())} " +
+                "workerGapMaxMs=${fmtMs(maxWorkerGapNs.toDouble())} " +
+                "workerCallbacks=$workerGapSamples " +
+                "decoderIntervalMs=${String.format(java.util.Locale.US, "%.2f", decodeIntervalMs)} " +
+                "decoderIntervalMaxMs=${fmtMs(maxDecodeIntervalNs.toDouble())} " +
+                "decoderSamples=$decodeIntervalCount " +
+                "frameBudgetMs=${String.format(java.util.Locale.US, "%.2f", frameBudgetMs)} " +
+                "pairMs=${String.format(java.util.Locale.US, "%.2f", pairPerCycleMs)} " +
+                "overBudget=${pairPerCycleMs > frameBudgetMs && frameBudgetMs > 0.0} " +
+                "queue=${frameQueue.size} readback=${frameGrabber?.readbackState() ?: "none"}"
+        )
         
         // HDR diagnostic line
         if (isHdrSource()) {
@@ -2795,9 +3085,12 @@ class VideoFrameProcessor(
         diagnosticOutputStartCount = submittedOutputFrameCount
         droppedOutputAtWindowStart = droppedOutputFrameCount
         nsReadback = 0
+        nsPoll = 0
         nsCopy = 0
         nsChecksum = 0
         nsJni = 0
+        nsMotion = 0
+        nsInterp = 0
         nsRender = 0
         nsRenderCurrent = 0
         nsRenderSetup = 0
@@ -2807,6 +3100,15 @@ class VideoFrameProcessor(
         nsPair = 0
         nsQueueLatency = 0
         queueLatencySamples = 0
+        // The gap counters are per-window but their anchors (lastCallbackExitNs, lastArrivalNs)
+        // deliberately are not: resetting an anchor would turn the first sample of the next
+        // window into a garbage interval spanning the whole report.
+        nsWorkerGap = 0
+        workerGapSamples = 0
+        maxWorkerGapNs = 0
+        nsDecodeInterval = 0
+        decodeIntervalCount = 0
+        maxDecodeIntervalNs = 0
         capturedAtWindowStart = frameCountInput
         outputAtWindowStart = frameCountOutput
         arrivalAtWindowStart = frameCountArrival
@@ -3077,6 +3379,15 @@ class VideoFrameProcessor(
     private fun renderFrameToOutput(frame: FrameData, timestampNs: Long = 0L) {
         val hdrTexture = hdrTextureByAnalysisBuffer[frame.pixels] ?: 0
         if (hdrTexture != 0) {
+            // Measured here rather than at capture because this is the exact texture the present
+            // samples; it is rate-limited inside and writes nothing, so the frame is unaffected.
+            hdrRepresentationProbe?.probe(
+                hdrTexture,
+                frame.width,
+                frame.height,
+                "tex=$hdrTexture ${frame.width}x${frame.height} out=$outputDataSpace " +
+                    "color=${sourceColorInfo ?: "unknown"}"
+            )
             outputRenderer?.isHdr = isHdrSource()
             if (outputRenderer?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true) {
                 submittedOutputFrameCount++

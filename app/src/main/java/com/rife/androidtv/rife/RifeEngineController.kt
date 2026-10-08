@@ -235,6 +235,7 @@ class RifeEngineController(
         sourceCodecs = codecs
         processor.setSourceFrameRate(frameRate)
         processor.setSourceColorInfo(colorInfo)
+        processor.setSourceStreamInfo(sampleMimeType, codecs)
         Log.i(TAG, "[HDR] inputColor=$colorInfo mime=$sampleMimeType codecs=$codecs")
     }
 

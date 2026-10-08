@@ -412,8 +412,39 @@ private const val WARP_FRAGMENT_SHADER = """
     @Volatile
     var denoiseStrength = 1f
 
+    /**
+     * Whether the shaders must convert their input to PQ before writing it out.
+     *
+     * Going true runs the output invariant: an HDR source presented into a window surface whose
+     * config has fewer than ten bits per channel loses the precision the whole HDR path exists to
+     * keep, and loses it silently, because the picture still appears. The setter escalates that
+     * through [onHdrOutputInvariant] rather than downgrading the request, since downgrading is
+     * exactly the workaround the pipeline is not allowed to fall back to.
+     */
     @Volatile
     var isHdr = false
+        set(value) {
+            if (field == value) return
+            field = value
+            if (value) enforceHdrOutputInvariant("isHdr turned on")
+        }
+
+    /**
+     * Raised once per window surface when an HDR source is about to be presented into a surface
+     * that cannot carry HDR precision. Wired by the owner so it becomes a reported error.
+     */
+    @Volatile
+    var onHdrOutputInvariant: ((String) -> Unit)? = null
+
+    /** Bits per channel the active config actually has; 0 before a surface exists. */
+    @Volatile
+    var outputColorBits = 0
+        private set
+
+    /** How the active window surface's config was chosen, for the log. */
+    @Volatile
+    private var windowConfigAttempt = "none"
+    private var hdrInvariantLoggedForSurface = false
 
     private var uIsHdrHandle = -1
     private var warpUIsHdr = -1
@@ -805,7 +836,7 @@ private const val WARP_FRAGMENT_SHADER = """
             EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
             EGL14.EGL_NONE
         )
-        var created = createWindowSurface(display, surface, strict)
+        var created = createWindowSurface(display, surface, strict, attempt = "strict8bit")
         if (created == null) {
             // A Main10 encoder's input surface is a 10-bit buffer, and an 8-bit config cannot
             // match it. RGB10_A2 is the 10-bit layout every GLES2 driver exposes; if the surface
@@ -819,7 +850,7 @@ private const val WARP_FRAGMENT_SHADER = """
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
                 EGL14.EGL_NONE
             )
-            created = createWindowSurface(display, surface, hdr)
+            created = createWindowSurface(display, surface, hdr, attempt = "hdr10bit")
         }
         if (created == null) {
             // The display surface has always matched RGBA8888, but a MediaCodec encoder input
@@ -833,17 +864,23 @@ private const val WARP_FRAGMENT_SHADER = """
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
                 EGL14.EGL_NONE
             )
-            created = createWindowSurface(display, surface, relaxed)
+            created = createWindowSurface(display, surface, relaxed, attempt = "relaxed")
             if (created == null) return
         }
 
         this.windowSurface = created
+        hdrInvariantLoggedForSurface = false
         updateSurfaceSize()
+        // Recorded for SDR too: "what did this surface actually get" is only meaningful if both
+        // cases answer it, and an SDR baseline is what an HDR reading is compared against.
+        outputColorBits = activeRedBits()
         Log.i(
             TAG,
             "Output window surface created (${surfaceWidth}x$surfaceHeight, " +
-                "eglConfig=${describeConfig()})"
+                "attempt=$windowConfigAttempt eglConfig=${describeConfig()} " +
+                "colorBits=$outputColorBits bits10BitConfigAvailable=${tenBitConfigAvailable()})"
         )
+        if (isHdr) enforceHdrOutputInvariant("surface created")
     }
 
     /** Adds a preview consumer while the primary window is the encoder input Surface. */
@@ -908,14 +945,16 @@ private const val WARP_FRAGMENT_SHADER = """
         surface: Surface,
         configAttribs: IntArray,
         /** False for surfaces that must not become the config [describeConfig] reports. */
-        recordConfig: Boolean = true
+        recordConfig: Boolean = true,
+        /** Which of the three attempts succeeded, so the log says how the format was arrived at. */
+        attempt: String = "unknown",
     ): EGLSurface? {
         val configs = arrayOfNulls<EGLConfig>(1)
         val numConfigs = IntArray(1)
         if (!EGL14.eglChooseConfig(display, configAttribs, 0, configs, 0, 1, numConfigs, 0) ||
             numConfigs[0] == 0
         ) {
-            Log.e(TAG, "eglChooseConfig failed for the output surface")
+            Log.e(TAG, "eglChooseConfig failed for the output surface (attempt=$attempt)")
             return null
         }
         val candidate = EGL14.eglCreateWindowSurface(
@@ -926,11 +965,81 @@ private const val WARP_FRAGMENT_SHADER = """
             0
         )
         if (candidate == null || candidate == EGL14.EGL_NO_SURFACE) {
-            Log.e(TAG, "eglCreateWindowSurface failed: 0x${EGL14.eglGetError().toString(16)}")
+            Log.e(
+                TAG,
+                "eglCreateWindowSurface failed (attempt=$attempt): " +
+                    "0x${EGL14.eglGetError().toString(16)}"
+            )
             return null
         }
-        if (recordConfig) activeConfig = configs[0]
+        if (recordConfig) {
+            activeConfig = configs[0]
+            windowConfigAttempt = attempt
+        }
         return candidate
+    }
+
+    /**
+     * Bits per channel of the red component in the config the window surface actually got. This
+     * is the one number that says whether the pixels written into the surface can carry HDR
+     * precision at all: 8 means they cannot, whatever the source is.
+     */
+    private fun activeRedBits(): Int {
+        val display = this.display ?: return 0
+        val config = activeConfig ?: return 0
+        val value = IntArray(1)
+        return if (EGL14.eglGetConfigAttrib(display, config, EGL14.EGL_RED_SIZE, value, 0)) {
+            value[0]
+        } else {
+            0
+        }
+    }
+
+    /**
+     * Whether a ten-bit window config exists on this device at all. Distinguishes "the driver
+     * offers 10-bit and this surface refused it" from "this driver has no 10-bit window config",
+     * which are two different problems with two different fixes.
+     */
+    private fun tenBitConfigAvailable(): Boolean {
+        val display = this.display ?: return false
+        val hdr = intArrayOf(
+            EGL14.EGL_RED_SIZE, 10,
+            EGL14.EGL_GREEN_SIZE, 10,
+            EGL14.EGL_BLUE_SIZE, 10,
+            EGL14.EGL_ALPHA_SIZE, 2,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_NONE
+        )
+        val configs = arrayOfNulls<EGLConfig>(4)
+        val num = IntArray(1)
+        return EGL14.eglChooseConfig(display, hdr, 0, configs, 0, 4, num, 0) && num[0] > 0
+    }
+
+    /**
+     * The invariant: an HDR source is never allowed to degrade to an eight-bit surface without
+     * that being said out loud. It deliberately does not "fix" the situation by forcing a
+     * ten-bit config - a forced config that the native window cannot match is the frozen-preview
+     * failure - and it does not quietly present HDR through eight bits either. It reports, once
+     * per window surface, and lets the owner decide what the right response is.
+     */
+    private fun enforceHdrOutputInvariant(reason: String) {
+        if (windowSurface == null) return
+        if (hdrInvariantLoggedForSurface) return
+        val bits = activeRedBits()
+        outputColorBits = bits
+        if (bits >= 10) {
+            hdrInvariantLoggedForSurface = true
+            return
+        }
+        hdrInvariantLoggedForSurface = true
+        val available = tenBitConfigAvailable()
+        val message = "HDR invariant: HDR source with an 8-bit output surface " +
+            "($reason, attempt=$windowConfigAttempt, colorBits=$bits, " +
+            "eglConfig=${describeConfig()}, tenBitConfigAvailable=$available). " +
+            "HDR is being quantised to 8 bits on the way out."
+        Log.e(TAG, message)
+        onHdrOutputInvariant?.invoke(message)
     }
 
     /**
@@ -2204,6 +2313,9 @@ private const val WARP_FRAGMENT_SHADER = """
         }
         windowSurface = null
         activeConfig = null
+        windowConfigAttempt = "none"
+        outputColorBits = 0
+        hdrInvariantLoggedForSurface = false
         outputSurface = null
         surfaceWidth = 0
         surfaceHeight = 0
