@@ -133,6 +133,18 @@ class VideoFrameProcessor(
          */
         private const val FRAME_MEMORY_BUDGET_BYTES = 512L * 1024L * 1024L
 
+        /**
+         * Cool-down before a stage that refused a size because a direct allocation threw is tried
+         * again. An OutOfMemoryError here is usually the previous size's buffers still waiting on
+         * their Cleaner rather than a size that can never fit, so waiting recovers; latching the
+         * refusal for the rest of the stream does not. The over-budget refusal above is a property
+         * of the size itself and is therefore still latched.
+         */
+        private const val ALLOCATION_RETRY_COOLDOWN_NS = 1_000_000_000L
+
+        /** Bounds the log line that reports a refusal and the retry that follows it. */
+        private const val ALLOCATION_LOG_INTERVAL_NS = 1_000_000_000L
+
         private const val WORKER_TASK_TIMEOUT_MS = 3000L
 
         /**
@@ -406,6 +418,13 @@ class VideoFrameProcessor(
     private var rejectedTargetSize = 0
 
     /**
+     * `System.nanoTime()` deadline after which [rejectedTargetSize] was set by an
+     * `OutOfMemoryError` may be retried, or 0 when the refusal is a property of the size and is
+     * therefore meant to last. Read and written on the worker only.
+     */
+    private var rejectRetryAfterNs = 0L
+
+    /**
      * Frame size whose *interpolation* scratch set was refused (over the budget above, or an
      * allocation failure). At this size the pipeline keeps capturing and keeps showing video but
      * skips the interpolation call. Deliberately a different flag from [rejectedTargetSize]:
@@ -414,6 +433,15 @@ class VideoFrameProcessor(
      */
     private var bypassTargetSize = 0
     private var bypassReportedForSize = 0
+
+    /**
+     * The mirror of [rejectRetryAfterNs] for [bypassTargetSize]: a non-zero deadline means the
+     * refusal came from an allocation failure and is cleared once it passes.
+     */
+    private var bypassRetryAfterNs = 0L
+
+    /** Rate-limiter for the single line that reports a refusal and the retry that follows it. */
+    private var lastAllocationLogNs = 0L
 
     /**
      * Packed motion field for the GPU warp: four bytes per 16x16 block, so a few kilobytes even
@@ -1423,8 +1451,11 @@ class VideoFrameProcessor(
         frameBufferPool.clear()
         cachedTargetSize = 0
         rejectedTargetSize = 0
+        rejectRetryAfterNs = 0L
         bypassTargetSize = 0
         bypassReportedForSize = 0
+        bypassRetryAfterNs = 0L
+        lastAllocationLogNs = 0L
         readbackInProgress = false
 
         frameCountInput = 0
@@ -2429,6 +2460,10 @@ class VideoFrameProcessor(
             releaseFrameBuffer(prev.pixels)
             renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             previousFrame = nextFrame
+            // Still a completed cycle: without these two the bypass blanks [PIPELINE] entirely
+            // and freezes the overlay, which is exactly what makes it invisible in a log.
+            reportStageTiming()
+            updateStats()
             return
         }
 
@@ -3043,7 +3078,7 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
         // Scheduling evidence rather than stage cost: how long the worker actually went quiet
         // between callbacks, how regularly the decoder delivered, and how much wall clock each
         // output frame was entitled to. A stage time that fits its budget with room to spare
@@ -3145,6 +3180,7 @@ class VideoFrameProcessor(
         // makes obtainFrameBuffer return a zero-capacity buffer, which stops the read-back
         // entirely; it is set only by a genuine capture allocation failure. `bypassTargetSize`
         // only skips the interpolation call for this pair while video keeps flowing.
+        expireAllocationRefusals()
         if (bypassTargetSize == requiredBytesInt || rejectedTargetSize == requiredBytesInt) return false
         val gridStep = NativeEngine.motionFieldStep()
         val gridW = (inputWidth + gridStep - 1) / gridStep
@@ -3165,6 +3201,8 @@ class VideoFrameProcessor(
         val estimatedMemory = requiredBytes * liveFrames + motionBytes
         if (estimatedMemory > FRAME_MEMORY_BUDGET_BYTES) {
             bypassTargetSize = requiredBytesInt
+            // A property of the size, not of the moment: no deadline, so it is not retried.
+            bypassRetryAfterNs = 0L
             Log.e(
                 TAG,
                 "Interpolation skipped at ${inputWidth}x${inputHeight}: live frame set needs $estimatedMemory bytes " +
@@ -3208,6 +3246,10 @@ class VideoFrameProcessor(
                 cachedOutBuf = null; cachedMotionBuf = null; cachedTargetSize = 0
                 // Bypass, not reject: capture is unaffected, so the picture keeps moving.
                 bypassTargetSize = requiredBytesInt
+                // Unlike the budget refusal above, an OutOfMemoryError says nothing about the
+                // size itself, so it is retried once the direct buffers of the previous size have
+                // had a chance to be returned.
+                bypassRetryAfterNs = System.nanoTime() + ALLOCATION_RETRY_COOLDOWN_NS
                 Log.e(
                     TAG,
                     "Interpolation buffer allocation failed at ${inputWidth}x${inputHeight}; " +
@@ -3249,6 +3291,7 @@ class VideoFrameProcessor(
             return ByteBuffer.allocateDirect(0)
         }
         val intBytes = requiredBytes.toInt()
+        expireAllocationRefusals()
         if (rejectedTargetSize == intBytes) {
             droppedFrameCount++
             return ByteBuffer.allocateDirect(0)
@@ -3265,9 +3308,51 @@ class VideoFrameProcessor(
         } catch (oom: OutOfMemoryError) {
             droppedFrameCount++
             rejectedTargetSize = intBytes
+            rejectRetryAfterNs = System.nanoTime() + ALLOCATION_RETRY_COOLDOWN_NS
             Log.e(TAG, "Capture allocation failed at ${width}x$height; suppressing repeat allocation", oom)
             ByteBuffer.allocateDirect(0)
         }
+    }
+
+    /**
+     * Clears a refusal whose cool-down has passed, so a stage that failed because a direct
+     * allocation threw is offered the size again instead of staying off for the rest of the
+     * stream. Worker thread only: both flags it touches are worker-owned.
+     */
+    private fun expireAllocationRefusals() {
+        val nowNs = System.nanoTime()
+        if (bypassRetryAfterNs != 0L && nowNs >= bypassRetryAfterNs) {
+            bypassRetryAfterNs = 0L
+            val size = bypassTargetSize
+            if (size != 0) {
+                bypassTargetSize = 0
+                bypassReportedForSize = 0
+                logAllocationRetry(nowNs, "interpolation scratch", size)
+            }
+        }
+        if (rejectRetryAfterNs != 0L && nowNs >= rejectRetryAfterNs) {
+            rejectRetryAfterNs = 0L
+            val size = rejectedTargetSize
+            if (size != 0) {
+                rejectedTargetSize = 0
+                logAllocationRetry(nowNs, "capture buffer", size)
+            }
+        }
+    }
+
+    /**
+     * Rate-limited record that a refused allocation was allowed to be tried again. The refusal
+     * itself is logged where it is raised; this is the line that distinguishes a one-second blip
+     * from a stream that never recovered, which is what the offline logs cannot show.
+     */
+    private fun logAllocationRetry(nowNs: Long, stage: String, size: Int) {
+        if (nowNs - lastAllocationLogNs < ALLOCATION_LOG_INTERVAL_NS) return
+        lastAllocationLogNs = nowNs
+        Log.i(
+            TAG,
+            "[ALLOC] retrying $stage allocation ($size bytes) after cool-down; " +
+                "another failure here means this size does not fit on this device"
+        )
     }
 
     /**
