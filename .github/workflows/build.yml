@@ -92,12 +92,14 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      # Versions must match the project: compileSdk/targetSdk 37 (gradle/libs.versions.toml),
-      # ndkVersion 26.3.11579264 and CMake 3.22.1 (app/build.gradle.kts).
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: "platform-tools platforms;android-37 build-tools;37.0.0 ndk;26.3.11579264 cmake;3.22.1"
+          # API 37 is the project's compileSdk, but the runner's sdkmanager index has no
+          # 'platforms;android-37'/'build-tools;37.0.0' package (verified: it fails with
+          # "Failed to find package"). This is the exact set the last green run used; the Android
+          # Gradle Plugin installs compileSdk 37 itself once the licenses are accepted.
+          packages: "platform-tools platforms;android-34 build-tools;34.0.0 ndk;26.3.11579264 cmake;3.22.1"
 
       - name: Build Debug APK
         run: |
