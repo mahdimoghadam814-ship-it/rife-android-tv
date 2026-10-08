@@ -320,6 +320,7 @@ class VideoFrameProcessor(
     private var droppedFrameCount = 0L
     private var droppedOutputFrameCount = 0L
     private var submittedOutputFrameCount = 0L
+    private var surfaceRecoveryRequested = false
     private var diagnosticOutputStartCount = 0L
     private var diagnosticWindowStartNs = 0L
     private var droppedOutputAtWindowStart = 0L
@@ -336,7 +337,7 @@ class VideoFrameProcessor(
     private var stageSubmittedAtBeat = 0L
     private var stageDroppedInAtBeat = 0L
     private var stageDroppedOutAtBeat = 0L
-    private var stagePrevArrival = 0
+    private var stagePrevArrival = 0L
 
     private var cachedIn0Buf: ByteBuffer? = null
     private var cachedIn1Buf: ByteBuffer? = null
@@ -811,16 +812,16 @@ class VideoFrameProcessor(
             if (released) return
             val now = System.nanoTime()
             val windowSec = ((now - stageHeartbeatNs).coerceAtLeast(1L)) / 1_000_000_000.0
-            val arrival = frameCountArrival - stageArrivalAtBeat
-            val captured = frameCountInput - stageCapturedAtBeat
-            val processed = frameCountOutput - stageOutputAtBeat
+            val arrival = (frameCountArrival - stageArrivalAtBeat).toLong()
+            val captured = (frameCountInput - stageCapturedAtBeat).toLong()
+            val processed = (frameCountOutput - stageOutputAtBeat).toLong()
             val submitted = submittedOutputFrameCount - stageSubmittedAtBeat
             val droppedIn = droppedFrameCount - stageDroppedInAtBeat
             val droppedOut = droppedOutputFrameCount - stageDroppedOutAtBeat
             val queue = frameQueue.size
-            val moved = arrival > 0 || captured > 0 || processed > 0 || submitted > 0 ||
+            val moved = arrival > 0L || captured > 0L || processed > 0L || submitted > 0L ||
                 droppedIn != 0L || droppedOut != 0L
-            val stalled = isProcessingEnabled && stagePrevArrival > 0 && arrival == 0
+            val stalled = isProcessingEnabled && stagePrevArrival > 0 && arrival == 0L
             if (moved || stalled) {
                 val f = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
                 Log.i(
@@ -833,6 +834,14 @@ class VideoFrameProcessor(
                         if (stalled) " | STALLED: decoder delivered no frames this second" else ""
                 )
             }
+
+            // Pipeline health check: if frames are arriving but none are being submitted to output,
+            // the pipeline may be stuck. Trigger a recovery.
+            if (isProcessingEnabled && arrival > 0L && submitted == 0L && processed == 0L && captured == 0L) {
+                Log.w(TAG, "[HEALTH CHECK] Pipeline stalled: frames arriving but none processed/rendered. Triggering recovery.")
+                resetPipelineOnWorker("health_check_stalled_pipeline")
+            }
+
             stageHeartbeatNs = now
             stageArrivalAtBeat = frameCountArrival
             stageCapturedAtBeat = frameCountInput
@@ -2913,14 +2922,24 @@ class VideoFrameProcessor(
     ) {
         // An encode can run before, or without, any preview surface being published, so the
         // encoder target counts as a legitimate destination here.
-        if (pendingOutputSurfaceInfo == null && encodeSurface == null) { droppedOutputFrameCount++; return }
+        if (pendingOutputSurfaceInfo == null && encodeSurface == null) {
+            droppedOutputFrameCount++
+            Log.w(TAG, "renderBufferToOutput: no output surface or encode surface; frame dropped")
+            return
+        }
         val surface = activeOutputSurface()
         if (surface == null || !surface.isValid) {
             Log.w(TAG, "renderBufferToOutput: no valid output surface; frame dropped")
             droppedOutputFrameCount++
+            // Attempt to recover by requesting surface re-creation
+            requestSurfaceRecovery()
             return
         }
-        val renderer = outputRenderer ?: run { droppedOutputFrameCount++; return }
+        val renderer = outputRenderer ?: run {
+            droppedOutputFrameCount++
+            Log.w(TAG, "renderBufferToOutput: renderer not available; frame dropped")
+            return
+        }
         if (!renderer.isInitialized) {
             Log.w(TAG, "renderBufferToOutput: renderer not initialized; frame dropped")
             droppedOutputFrameCount++
@@ -2930,14 +2949,13 @@ class VideoFrameProcessor(
         val requiredBytes = width.toLong() * height.toLong() * 4L
         if (requiredBytes > Int.MAX_VALUE) {
             Log.e(TAG, "renderBufferToOutput: dimensions ${width}x$height overflow Int")
+            droppedOutputFrameCount++
             return
         }
         pixels.position(0)
         pixels.limit(requiredBytes.toInt())
 
-        // DIAGNOSTICS: Log checksum before sending to GlOutputRenderer. This samples the buffer
-        // one byte at a time through ByteBuffer.get(offset), i.e. ~91k JNI calls per 854x427
-        // frame and ~182k per interpolated pair, so it must never run on the playback path.
+        // DIAGNOSTICS: Log checksum before sending to GlOutputRenderer
         if (VERBOSE_DIAGNOSTICS) {
             val renderChecksum = calculateChecksum(pixels, width, height)
             Log.d(TAG, "PIPELINE CHECKSUM: before GlOutputRenderer ${width}x$height checksum=$renderChecksum")
@@ -2945,11 +2963,34 @@ class VideoFrameProcessor(
 
         try {
             renderer.isHdr = isHdrSource()
-            renderer.render(pixels, width, height, timestampNs)
-            submittedOutputFrameCount++
+            val success = renderer.render(pixels, width, height, timestampNs)
+            if (success) {
+                submittedOutputFrameCount++
+                surfaceRecoveryRequested = false
+            } else {
+                droppedOutputFrameCount++
+                Log.w(TAG, "renderBufferToOutput: renderer.render returned false; frame dropped")
+                // Attempt recovery on next frame
+            }
         } catch (t: Throwable) {
             droppedOutputFrameCount++
             Log.w(TAG, "Failed to render a frame to the output surface", t)
+            // Attempt recovery on next frame
+        }
+    }
+
+    /**
+     * Requests surface recovery by triggering a pipeline reset on the next frame.
+     * This helps recover from transient surface/EGL issues without full pipeline restart.
+     */
+    private fun requestSurfaceRecovery() {
+        if (surfaceRecoveryRequested || released) return
+        surfaceRecoveryRequested = true
+        workerHandler?.post {
+            if (!released) {
+                Log.w(TAG, "Requesting surface recovery due to invalid output surface")
+                resetPipelineOnWorker("surface_recovery")
+            }
         }
     }
 

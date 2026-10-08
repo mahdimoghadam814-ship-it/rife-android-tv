@@ -1017,7 +1017,7 @@ private const val WARP_FRAGMENT_SHADER = """
      * MediaCodec. It must be called on the thread that owns the EGL context, immediately before
      * the swap, with the surface current - which is exactly where every render path ends up.
      */
-    private fun swapBuffers(eglDisplay: EGLDisplay, eglSurface: EGLSurface, label: String) {
+    private fun swapBuffers(eglDisplay: EGLDisplay, eglSurface: EGLSurface, label: String): Boolean {
         val mirror = mirrorEglSurface
         if (mirror != null && mirrorSurface?.isValid == true) {
             ensureMirrorTexture()
@@ -1038,6 +1038,7 @@ private const val WARP_FRAGMENT_SHADER = """
         val submitPrimary = interval <= 0L || outputTimestampNs == 0L ||
             nextRemotePresentationNs == Long.MIN_VALUE || outputTimestampNs >= nextRemotePresentationNs
         if (!submitPrimary) remoteDroppedFrameCount++
+        var primarySuccess = true
         if (submitPrimary) {
             if (outputTimestampNs != 0L) EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, outputTimestampNs)
             val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)
@@ -1045,16 +1046,20 @@ private const val WARP_FRAGMENT_SHADER = """
             if (!swapResult || swapError != EGL14.EGL_SUCCESS || VERBOSE_DIAGNOSTICS) {
                 Log.d(TAG, "eglSwapBuffers ($label): result=$swapResult error=0x${swapError.toString(16)}")
             }
+            if (!swapResult || swapError != EGL14.EGL_SUCCESS) {
+                primarySuccess = false
+            }
             if (interval > 0L && outputTimestampNs != 0L) {
                 if (nextRemotePresentationNs == Long.MIN_VALUE) nextRemotePresentationNs = outputTimestampNs + interval
                 else while (nextRemotePresentationNs <= outputTimestampNs) nextRemotePresentationNs += interval
             }
-            primarySwapCount++
+            if (primarySuccess) primarySwapCount++
         }
 
         // Always update the mirror (phone preview) regardless of remote frame rate cap.
         // The local preview must continue showing the latest processed frame even when
         // the remote encoder is rate-limited and dropping frames.
+        var mirrorSuccess = true
         if (mirror != null && mirrorSurface?.isValid == true && mirrorTexture != 0 &&
             EGL14.eglMakeCurrent(eglDisplay, mirror, mirror, context)
         ) {
@@ -1083,10 +1088,15 @@ private const val WARP_FRAGMENT_SHADER = """
             GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
             if (outputTimestampNs != 0L) EGLExt.eglPresentationTimeANDROID(eglDisplay, mirror, outputTimestampNs)
-            EGL14.eglSwapBuffers(eglDisplay, mirror)
+            val mirrorSwapResult = EGL14.eglSwapBuffers(eglDisplay, mirror)
+            val mirrorSwapError = EGL14.eglGetError()
+            if (!mirrorSwapResult || mirrorSwapError != EGL14.EGL_SUCCESS) {
+                mirrorSuccess = false
+            }
             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, context)
-            mirrorSwapCount++
+            if (mirrorSuccess) mirrorSwapCount++
         }
+        return primarySuccess && mirrorSuccess
     }
 
     private fun releaseMirrorSurface() {
@@ -1120,7 +1130,7 @@ private const val WARP_FRAGMENT_SHADER = """
      *
      * [timestampNs] is the frame's presentation time; see [outputTimestampNs].
      */
-    fun render(buffer: ByteBuffer, width: Int, height: Int, timestampNs: Long = 0L) {
+    fun render(buffer: ByteBuffer, width: Int, height: Int, timestampNs: Long = 0L): Boolean {
         val eglDisplay = display
         val eglContext = context
         val eglSurface = windowSurface
@@ -1128,15 +1138,16 @@ private const val WARP_FRAGMENT_SHADER = """
             eglContext == null || eglSurface == null
         ) {
             Log.w(TAG, "render(): renderer not ready (program=$program texture=$textureId); frame dropped")
-            return
+            return false
         }
         if (width <= 0 || height <= 0) {
             Log.w(TAG, "render(): bad size ${width}x${height}; frame dropped")
-            return
+            return false
         }
 
         if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
-            return
+            Log.w(TAG, "render(): bindWindow failed; frame dropped")
+            return false
         }
 
         // DIAGNOSTICS: Log EGL state before rendering
@@ -1196,7 +1207,7 @@ private const val WARP_FRAGMENT_SHADER = """
         val requiredBytes = width.toLong() * height.toLong() * 4L
         if (requiredBytes > Int.MAX_VALUE) {
             Log.e(TAG, "render: dimensions ${width}x$height overflow Int")
-            return
+            return false
         }
         buffer.position(0)
         buffer.limit(requiredBytes.toInt())
@@ -1246,6 +1257,7 @@ private const val WARP_FRAGMENT_SHADER = """
         val error = GLES20.glGetError()
         if (error != GLES20.GL_NO_ERROR) {
             Log.e(TAG, "Output blit failed with GL error 0x${error.toString(16)}")
+            return false
         }
 
         GLES20.glDisableVertexAttribArray(aPositionHandle)
@@ -1257,9 +1269,13 @@ private const val WARP_FRAGMENT_SHADER = """
         // line fires twice per interpolated pair and is pure overhead at the frame rate we need.
         tPhase = System.nanoTime()
         outputTimestampNs = timestampNs
-        swapBuffers(eglDisplay, eglSurface, "")
+        val swapResult = swapBuffers(eglDisplay, eglSurface, "")
+        if (!swapResult) {
+            Log.w(TAG, "render(): eglSwapBuffers failed; frame may not be presented")
+        }
         nsSwap += System.nanoTime() - tPhase
         renderCalls++
+        return swapResult
     }
 
     /** Presents a retained GPU source texture without converting it through the RGBA8 analysis buffer. */
@@ -1269,7 +1285,10 @@ private const val WARP_FRAGMENT_SHADER = """
         val eglSurface = windowSurface ?: return false
         if (program == 0 || sourceTexture == 0 || width <= 0 || height <= 0 ||
             !bindWindow(eglDisplay, eglSurface, eglContext)
-        ) return false
+        ) {
+            Log.w(TAG, "renderTexture(): renderer not ready (program=$program sourceTexture=$sourceTexture); frame dropped")
+            return false
+        }
         if (surfaceWidth != width || surfaceHeight != height) updateSurfaceSize()
         GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
         GLES20.glUseProgram(program)
@@ -1292,9 +1311,16 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glDisableVertexAttribArray(aPositionHandle)
         GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
-        if (error != GLES20.GL_NO_ERROR) return false
+        if (error != GLES20.GL_NO_ERROR) {
+            Log.e(TAG, "renderTexture(): GL error 0x${error.toString(16)}; frame dropped")
+            return false
+        }
         outputTimestampNs = timestampNs
-        swapBuffers(eglDisplay, eglSurface, "hdr-source")
+        val swapResult = swapBuffers(eglDisplay, eglSurface, "hdr-source")
+        if (!swapResult) {
+            Log.w(TAG, "renderTexture(): eglSwapBuffers failed; frame may not be presented")
+            return false
+        }
         renderCalls++
         return true
     }
@@ -1350,15 +1376,18 @@ private const val WARP_FRAGMENT_SHADER = """
         timestamps: LongArray = LongArray(0)
     ): Boolean {
         if (timesteps.isEmpty()) {
+            Log.w(TAG, "renderWarp: empty timesteps array")
             return false
         }
         val eglDisplay = display
         val eglContext = context
         val eglSurface = windowSurface
         if (warpProgram == 0 || eglDisplay == null || eglContext == null || eglSurface == null) {
+            Log.w(TAG, "renderWarp: warp program not ready or EGL invalid (program=$warpProgram)")
             return false
         }
         if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
+            Log.w(TAG, "renderWarp: invalid dimensions src=${srcWidth}x$srcHeight target=${targetWidth}x$targetHeight")
             return false
         }
         val gridStep = NativeEngine.motionFieldStep()
@@ -1366,6 +1395,7 @@ private const val WARP_FRAGMENT_SHADER = """
         val gridH = (targetHeight + gridStep - 1) / gridStep
 
         if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            Log.w(TAG, "renderWarp: bindWindow failed")
             return false
         }
 
@@ -1384,6 +1414,7 @@ private const val WARP_FRAGMENT_SHADER = """
                 gridW * gridH * 4
             )
         ) {
+            Log.w(TAG, "renderWarp: texture upload failed")
             return false
         }
         warpTex0W = srcWidth
@@ -1396,10 +1427,14 @@ private const val WARP_FRAGMENT_SHADER = """
         warpBlendMode = NativeEngine.motionFieldBlendMode()
         nsUpload += System.nanoTime() - tPhase
 
-        return drawWarps(
+        val success = drawWarps(
             eglDisplay, eglSurface, warpTex0, warpTex1, srcWidth, srcHeight,
             targetWidth, targetHeight, gridW, gridH, timesteps
         )
+        if (!success) {
+            Log.w(TAG, "renderWarp: drawWarps failed")
+        }
+        return success
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -1483,18 +1518,22 @@ private const val WARP_FRAGMENT_SHADER = """
         denPair0 = 0
         denPair1 = 0
         if (denoiseProgram == 0 || eglDisplay == null || eglContext == null || eglSurface == null) {
+            Log.w(TAG, "renderDenoise: denoise program not ready or EGL invalid (program=$denoiseProgram)")
             return false
         }
         if (width <= 0 || height <= 0) {
+            Log.w(TAG, "renderDenoise: invalid dimensions ${width}x$height")
             return false
         }
         if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            Log.w(TAG, "renderDenoise: bindWindow failed")
             return false
         }
         val gridStep = NativeEngine.motionFieldStep()
         val gridW = (width + gridStep - 1) / gridStep
         val gridH = (height + gridStep - 1) / gridStep
         if (!ensureDenoiseTarget(width, height)) {
+            Log.w(TAG, "renderDenoise: ensureDenoiseTarget failed")
             return false
         }
 
@@ -1823,12 +1862,15 @@ private const val WARP_FRAGMENT_SHADER = """
         if (program == 0 || denPair1 == 0 || eglDisplay == null ||
             eglContext == null || eglSurface == null
         ) {
+            Log.w(TAG, "presentDenoised: program or denPair1 not ready or EGL invalid")
             return false
         }
         if (width <= 0 || height <= 0) {
+            Log.w(TAG, "presentDenoised: invalid dimensions ${width}x$height")
             return false
         }
         if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            Log.w(TAG, "presentDenoised: bindWindow failed")
             return false
         }
 
@@ -1867,6 +1909,11 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glDisableVertexAttribArray(aPositionHandle)
         GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+        val error = GLES20.glGetError()
+        if (error != GLES20.GL_NO_ERROR) {
+            Log.e(TAG, "presentDenoised: GL error 0x${error.toString(16)}")
+            return false
+        }
         nsDraw += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
@@ -1875,7 +1922,11 @@ private const val WARP_FRAGMENT_SHADER = """
         // falls back to arrival order), draw the mirror preview, honour the remote rate cap, and
         // count toward the preview/encoder swap rates.
         outputTimestampNs = timestampNs
-        swapBuffers(eglDisplay, eglSurface, "denoised")
+        val swapResult = swapBuffers(eglDisplay, eglSurface, "denoised")
+        if (!swapResult) {
+            Log.w(TAG, "presentDenoised: eglSwapBuffers failed")
+            return false
+        }
         nsSwap += System.nanoTime() - tPhase
         renderCalls++
         return true
@@ -1952,6 +2003,10 @@ private const val WARP_FRAGMENT_SHADER = """
         val error = GLES20.glGetError()
         if (error != GLES20.GL_NO_ERROR) {
             Log.e(TAG, "Warp blit failed with GL error 0x${error.toString(16)}")
+            GLES20.glDisableVertexAttribArray(warpAPosition)
+            GLES20.glDisableVertexAttribArray(warpATexCoord)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
+            return false
         }
         GLES20.glDisableVertexAttribArray(warpAPosition)
         GLES20.glDisableVertexAttribArray(warpATexCoord)
@@ -1959,7 +2014,11 @@ private const val WARP_FRAGMENT_SHADER = """
         nsDraw += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
-        swapBuffers(eglDisplay, eglSurface, "warp")
+        val swapResult = swapBuffers(eglDisplay, eglSurface, "warp")
+        if (!swapResult) {
+            Log.w(TAG, "drawWarp: eglSwapBuffers failed")
+            return false
+        }
         nsSwap += System.nanoTime() - tPhase
         renderCalls++
         warpDrawCalls++
