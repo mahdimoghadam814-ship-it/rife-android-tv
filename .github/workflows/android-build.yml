@@ -11,7 +11,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
 
       - name: Verify SVP-only project layout
         run: |
@@ -24,8 +23,11 @@ jobs:
           echo "=== Native/CMake configuration required by SVP ==="
           test -d app/src/main/cpp || { echo "FAIL: app/src/main/cpp missing"; exit 1; }
           test -f app/src/main/cpp/CMakeLists.txt || { echo "FAIL: CMakeLists.txt missing"; exit 1; }
-          grep -Eq "add_library\([[:space:]]*rife_native" app/src/main/cpp/CMakeLists.txt \
-            || { echo "FAIL: SVP-only target rife_native not declared"; exit 1; }
+          CM_FLAT="$(tr '\n' ' ' < app/src/main/cpp/CMakeLists.txt)"
+          if ! printf '%s\n' "$CM_FLAT" | grep -Eq "add_library\([[:space:]]*rife_native"; then
+            echo "FAIL: CMakeLists.txt does not declare the SVP-only target rife_native"
+            exit 1
+          fi
           echo "PASS: CMakeLists.txt declares add_library(rife_native ...)"
           echo "=== Native sources referenced by the current CMake configuration ==="
           for src in rife_jni.cpp memc_interpolator.cpp memc_interpolator.h; do
@@ -49,7 +51,6 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
