@@ -105,9 +105,12 @@ class VideoFrameProcessor(
     companion object {
         private const val TAG = "VideoFrameProcessor"
 
-        /** Bounded queue: the pipeline must never grow faster than it can interpolate.
-         * Increased to 16 to allow more buffering for high-resolution (4K) pipelining. */
-        private const val FRAME_QUEUE_CAPACITY = 16
+        /**
+         * Bounded queue: the pipeline must never grow faster than it can interpolate.
+         * Depth = previousFrame(1) + pair in flight(2) + pendingRenderQueue(2) + capturing(1) = 6.
+         * 4 is enough for GPU/CPU overlap without accumulating latency.
+         */
+        private const val FRAME_QUEUE_CAPACITY = 4
 
         /** Pooled capture buffers. Bounded so a 4K stream cannot inflate the heap. */
         private const val MAX_POOLED_FRAME_BUFFERS = 2
@@ -166,6 +169,13 @@ class VideoFrameProcessor(
          */
         private const val FALLBACK_FRAME_WIDTH = 1920
         private const val FALLBACK_FRAME_HEIGHT = 1080
+
+        /**
+         * Maximum time a frame can wait in queue before being considered stale (ms).
+         * At 60fps with 4x interpolation, budget per pair = 16.6ms / 4 = 4.15ms per output frame.
+         * Keep 2 frames of latency headroom = ~8ms. Frames older than this are stale.
+         */
+        private const val MAX_QUEUE_LATENCY_MS = 16L
     }
 
     /**
@@ -533,6 +543,8 @@ class VideoFrameProcessor(
     private var nsJni = 0L
     private var nsRender = 0L
     private var nsPair = 0L
+    private var nsQueueLatency = 0L
+    private var queueLatencySamples = 0L
     // Per-phase split of nsRender, drained from GlOutputRenderer once per report window.
     private val renderBreakdown = LongArray(6)
     private var nsRenderCurrent = 0L
@@ -1762,13 +1774,22 @@ class VideoFrameProcessor(
             lastCaptureLogW = captureWidth
             lastCaptureLogH = captureHeight
             lastCaptureLogRes = resolution
+            val hdrInfo = if (isHdrSource()) {
+                val hdrLeases = frameGrabber?.readbackState() ?: "unknown"
+                val retainedW = captureWidth
+                val retainedH = captureHeight
+                val hdrGrabber = frameGrabber
+                val hdrSlots = hdrGrabber?.hdrSourceSlots?.size ?: 0
+                val estMem = hdrSlots.toLong() * (retainedW.toLong() * retainedH * 8L)
+                " HDR: source=${sourceWidth}x$sourceHeight processing=${retainedW}x$retainedH retained=$hdrSlots leases=$hdrLeases estimatedMemory=${estMem / 1024 / 1024}MB"
+            } else ""
             Log.i(
                 TAG,
                 "RES POLICY: src=${sourceWidth}x$sourceHeight " +
                     "surface=${outputRenderer?.outputSurfaceWidth ?: 0}x" +
                     "${outputRenderer?.outputSurfaceHeight ?: 0} " +
                     "res=$resolution memc=$isRifeEnabled denoise=$isDenoiseEnabled " +
-                    "-> capture=${captureWidth}x$captureHeight level=$autoDegradeLevel"
+                    "-> capture=${captureWidth}x$captureHeight level=$autoDegradeLevel" + hdrInfo
             )
         }
 
@@ -1902,7 +1923,27 @@ class VideoFrameProcessor(
 
     private fun processNextFramePair() {
         if (released) return
+        
+        // Discard stale frames that have been in queue too long (latency control)
+        val nowNs = System.nanoTime()
+        val maxQueueNs = MAX_QUEUE_LATENCY_MS * 1_000_000L
+        while (true) {
+            val head = frameQueue.peek() ?: break
+            val ageNs = nowNs - (head.timestampUs * 1000L)
+            if (ageNs <= maxQueueNs) break
+            frameQueue.poll()?.let { 
+                Log.w(TAG, "Discarding stale frame: queueLatencyMs=${ageNs / 1_000_000L} > ${MAX_QUEUE_LATENCY_MS}ms")
+                releaseFrameBuffer(it.pixels)
+                droppedFrameCount++
+            }
+        }
+        
         val nextFrame = frameQueue.poll() ?: return
+        // Track queue latency for this frame
+        val queueLatencyMs = (nowNs - (nextFrame.timestampUs * 1000L)) / 1_000_000L
+        nsQueueLatency += queueLatencyMs
+        queueLatencySamples++
+        
         val prev = previousFrame
 
         val canPrepareMotionOffThread = prev != null &&
@@ -1967,7 +2008,8 @@ class VideoFrameProcessor(
 
         // Submit motion for NEXT pair BEFORE rendering current pair.
         // This keeps motion executor busy continuously.
-        trySubmitNextMotion()
+        // Use 'next' (current pair's second frame) as prev for the next pair, not 'previousFrame'.
+        trySubmitNextMotion(next)
 
         // Render current pair
         processFramePair(prev, next, prepared)
@@ -1979,10 +2021,10 @@ class VideoFrameProcessor(
     }
 
     /** Tries to submit motion for the next available frame pair. Does nothing if no pair ready. */
-    private fun trySubmitNextMotion() {
+    private fun trySubmitNextMotion(prevForNextPair: FrameData) {
         if (released) return
         val nextFrame = frameQueue.peek() ?: return
-        val prev = previousFrame ?: return
+        val prev = prevForNextPair
 
         val canPrepareMotionOffThread = interpolationAlgorithmOrdinal in 1..2 &&
             isRifeEnabled &&
@@ -2674,11 +2716,20 @@ class VideoFrameProcessor(
             val overBudget = sourceIntervalNs > 0L && cycleNs > sourceIntervalNs.toDouble()
             if (dropped > 0 || overBudget) {
                 autoDegradeLevel++
+                val hdrInfo = if (isHdrSource()) {
+                    val hdrLeases = frameGrabber?.readbackState() ?: "unknown"
+                    val retainedW = processingWidth
+                    val retainedH = processingHeight
+                    val hdrGrabber = frameGrabber
+                    val hdrSlots = hdrGrabber?.hdrSourceSlots?.size ?: 0
+                    val estMem = hdrSlots.toLong() * (retainedW.toLong() * retainedH * 8L)
+                    " HDR: source=${inputWidth}x$inputHeight processing=${retainedW}x$retainedH retained=$hdrSlots leases=$hdrLeases estimatedMemory=${estMem / 1024 / 1024}MB"
+                } else ""
                 Log.w(
                     TAG,
                     "RES POLICY: ${autoCaptureW}x$autoCaptureH cannot hold the native rate " +
                         "(cycle=${fmtMs(cycleNs)} ms, budget=${fmtMs(sourceIntervalNs.toDouble())} ms, " +
-                        "dropped=$dropped), degrading to ${autoDegradeLadder[autoDegradeLevel]}"
+                        "dropped=$dropped), degrading to ${autoDegradeLadder[autoDegradeLevel]}" + hdrInfo
                 )
             }
         }
@@ -2699,6 +2750,7 @@ class VideoFrameProcessor(
                 "in=${frameCountInput - capturedAtWindowStart} " +
                 "out=${frameCountOutput - outputAtWindowStart} rife=$isRifeEnabled"
         )
+        val avgQueueLatencyMs = if (queueLatencySamples > 0) nsQueueLatency / queueLatencySamples else 0L
         val sourceFps = if (lastPairIntervalUs > 0L) 1_000_000.0 / lastPairIntervalUs else 0.0
         val windowSeconds = ((System.nanoTime() - diagnosticWindowStartNs).coerceAtLeast(1L)) / 1_000_000_000.0
         val generatedFps = (submittedOutputFrameCount - diagnosticOutputStartCount) / windowSeconds
@@ -2712,7 +2764,19 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} motionMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} motionMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}")
+        
+        // HDR diagnostic line
+        if (isHdrSource()) {
+            val hdrLeases = frameGrabber?.readbackState() ?: "unknown"
+            val hdrRetained = hdrTextureByAnalysisBuffer.size
+            val hdrGrabber = frameGrabber
+            val hdrSlots = hdrGrabber?.hdrSourceSlots?.size ?: 0
+            val retainedW = processingWidth
+            val retainedH = processingHeight
+            val estMem = hdrSlots.toLong() * (retainedW.toLong() * retainedH * 8L)
+            Log.i(TAG, "[HDR] source=${inputWidth}x$inputHeight processing=${retainedW}x$retainedH retained=$hdrRetained leases=$hdrLeases estimatedMemory=${estMem / 1024 / 1024}MB status=active")
+        }
 
         timingCycles = 0
         diagnosticWindowStartNs = System.nanoTime()
@@ -2729,6 +2793,8 @@ class VideoFrameProcessor(
         nsRenderDraw = 0
         nsRenderSwap = 0
         nsPair = 0
+        nsQueueLatency = 0
+        queueLatencySamples = 0
         capturedAtWindowStart = frameCountInput
         outputAtWindowStart = frameCountOutput
         arrivalAtWindowStart = frameCountArrival

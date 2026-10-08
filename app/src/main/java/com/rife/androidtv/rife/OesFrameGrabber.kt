@@ -62,12 +62,12 @@ class OesFrameGrabber {
     private val pendingPbos = java.util.ArrayDeque<PboSlot>()
     private var pboBytes = 0
     private var pboSupported = false
-    private data class HdrSourceSlot(var textureId: Int = 0, var inUse: Boolean = false)
-    // Sized for the deepest in-flight set the pipelined motion/render path can hold at once:
-    // previousFrame(1) + pair in flight(2) + pendingRenderQueue(2) + the frame being captured(1).
-    // With only 3 slots every other capture was refused ("hdr source leases exhausted"), pinning
-    // HDR capture at half rate and eventually spiraling into health-check resets.
-    private val hdrSourceSlots = Array(6) { HdrSourceSlot() }
+    internal data class HdrSourceSlot(var textureId: Int = 0, var inUse: Boolean = false)
+    // Pipeline depth = previousFrame(1) + pair in flight(2) + pendingRenderQueue(2) + capturing(1) = 6.
+    // But we only need to retain HDR sources for frames that are still in the pipeline.
+    // Max simultaneous: previousFrame (1) + current pair being processed (2) + 1 pending pair (2) = 5.
+    // Use 5 to allow one spare while keeping GPU memory bounded.
+    internal val hdrSourceSlots = Array(5) { HdrSourceSlot() }
     private var hdrFramebuffer = 0
     private var hdrWidth = 0
     private var hdrHeight = 0
