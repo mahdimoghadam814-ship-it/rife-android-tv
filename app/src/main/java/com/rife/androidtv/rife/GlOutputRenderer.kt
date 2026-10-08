@@ -1007,6 +1007,7 @@ private const val WARP_FRAGMENT_SHADER = """
             Log.e(TAG, "eglMakeCurrent failed: 0x${EGL14.eglGetError().toString(16)}")
             return false
         }
+        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         nsCurrent += System.nanoTime() - tPhase
         return true
     }
