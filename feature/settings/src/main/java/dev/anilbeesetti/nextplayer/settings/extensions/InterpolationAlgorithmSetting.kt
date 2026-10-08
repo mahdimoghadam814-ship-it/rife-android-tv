@@ -5,24 +5,18 @@ import androidx.compose.ui.res.stringResource
 import dev.anilbeesetti.nextplayer.core.model.InterpolationAlgorithmSetting
 import dev.anilbeesetti.nextplayer.core.ui.R
 
+/**
+ * The label of the selected interpolation backend. SVPlayer is the only backend left, so this is
+ * a constant rather than a lookup - the extension is kept because both settings surfaces read the
+ * preference through it.
+ */
 @Composable
-fun InterpolationAlgorithmSetting.name(): String {
-    val stringRes = when (this) {
-        InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_algorithm_rife
-        InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_algorithm_memc
-        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_algorithm_svplayer
-    }
+fun InterpolationAlgorithmSetting.name(): String = stringResource(
+    R.string.interpolation_algorithm_svplayer,
+)
 
-    return stringResource(stringRes)
-}
-
+/** The one-line description shown under [name]. */
 @Composable
-fun InterpolationAlgorithmSetting.description(): String {
-    val stringRes = when (this) {
-        InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_description_rife
-        InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_description_memc
-        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_description_svplayer
-    }
-
-    return stringResource(stringRes)
-}
+fun InterpolationAlgorithmSetting.description(): String = stringResource(
+    R.string.interpolation_description_svplayer,
+)

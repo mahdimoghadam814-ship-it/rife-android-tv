@@ -7,10 +7,10 @@ import dev.anilbeesetti.nextplayer.core.model.SvPlayerSettings
 import kotlinx.coroutines.flow.StateFlow
 
 /**
- * Processing resolutions offered by the Video Processing settings entry.
+ * Processing resolutions offered by the Video Processing settings entry. No AUTO: the adaptive
+ * ladder that used to sit behind it was removed with the RIFE/MEMC architecture.
  */
 enum class RifeResolution {
-    AUTO,
     ORIGINAL,
     RES_1080P,
     RES_720P,
@@ -18,11 +18,10 @@ enum class RifeResolution {
 }
 
 /**
- * Interpolation backends offered by the Video Processing settings entry.
+ * Interpolation backends offered by the Video Processing settings entry. SVPlayer is the only
+ * backend this build carries: the RIFE neural network and the MEMC baseline were removed.
  */
 enum class InterpolationAlgorithm {
-    RIFE,
-    MEMC,
     SVPLAYER,
 }
 
@@ -43,13 +42,14 @@ data class RifeStats(
 )
 
 /**
- * The app-wide RIFE / FastDVDnet processing control surface, consumed by the real Next Player
- * player screen. The implementation lives in the `app` module (it owns the native engine and the
- * Media3 frame pipeline); this interface is what the feature modules see.
+ * The app-wide interpolation / FastDVDnet processing control surface, consumed by the real
+ * Next Player player screen. The implementation lives in the `app` module (it owns the native
+ * search and the Media3 frame pipeline); this interface is what the feature modules see.
  *
  * The controller owns:
  *  * the worker thread, EGL context and pooled frame buffers of the processing pipeline,
- *  * the native RIFE engine (initialised lazily, off the main thread),
+ *  * the native SVPlayer search, which needs no deferred start-up (no model, no device
+ *    initialisation), so nothing here has a lazy engine to bring up,
  *  * the input surface the player must render decoded frames into while a stage is enabled
  *    (published through [inputSurface]),
  *  * the output surface the processed frames are rendered to (published by the player screen
@@ -57,7 +57,7 @@ data class RifeStats(
  */
 interface RifeController {
 
-    /** Whether any processing stage (RIFE or FastDVDnet) currently intercepts frames. */
+    /** Whether any processing stage (interpolation or FastDVDnet) currently intercepts frames. */
     val processingEnabled: StateFlow<Boolean>
 
     /** Pipeline statistics for the engine status overlay. */
@@ -84,9 +84,9 @@ interface RifeController {
     fun setResolution(resolution: RifeResolution)
 
     /**
-     * Selects the interpolation backend. Switching to [InterpolationAlgorithm.MEMC] does not
-     * require the RIFE model; switching to [InterpolationAlgorithm.RIFE] is handled lazily by
-     * [setRifeEnabled].
+     * Selects the interpolation backend. There is one backend now (SVPlayer), so this only
+     * configures the worker pool its search runs on; it still exists as a hook so a second
+     * backend can be added without a settings migration.
      */
     fun setInterpolationAlgorithm(algorithm: InterpolationAlgorithm)
 

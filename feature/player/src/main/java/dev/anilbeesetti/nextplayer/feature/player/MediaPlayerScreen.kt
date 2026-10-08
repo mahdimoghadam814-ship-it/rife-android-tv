@@ -184,7 +184,7 @@ internal fun MediaPlayerContent(
     var rifeStatusTrigger by remember { mutableIntStateOf(0) }
     var rifeStatusVisible by remember { mutableStateOf(false) }
 
-    // The RIFE / FastDVDnet processing stage is applied whenever the corresponding preferences
+    // The interpolation / FastDVDnet processing stage is applied whenever the corresponding preferences
     // change, including when the player screen is (re)opened with processing already enabled.
     val rifeController: RifeController = koinInject()
     val rifeProcessingEnabled by rifeController.processingEnabled.collectAsStateWithLifecycle()
@@ -285,8 +285,8 @@ internal fun MediaPlayerContent(
         playerPreferences.denoiseLevel,
         playerPreferences.svPlayerSettings,
     ) {
-        // Order matters: the algorithm has to be known before setRifeEnabled decides whether
-        // the RIFE model is worth loading at all.
+        // Order matters: the algorithm decides the worker pool before setRifeEnabled switches
+        // the pipeline on, so the first pair is already scheduled on the right one.
         rifeController.setInterpolationAlgorithm(
             playerPreferences.interpolationAlgorithm.toInterpolationAlgorithm(),
         )
@@ -360,7 +360,7 @@ internal fun MediaPlayerContent(
         if (pictureInPictureState != null) {
             // Real Next Player surface while nothing is processing. The processing path feeds the
             // same frame instead of replacing it, so content scale, pinch zoom, subtitles and the
-            // shutter keep working with MEMC or denoise on.
+            // shutter keep working with interpolation or denoise on.
             PlayerContentFrame(
                 player = player,
                 pictureInPictureState = pictureInPictureState,
@@ -501,7 +501,6 @@ private fun MediaPlayerContentPreview() {
 }
 
 private fun RifeResolutionSetting.toRifeResolution(): RifeResolution = when (this) {
-    RifeResolutionSetting.AUTO -> RifeResolution.AUTO
     RifeResolutionSetting.ORIGINAL -> RifeResolution.ORIGINAL
     RifeResolutionSetting.RES_1080P -> RifeResolution.RES_1080P
     RifeResolutionSetting.RES_720P -> RifeResolution.RES_720P
@@ -555,8 +554,4 @@ private fun Tracks.outputDataSpace(): Int? {
 }
 
 private fun InterpolationAlgorithmSetting.toInterpolationAlgorithm(): InterpolationAlgorithm =
-    when (this) {
-        InterpolationAlgorithmSetting.RIFE -> InterpolationAlgorithm.RIFE
-        InterpolationAlgorithmSetting.MEMC -> InterpolationAlgorithm.MEMC
-        InterpolationAlgorithmSetting.SVPLAYER -> InterpolationAlgorithm.SVPLAYER
-    }
+    InterpolationAlgorithm.SVPLAYER

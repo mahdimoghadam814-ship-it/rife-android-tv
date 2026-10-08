@@ -1,118 +1,36 @@
 #include <jni.h>
 #include <string>
-#include <atomic>
 #include <dlfcn.h>
-#include <android/asset_manager_jni.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
-#include "vulkan_diagnostic.h"
-#include "rife_engine.h"
 #include "memc_interpolator.h"
 
-static RifeEngine g_rife_engine;
-static rife::MemcInterpolator g_memc;
-static std::atomic<int> g_interp_algorithm{static_cast<int>(rife::InterpolationAlgorithm::MEMC)};
-
-extern "C" JNIEXPORT jobject JNICALL
-Java_com_rife_androidtv_NativeEngine_runDiagnostics(JNIEnv* env, jclass clazz) {
-    DiagnosticResult res = run_vulkan_diagnostics();
-
-    jclass resultClass = env->FindClass("com/rife/androidtv/NativeDiagnosticResult");
-    if (resultClass == nullptr) {
-        return nullptr;
-    }
-    jmethodID constructor = env->GetMethodID(
-        resultClass,
-        "<init>",
-        "(ZLjava/lang/String;Ljava/lang/String;IILjava/lang/String;Ljava/lang/String;Ljava/lang/String;ZLjava/lang/String;Ljava/lang/String;)V"
-    );
-    if (constructor == nullptr) {
-        return nullptr;
-    }
-
-    jstring vulkanApiVersion = env->NewStringUTF(res.vulkan_api_version.c_str());
-    jstring gpuName = env->NewStringUTF(res.gpu_name.c_str());
-    jstring driverInfo = env->NewStringUTF(res.driver_info.c_str());
-    jstring relevantFeatures = env->NewStringUTF(res.relevant_features.c_str());
-    jstring ncnnVersion = env->NewStringUTF(res.ncnn_version.c_str());
-    jstring ncnnOpDetails = env->NewStringUTF(res.ncnn_op_details.c_str());
-    jstring errorMessage = env->NewStringUTF(res.error_message.c_str());
-
-    jobject objectResult = env->NewObject(
-        resultClass,
-        constructor,
-        res.vulkan_supported,
-        vulkanApiVersion,
-        gpuName,
-        (jint)res.vendor_id,
-        (jint)res.device_id,
-        driverInfo,
-        relevantFeatures,
-        ncnnVersion,
-        res.ncnn_vulkan_op_success,
-        ncnnOpDetails,
-        errorMessage
-    );
-
-    env->DeleteLocalRef(resultClass);
-    return objectResult;
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_rife_androidtv_NativeEngine_initRife(JNIEnv* env, jclass clazz, jint gpuId) {
-    return g_rife_engine.init(gpuId);
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_rife_androidtv_NativeEngine_loadRifeModel(
-    JNIEnv* env, jclass clazz,
-    jobject assetManager, jstring baseCacheDir, jstring modelDir, jboolean isV2, jboolean isV4
-) {
-    AAssetManager* mgr = AAssetManager_fromJava(env, assetManager);
-    const char* cacheStr = env->GetStringUTFChars(baseCacheDir, nullptr);
-    const char* dirStr = env->GetStringUTFChars(modelDir, nullptr);
-    bool res = g_rife_engine.loadModelFromAssets(mgr, cacheStr, dirStr, isV2, isV4);
-    env->ReleaseStringUTFChars(baseCacheDir, cacheStr);
-    env->ReleaseStringUTFChars(modelDir, dirStr);
-    return res;
-}
+static rife::MemcInterpolator g_interp;
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_rife_androidtv_NativeEngine_setInterpolationAlgorithm(
-    JNIEnv* env, jclass clazz, jint algorithm
-) {
-    const int value = static_cast<int>(algorithm);
-    g_interp_algorithm.store(value, std::memory_order_relaxed);
-    // The interpolator keeps its own copy: the search is a member function and reads settings
-    // through `this`, where the file-scope atomic is not in scope.
-    g_memc.setAlgorithm(value);
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_com_rife_androidtv_NativeEngine_setMemcThreadCount(
+Java_com_rife_androidtv_NativeEngine_setInterpolationThreadCount(
     JNIEnv* env, jclass clazz, jint threads
 ) {
-    g_memc.setThreadCount(static_cast<int>(threads));
+    g_interp.setThreadCount(static_cast<int>(threads));
 }
 
 // The pitch the packed motion grid is laid out on. The Java side cannot work it out for
-// itself: it depends on whether SVPlayer is selected and on the `overlap` setting, both of
-// which live in the interpolator. Everything that sizes or reads the packed field - the
-// ByteBuffer it is written into and the texture coordinates the shaders index it with -
-// derives gridW/gridH from this, and if it ever disagreed with blockStep() the field would
-// be sampled with the wrong pitch and come out smeared.
+// itself: it depends on the `overlap` setting, which lives in the interpolator. Everything
+// that sizes or reads the packed field - the ByteBuffer it is written into and the texture
+// coordinates the shaders index it with - derives gridW/gridH from this, and if it ever
+// disagreed with blockStep() the field would be sampled with the wrong pitch and come out
+// smeared.
 extern "C" JNIEXPORT jint JNICALL
 Java_com_rife_androidtv_NativeEngine_motionFieldStep(JNIEnv*, jclass) {
-    return static_cast<jint>(g_memc.blockStep());
+    return static_cast<jint>(g_interp.blockStep());
 }
 
 // Which of SVP's three renderers the warp should blend with: 0 = algo 11, 1 = algo 13, 2 = algo
-// 21. Taken from the interpolator rather than from the raw setting because blendMode() pins it
-// to 2 for every algorithm except SVPlayer - the CPU warp already reads it there, and the shader
-// has to make the same choice or the two paths would disagree about what they are rendering.
+// 21. Taken from the interpolator rather than from the raw setting so the CPU warp and the GL
+// shader cannot disagree about what they are rendering.
 extern "C" JNIEXPORT jint JNICALL
 Java_com_rife_androidtv_NativeEngine_motionFieldBlendMode(JNIEnv*, jclass) {
-    return static_cast<jint>(g_memc.blendMode());
+    return static_cast<jint>(g_interp.blendMode());
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -133,17 +51,17 @@ Java_com_rife_androidtv_NativeEngine_setSvPlayerSettings(
     config.blendAlgorithm = static_cast<int>(blendAlgorithm);
     config.sceneAdaptive = static_cast<int>(sceneAdaptive);
     config.meScale = static_cast<int>(meScale);
-    g_memc.setSvConfig(config);
+    g_interp.setSvConfig(config);
 }
 
 extern "C" JNIEXPORT void JNICALL
-Java_com_rife_androidtv_NativeEngine_resetMemcState(JNIEnv* env, jclass clazz) {
-    g_memc.reset();
+Java_com_rife_androidtv_NativeEngine_resetInterpolationState(JNIEnv* env, jclass clazz) {
+    g_interp.reset();
 }
 
 extern "C" JNIEXPORT jdouble JNICALL
-Java_com_rife_androidtv_NativeEngine_getMemcLastDurationMs(JNIEnv* env, jclass clazz) {
-    return static_cast<jdouble>(g_memc.lastDurationMs());
+Java_com_rife_androidtv_NativeEngine_getInterpolationLastDurationMs(JNIEnv* env, jclass clazz) {
+    return static_cast<jdouble>(g_interp.lastDurationMs());
 }
 
 // Failure codes for setOutputDataSpace(). Deliberately outside the -1..-38 range any status_t
@@ -246,26 +164,20 @@ Java_com_rife_androidtv_NativeEngine_computeMotionField(
     if (!in0Ptr || !in1Ptr || !mvPtr) {
         return false;
     }
-    // The field only exists for the block-matching algorithms. In RIFE mode there is nothing to
-    // hand to the shader, so report failure and let the caller take its CPU path instead.
-    if (!rife::producesMotionField(
-            g_interp_algorithm.load(std::memory_order_relaxed))) {
-        return false;
-    }
     const jlong mvCapacity = env->GetDirectBufferCapacity(mvBuffer);
     if (mvCapacity < 0) {
         return false;
     }
     const size_t needed =
-        rife::MemcInterpolator::motionFieldBytes(targetWidth, targetHeight, g_memc.blockStep());
+        rife::MemcInterpolator::motionFieldBytes(targetWidth, targetHeight, g_interp.blockStep());
     if (static_cast<size_t>(mvCapacity) < needed) {
         return false;
     }
-    return g_memc.motionField(in0Ptr, in1Ptr,
-                              srcWidth, srcHeight,
-                              targetWidth, targetHeight,
-                              mvPtr, static_cast<size_t>(mvCapacity),
-                              forwardOnly == JNI_TRUE);
+    return g_interp.motionField(in0Ptr, in1Ptr,
+                                srcWidth, srcHeight,
+                                targetWidth, targetHeight,
+                                mvPtr, static_cast<size_t>(mvCapacity),
+                                forwardOnly == JNI_TRUE);
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
@@ -287,7 +199,6 @@ Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
 
     // Check output buffer capacity - native code writes RGBA (4 bytes per pixel)
     // The maximum output size is targetWidth * targetHeight * 4 bytes (RGBA)
-    // since resolution fallback never upscales beyond requested target dimensions
     jlong outCapacity = env->GetDirectBufferCapacity(outBuffer);
     if (outCapacity < 0) {
         // Not a direct buffer
@@ -295,152 +206,17 @@ Java_com_rife_androidtv_NativeEngine_interpolateFrameBuffers(
     }
 
     // Calculate required capacity: max possible output is targetWidth * targetHeight * 4 bytes (RGBA)
-    // Resolution fallback only downscales, so this is the maximum required capacity
     const int64_t requiredCapacity = static_cast<int64_t>(targetWidth) * targetHeight * 4;
     if (static_cast<int64_t>(outCapacity) < requiredCapacity) {
         // Buffer too small for the requested output resolution
         return false;
     }
 
-    if (rife::producesMotionField(
-            g_interp_algorithm.load(std::memory_order_relaxed))) {
-        return g_memc.interpolate(
-            in0Ptr, in1Ptr,
-            srcWidth, srcHeight,
-            targetWidth, targetHeight,
-            timestep,
-            outPtr
-        );
-    }
-
-    return g_rife_engine.processFrameBuffer(
+    return g_interp.interpolate(
         in0Ptr, in1Ptr,
         srcWidth, srcHeight,
         targetWidth, targetHeight,
         timestep,
         outPtr
     );
-}
-
-extern "C" JNIEXPORT jboolean JNICALL
-Java_com_rife_androidtv_NativeEngine_runRifeTest(
-    JNIEnv* env, jclass clazz, jint width, jint height
-) {
-    return g_rife_engine.interpolateTest(width, height);
-}
-
-extern "C" JNIEXPORT jobject JNICALL
-Java_com_rife_androidtv_NativeEngine_getRifeStatus(JNIEnv* env, jclass clazz) {
-    RifeEngineResult res = g_rife_engine.getStatus();
-
-    jclass resultClass = env->FindClass("com/rife/androidtv/RifeDiagnosticResult");
-    if (resultClass == nullptr) {
-        return nullptr;
-    }
-    jmethodID constructor = env->GetMethodID(
-        resultClass,
-        "<init>",
-        "(ZZLjava/lang/String;Ljava/lang/String;ZJLjava/lang/String;Ljava/lang/String;Lcom/rife/androidtv/VulkanCapabilities;Lcom/rife/androidtv/DeviceProfile;Ljava/lang/String;)V"
-    );
-    if (constructor == nullptr) {
-        return nullptr;
-    }
-
-    // Create VulkanCapabilities object
-    jclass capsClass = env->FindClass("com/rife/androidtv/VulkanCapabilities");
-    if (capsClass == nullptr) {
-        return nullptr;
-    }
-    jmethodID capsConstructor = env->GetMethodID(
-        capsClass,
-        "<init>",
-        "(ZZZZZZZZZZZZZZ)V"
-    );
-    if (capsConstructor == nullptr) {
-        return nullptr;
-    }
-    jobject capsObj = env->NewObject(
-        capsClass,
-        capsConstructor,
-        res.vulkan_caps.fp16_storage,
-        res.vulkan_caps.fp16_packed,
-        res.vulkan_caps.fp16_arithmetic,
-        res.vulkan_caps.int8_storage,
-        res.vulkan_caps.int8_packed,
-        res.vulkan_caps.int8_arithmetic,
-        res.vulkan_caps.int16_storage,
-        res.vulkan_caps.int16_arithmetic,
-        res.vulkan_caps.shader_int16,
-        res.vulkan_caps.shader_int64,
-        res.vulkan_caps.cooperative_matrix,
-        res.vulkan_caps.subgroup_size_control,
-        res.vulkan_caps.storage_buffer_16bit,
-        res.vulkan_caps.uniform_storage_buffer_16bit
-    );
-
-    // Get DeviceProfile enum value.
-    //
-    // DeviceProfile.values() is a static *method*, not a field, so GetStaticFieldID throws
-    // NoSuchFieldError. The next JNI call (GetStaticObjectField) was then entered with that
-    // exception still pending, which CheckJNI turns into a SIGABRT of the whole process -
-    // the Kotlin try/catch around this call never sees it. Use Class.getEnumConstants(),
-    // which works for any enum regardless of how it is named, and never call into JNI while
-    // an exception is pending.
-    jclass profileClass = env->FindClass("com/rife/androidtv/DeviceProfile");
-    if (profileClass == nullptr) {
-        return nullptr;
-    }
-
-    jobjectArray profileValues = nullptr;
-    jclass classClass = env->FindClass("java/lang/Class");
-    if (classClass != nullptr && !env->ExceptionCheck()) {
-        jmethodID getEnumConstants =
-            env->GetMethodID(classClass, "getEnumConstants", "()[Ljava/lang/Object;");
-        if (getEnumConstants != nullptr && !env->ExceptionCheck()) {
-            profileValues = static_cast<jobjectArray>(
-                env->CallObjectMethod(profileClass, getEnumConstants));
-        }
-        env->DeleteLocalRef(classClass);
-    }
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        profileValues = nullptr;
-    }
-
-    jobject profileObj = nullptr;
-    if (profileValues) {
-        jsize len = env->GetArrayLength(profileValues);
-        int profileIndex = static_cast<int>(res.device_profile);
-        if (profileIndex >= 0 && profileIndex < len) {
-            profileObj = env->GetObjectArrayElement(profileValues, profileIndex);
-        }
-    }
-
-    jstring gpuName = env->NewStringUTF(res.gpu_name.c_str());
-    jstring vulkanApiVersion = env->NewStringUTF(res.vulkan_api_version.c_str());
-    jstring lastError = env->NewStringUTF(res.last_error.c_str());
-    jstring opDetails = env->NewStringUTF(res.op_details.c_str());
-    jstring deviceModel = env->NewStringUTF(res.device_model.c_str());
-
-    jobject objectResult = env->NewObject(
-        resultClass,
-        constructor,
-        res.success,
-        res.vulkan_available,
-        gpuName,
-        vulkanApiVersion,
-        res.model_loaded,
-        static_cast<jlong>(res.last_inference_time_ms),
-        lastError,
-        opDetails,
-        capsObj,
-        profileObj,
-        deviceModel
-    );
-
-    env->DeleteLocalRef(resultClass);
-    env->DeleteLocalRef(capsClass);
-    env->DeleteLocalRef(profileClass);
-    if (profileValues) env->DeleteLocalRef(profileValues);
-    return objectResult;
 }

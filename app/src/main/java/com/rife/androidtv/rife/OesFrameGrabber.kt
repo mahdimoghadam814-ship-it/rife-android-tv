@@ -21,9 +21,9 @@ import java.nio.FloatBuffer
  *
  * ```
  * MediaCodec -> Surface(SurfaceTexture) -> GL_TEXTURE_EXTERNAL_OES
- *            -> OesFrameGrabber (FBO of the pre-RIFE size)
+ *            -> OesFrameGrabber (FBO of the pre-interpolation size)
  *            -> glReadPixels -> direct RGBA ByteBuffer
- *            -> FastDVDnet scaffold (optional) -> RIFE JNI -> output Surface
+ *            -> FastDVDnet scaffold (optional) -> interpolation JNI -> output Surface
  * ```
  *
  * Three details are load bearing and must not be "simplified":
@@ -34,11 +34,11 @@ import java.nio.FloatBuffer
  *    `glUniformMatrix4fv`. There is deliberately no 3x3 -> 4x4 conversion, because a conversion
  *    silently drops the perspective/offset terms the decoder's crop matrix uses;
  *  * the quad's V coordinate is flipped so that row 0 of the `glReadPixels` result is the first image
- *    line. `glReadPixels` reads bottom-up, and RIFE plus `Bitmap.copyPixelsFromBuffer` both expect
+ *    line. `glReadPixels` reads bottom-up, and the interpolator plus `Bitmap.copyPixelsFromBuffer` both expect
  *    top-down rows.
  *
  * Every method must be called on the thread that owns the EGL context used to create the program and
- * the FBO (the RIFE worker thread). The class holds no per-frame allocations: the shaders, the quad
+ * the FBO (the worker thread). The class holds no per-frame allocations: the shaders, the quad
  * buffers, the FBO and the FBO texture are created once and reused, and readback targets a
  * caller-owned direct buffer.
  */

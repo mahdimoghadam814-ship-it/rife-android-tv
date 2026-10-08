@@ -31,7 +31,7 @@ class AppModule {
     fun provideMainViewModel(preferencesRepository: PreferencesRepository) = MainViewModel(preferencesRepository)
 
     /**
-     * The RIFE / FastDVDnet processing stage singleton. It lives in the `app` module because it
+     * The interpolation / FastDVDnet processing stage singleton. It lives in the `app` module because it
      * owns the native engine and the Media3 frame pipeline; the player screen and the Video
      * Processing settings entry drive it through the [RifeController] interface.
      */

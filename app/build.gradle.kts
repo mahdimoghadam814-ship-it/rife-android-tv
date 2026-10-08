@@ -19,8 +19,9 @@ android {
         versionName = "2.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // The RIFE engine (ncnn + Vulkan + SPIR-V shaders) is built from the third_party
-        // submodules through CMake. Support both arm64-v8a (modern phones/TVs) and
+        // The native interpolation library is a single CMake target over two translation units
+        // (the JNI bridge and the SVPlayer search core) - no submodules, no model files, no
+        // shader compilation. Support both arm64-v8a (modern phones/TVs) and
         // armeabi-v7a (Xiaomi TV Box S 3rd Gen and other 32-bit ARM Android TV runtimes).
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "armeabi-v7a"))
@@ -125,7 +126,7 @@ dependencies {
 
     implementation(libs.github.anilbeesetti.nextlib.mediainfo)
 
-    // Media3 common: the RIFE VideoFrameProcessor implements androidx.media3.common.VideoFrameProcessor
+    // Media3 common: the pipeline implements androidx.media3.common.VideoFrameProcessor
     implementation(libs.androidx.media3.common)
 
     testImplementation(libs.junit4)

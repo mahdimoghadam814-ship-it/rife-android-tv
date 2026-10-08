@@ -27,7 +27,7 @@ import java.nio.FloatBuffer
  * RGBA direct buffer -> glTexImage2D -> full-screen quad -> eglSwapBuffers
  * ```
  *
- * All methods must be called on the thread that owns [context] (the RIFE worker thread), which is
+ * All methods must be called on the thread that owns [context] (the worker thread), which is
  * also the thread that owns the EGL context used by [OesFrameGrabber], so the two stages share one
  * GL context and no texture or buffer has to cross threads.
  */
@@ -134,7 +134,7 @@ class GlOutputRenderer {
          *
          * `uBlendMode` selects between those three: 0 is algo 11 (the plain time blend), 1 is
          * algo 13 (plus the dynamic median), 2 is algo 21 (plus cover/uncover). SVP documents
-         * them as alternatives - 21 does not include the median - and ships 13; MEMC is pinned
+         * them as alternatives - 21 does not include the median - and ships 13; the CPU warp is pinned
          * to 2 by `NativeEngine.motionFieldBlendMode()` so that picking a different renderer
          * cannot move it.
          */
@@ -1532,7 +1532,7 @@ private const val WARP_FRAGMENT_SHADER = """
      *
      * [current] is exactly [width] x [height] RGBA, top row first. [motion] is the packed field
      * from `NativeEngine.computeMotionField()` at `ceil(width/step) x ceil(height/step)`, where
-     * step is `NativeEngine.motionFieldStep()` - 16 with MEMC or SVPlayer's overlap off, smaller
+     * step is `NativeEngine.motionFieldStep()` - 16 with SVPlayer's overlap off, smaller
      * when overlap is on. It is laid out as [renderWarp] documents: vectors in the first half,
      * then the mask the denoiser reads from the second half as (cover mask, unused, blend weight,
      * noise floor).
@@ -2060,7 +2060,7 @@ private const val WARP_FRAGMENT_SHADER = """
      * window. A vector always sits 8 px into its cell - that is the centre of the 16 px window the
      * search ran over - while a texture texel sits half a pitch in, so this is the correction that
      * makes `(p + offset) / (step * grid)` land on the same vector `mvGridAxis()` picks. It is
-     * exactly 0 whenever the pitch is 16, which covers MEMC and SVPlayer with overlap off, so
+     * exactly 0 whenever the pitch is 16, which covers SVPlayer with overlap off, so
      * those paths evaluate `p / uMotionGrid` exactly as before.
      */
     private fun motionOffsetFor(gridStep: Int): Float = gridStep / 2f - 8f

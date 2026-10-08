@@ -9,18 +9,6 @@ namespace rife {
 
 class MemcPool;   // persistent worker threads, defined in memc_interpolator.cpp
 
-// Selects the frame interpolation algorithm used by interpolateFrameBuffers().
-// Mirrors the ordinal values used by the Kotlin InterpolationAlgorithm enum.
-enum class InterpolationAlgorithm : int {
-    RIFE = 0,
-    MEMC = 1,
-    SVPLAYER = 2,
-};
-
-// True when the selected algorithm is block matching, i.e. it produces a motion field the warp
-// and the denoiser can consume. Both MEMC and SVPLAYER do; only RIFE does not.
-bool producesMotionField(int algorithm);
-
 // Tuning surface of the SVPlayer-shaped search, in the same units as the SVPflow configuration
 // it is modelled on. The two bars in the UI are derived from these rather than stored beside
 // them: performanceQuality selects the rung of the cost ladder, artifactMaskLevel selects how
@@ -53,11 +41,11 @@ struct SvConfig {
     int meScale = 1;
 };
 
-// Block-matching motion estimation / motion compensation (MEMC) interpolator.
+// CPU block-matching interpolator implementing the SVPlayer (SVP) search.
 //
-// This is the cheap alternative to the RIFE neural network. It runs on the CPU with
-// NEON and needs no model files, no Vulkan and no GPU memory, which is why it is the
-// only candidate that can plausibly keep up on a low-end SoC.
+// It runs on the CPU with NEON and needs no model files, no Vulkan and no GPU memory, so it
+// is the only interpolation path this build carries: the RIFE neural network and the plain
+// MEMC baseline were both removed, and this class is now unconditionally the SVPlayer search.
 //
 // Pipeline per frame pair:
 //   1. RGBA -> luma (BT.601)              luma is 1/4 the memory traffic of RGBA
@@ -65,8 +53,7 @@ struct SvConfig {
 //   3. hierarchical search, bidirectional: in0->in1 (forward) and in1->in0 (backward)
 //   4. motion compensation on the RGB channels using both vector fields, averaged
 //
-// The output is written as tightly packed RGBA8888, top-down, targetW*targetH*4 bytes,
-// matching the contract of RifeEngine::processFrameBuffer().
+// The output is written as tightly packed RGBA8888, top-down, targetW*targetH*4 bytes.
 //
 // The warp interpolates the motion field bilinearly between block centres and resamples both
 // source frames with a 4-tap read, so the motion varies continuously across the frame instead
@@ -151,17 +138,17 @@ public:
     // Exact byte count motionField() writes for a processing size: eight bytes per block. Also
     // the size the caller must allocate for the packed field, still only tens of kB at 1080p.
     //
-    // The grid step is a required argument rather than a defaulted one on purpose: it is the
-    // only thing that separates the SVPlayer layout from the MEMC one, and a caller that sizes
-    // its buffer from kBlock while the field is packed at blockStep() would silently overflow.
-    // Pass blockStep() of the same interpolator that will do the writing.
+    // The grid step is a required argument rather than a defaulted one on purpose: the pitch
+    // depends on the `overlap` setting, and a caller that sizes its buffer from kBlock while the
+    // field is packed at blockStep() would silently overflow. Pass blockStep() of the same
+    // interpolator that will do the writing.
     static size_t motionFieldBytes(int targetWidth, int targetHeight, int step);
 
-    // The pitch the motion grid is laid out on, in pixels. kBlock for the MEMC baseline and for
-    // SVPlayer with `overlap` switched off; kBlock minus the overlap otherwise. The value of
-    // `overlap` is SVP's own - 0 is none, 1 an eighth of a block, 2 a quarter - so the shipped
-    // overlap of 2 searches a 16 px window at a 12 px pitch, which is exactly what makes the
-    // neighbouring windows overlap by 4 px and the grid carry 1.77x as many vectors.
+    // The pitch the motion grid is laid out on, in pixels. kBlock when `overlap` is switched
+    // off; kBlock minus the overlap otherwise. The value of `overlap` is SVP's own - 0 is none,
+    // 1 an eighth of a block, 2 a quarter - so the shipped overlap of 2 searches a 16 px window
+    // at a 12 px pitch, which is exactly what makes the neighbouring windows overlap by 4 px and
+    // the grid carry 1.77x as many vectors.
     //
     // It is public because the packed field is sized and then read back by the GL side, which
     // has to agree with this to the pixel: gridW is ceil(width / blockStep()), not ceil(/16).
@@ -172,10 +159,8 @@ public:
     // alternatives in SVP, not cumulative rungs - 21 does not include the median - and the
     // reference ships 13.
     //
-    // MEMC has no SvConfig of its own and must keep the path it has always taken, so this reads
-    // as 2 for every algorithm but SVPlayer. Both the CPU warp and the GL shader take their mode
-    // from here rather than from the raw setting, which is what stops a user who picks MEDIAN and
-    // then switches to MEMC from moving MEMC.
+    // Read from the setting rather than from a separate flag, so the CPU warp and the GL shader
+    // take their mode from the same place and cannot disagree about what they are rendering.
     int blendMode() const;
 
     void reset();
@@ -191,19 +176,12 @@ public:
     void setSvConfig(const SvConfig& config) { sv_config_ = config; }
     const SvConfig& svConfig() const { return sv_config_; }
 
-    // Which InterpolationAlgorithm is in force. The search reads this rather than a flag so the
-    // SVPlayer tuning never leaks into the plain MEMC baseline the user is comparing against.
-    void setAlgorithm(int algorithm) { algorithm_.store(algorithm, std::memory_order_relaxed); }
-    int algorithm() const { return algorithm_.load(std::memory_order_relaxed); }
-
     // Wall-clock duration of the most recent interpolate() call, for diagnostics.
     double lastDurationMs() const { return last_ms_.load(std::memory_order_relaxed); }
 
 private:
     static constexpr int kBlock = 16;
     static constexpr int kLevels = 3;   // 1/1, 1/2, 1/4
-    static constexpr int kCoarseRange = 8;
-    static constexpr int kFineRange = 2;
 
     // Occlusion is where the field folds: a block whose right/bottom neighbour travels *less*
     // than it does means the destinations between them overlap and some of the content is being
@@ -310,7 +288,6 @@ private:
 
     std::atomic<int> threads_{1};
     std::atomic<double> last_ms_{0.0};
-    std::atomic<int> algorithm_{0};
     SvConfig sv_config_{};
 
     // Per-stage accumulation for diagnostics. Only touched by the pipeline worker thread
@@ -359,7 +336,7 @@ private:
     // low bit when a block lands between two pixels. Every consumer converts back to pixels -
     // `hpToPx()` for the samplers on the CPU, `* 0.5` after the biased-byte decode in the
     // shaders. Keeping the unit uniform means a whole-pixel search never sets the low bit, so
-    // MEMC's output is unchanged by the extra precision.
+    // a whole-pixel-only run is unchanged by the extra precision.
     std::vector<int32_t> mvf_x_, mvf_y_, mvb_x_, mvb_y_;
     // Destination for one regulariseField() pass; a few kilobytes even at 1080p.
     std::vector<int32_t> tmpx_, tmpy_;

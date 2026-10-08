@@ -7,7 +7,7 @@ import java.nio.ByteBuffer
  * FastDVDnet temporal-denoising stage — SCAFFOLD ONLY, NOT A NEURAL NETWORK.
  *
  * This class exists to hold the *plumbing* of a FastDVDnet-style pre-processing stage in front of
- * RIFE (a bounded temporal window, a preprocessing entry point, a history that has to be flushed on
+ * the interpolator (a bounded temporal window, a preprocessing entry point, a history that has to be flushed on
  * seek / new media / toggle). It is **not** a denoiser:
  *
  *  * no model is loaded, no weights are shipped, and nothing is inferred;

@@ -15,14 +15,9 @@
 #include <thread>
 #include <vector>
 
-#define LOGI_MEMC(...) __android_log_print(ANDROID_LOG_INFO, "RIFE-MEMC", __VA_ARGS__)
+#define LOGI_SVP(...) __android_log_print(ANDROID_LOG_INFO, "SVP", __VA_ARGS__)
 
 namespace rife {
-
-bool producesMotionField(int algorithm) {
-    return algorithm == static_cast<int>(InterpolationAlgorithm::MEMC) ||
-           algorithm == static_cast<int>(InterpolationAlgorithm::SVPLAYER);
-}
 
 namespace {
 
@@ -88,19 +83,14 @@ static inline int sadWin(const uint8_t* a, const uint8_t* b, int stride, int bw,
 // block-matching counterpart of SVP's penalty.* settings and they are what keeps a per-block
 // search from producing a field that is locally plausible but globally speckled:
 //
-//   kPenaltyNew    a candidate is charged for moving away from the estimate inherited from the
-//                  coarser pyramid level, so the fine pass refines instead of jumping to a
-//                  coincidental match in textured or repetitive areas.
-//   kPenaltyZero   a candidate is charged for its own magnitude, which breaks ties in favour of
-//                  stillness - flat and out-of-focus regions should read as no motion rather
-//                  than as whatever the noise happened to prefer.
 //   kPenaltyNeighbour a candidate is charged for differing from the block's current vector, so
 //                  the coherence pass only adopts a neighbour when it is clearly better here.
 //
+// The forward/backward penalties themselves are no longer compile-time constants: SVP's
+// penaltyLambda sets both, so they are read from SvConfig per frame rather than defaulted here.
+//
 // Magnitudes are deliberately small against a 16x16 SAD (which runs into the thousands for a
 // mismatch): they decide between near-ties, they do not override the picture.
-static constexpr int kPenaltyNew = 16;
-static constexpr int kPenaltyZero = 4;
 static constexpr int kPenaltyNeighbour = 96;
 
 static inline int clampi(int v, int lo, int hi) {
@@ -521,7 +511,7 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     work_w_ = w;
     work_h_ = h;
     work_step_ = step;
-    LOGI_MEMC("scratch allocated %dx%d (%zu blocks at %d px, %d threads)",
+    LOGI_SVP("scratch allocated %dx%d (%zu blocks at %d px, %d threads)",
               w, h, blocks, step, threads_.load(std::memory_order_relaxed));
 }
 
@@ -584,7 +574,7 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                                            int32_t* mvx, int32_t* mvy) {
     // Ceil grid: the last column/row of blocks is a partial tile covering the
     // remainder of a frame whose width is not a multiple of the pitch. The pitch is kBlock
-    // for MEMC and for SVPlayer with overlap off, and smaller when SVP's overlap is on - the
+    // with overlap off, and smaller when SVP's overlap is on - the
     // matching window stays kBlock wide regardless, which is what makes it overlap its
     // neighbours once the pitch drops below that.
     const int step = blockStep();
@@ -596,45 +586,34 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
     std::fill(mvy, mvy + nblocks, 0);
     if (w < kBlock || h < kBlock) return 0;   // no full 16x16 window exists; MVs stay zero
 
-    // The SVPlayer tuning only applies when that backend is the one selected. MEMC keeps the
-    // measured baseline above unchanged so the two stay comparable from run to run.
-    const bool sv = algorithm() == static_cast<int>(InterpolationAlgorithm::SVPLAYER);
     // `subpel` is samples per pixel: 2 asks for a half-pixel search, 1 stays on whole pixels.
-    // Only the SVPlayer backend pays for the extra pass - MEMC's output stays bit-identical.
-    const bool halfPel = sv && sv_config_.subpel == 2;
-    int coarseBase = kCoarseRange;
-    int fineBase = kFineRange;
-    int newLambdaBase = kPenaltyNew;
-    int zeroLambdaBase = kPenaltyZero;
-    int searchDistance = 0;
+    const bool halfPel = sv_config_.subpel == 2;
+    const SvConfig& c = sv_config_;
+    const float q = c.performanceQuality < 0.0f ? 0.0f
+                  : (c.performanceQuality > 1.0f ? 1.0f : c.performanceQuality);
+    // The performance bar is one ladder read three ways: how far the search looks, how hard
+    // the penalties pull it back together, and how much picture each match averages over.
+    const int coarseBase = 4 + static_cast<int>(q * 8.0f + 0.5f);
+    const int fineBase = 1 + static_cast<int>(q * 2.0f + 0.5f);
+    const int newLambdaBase = static_cast<int>(c.penaltyLambda + 0.5f);
+    const int zeroLambdaBase = static_cast<int>(c.penaltyLambda * 0.25f + 0.5f);
+    const int searchDistance = c.searchDistance > 0 ? c.searchDistance : 0;
     int winW = kBlock;
     int winH = kBlock;
-    if (sv) {
-        const SvConfig& c = sv_config_;
-        const float q = c.performanceQuality < 0.0f ? 0.0f
-                      : (c.performanceQuality > 1.0f ? 1.0f : c.performanceQuality);
-        // The performance bar is one ladder read three ways: how far the search looks, how hard
-        // the penalties pull it back together, and how much picture each match averages over.
-        coarseBase = 4 + static_cast<int>(q * 8.0f + 0.5f);
-        fineBase = 1 + static_cast<int>(q * 2.0f + 0.5f);
-        newLambdaBase = static_cast<int>(c.penaltyLambda + 0.5f);
-        zeroLambdaBase = static_cast<int>(c.penaltyLambda * 0.25f + 0.5f);
-        searchDistance = c.searchDistance > 0 ? c.searchDistance : 0;
-        // Indexed by SvBlockSizeSetting.ordinal: 16x8, 16x16, 32x8, 32x16. 16x16 is SVP's own
-        // block size and the rung the app ships; the wider windows are there for noisy sources,
-        // where averaging more of the picture into a match beats matching it precisely.
-        switch (c.blockSize) {
-            case 1: winW = 16; winH = 8;   break;
-            case 2: winW = 16; winH = 16;  break;
-            case 3: winW = 32; winH = 8;   break;
-            case 4: winW = 32; winH = 16;  break;
-            default:
-                // AUTO: the quality bar picks the rung, so the two controls never fight over it.
-                if (q < 0.4f)       { winW = 16; winH = 8;  }
-                else if (q < 0.75f) { winW = 32; winH = 8;  }
-                else                { winW = 32; winH = 16; }
-                break;
-        }
+    // Indexed by SvBlockSizeSetting.ordinal: 16x8, 16x16, 32x8, 32x16. 16x16 is SVP's own
+    // block size and the rung the app ships; the wider windows are there for noisy sources,
+    // where averaging more of the picture into a match beats matching it precisely.
+    switch (c.blockSize) {
+        case 1: winW = 16; winH = 8;   break;
+        case 2: winW = 16; winH = 16;  break;
+        case 3: winW = 32; winH = 8;   break;
+        case 4: winW = 32; winH = 16;  break;
+        default:
+            // AUTO: the quality bar picks the rung, so the two controls never fight over it.
+            if (q < 0.4f)       { winW = 16; winH = 8;  }
+            else if (q < 0.75f) { winW = 32; winH = 8;  }
+            else                { winW = 32; winH = 16; }
+            break;
     }
 
     // Sum of the accepted vectors' plain 16x16 whole-pixel SAD at the finest level, in luma
@@ -673,9 +652,7 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         const int group = div;                      // full-res blocks per side
 
         int base;
-        if (!sv) {
-            base = (l == kLevels - 1) ? kCoarseRange : kFineRange;
-        } else if (searchDistance > 0) {
+        if (searchDistance > 0) {
             // An explicit distance is a reach in full-resolution pixels. The pyramid spends it
             // where it can afford it - the coarse level, which is what sets the prediction -
             // and the fine level stays inside its quality budget, so a wide setting widens the
@@ -688,14 +665,14 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
 
         // Both penalties are scaled by div so they are charged per full-resolution pixel and
         // their strength is the same at every level. The coarsest level is seeded from an
-        // all-zero field, so kPenaltyNew is switched off there - otherwise it would only be
-        // charging the search for finding motion at all.
+        // all-zero field, so the new-vector penalty is switched off there - otherwise it would
+        // only be charging the search for finding motion at all.
         const int newLambda = (l == kLevels - 1) ? 0 : newLambdaBase * div;
         const int zeroLambda = zeroLambdaBase * div;
         const uint8_t* tgt = tgtPyr[l];
         const uint8_t* ref = refPyr[l];
         // Shown to the SAD only through `range`, so it can be read once per level.
-        const bool adaptive = sv && searchDistance == 0 && base > 1;
+        const bool adaptive = searchDistance == 0 && base > 1;
 
         parallelFor(0, lrows, [&](int r0, int r1) {
             long long localSad = 0;
@@ -735,7 +712,7 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         range = base / 3 + ((base - base / 3) * hit) / span;
                     }
 
-                    if (sv && predMiss[idx]) range += kBlock >> (l > 0 ? l : 1);
+                    if (predMiss[idx]) range += kBlock >> (l > 0 ? l : 1);
 
                     int best = 0x7FFFFFFF;
                     int bestDx = gx, bestDy = gy;
@@ -972,7 +949,7 @@ void MemcInterpolator::buildOcclusionMasks(int w, int h) {
     // grid pitch for a field of the same shape. Dividing by step puts the byte back in the
     // units the threshold was tuned in: 255 is a fold of exactly one block step, whatever the
     // pitch. At step == kBlock the numerator is a multiple of the divisor, so this is the plain
-    // `fold * kOccScale` the baseline has always used and MEMC's masks are unchanged.
+    // `fold * kOccScale` multiply, identical at every pitch.
     auto scaleFold = [step](int fold) {
         return (fold * kOccScale * kBlock + step / 2) / step;
     };
@@ -1008,20 +985,17 @@ void MemcInterpolator::buildOcclusionMasks(int w, int h) {
 
     // How much of a fold the blend is still allowed to trust. Zero hands every sample back to
     // the motion field unchallenged; one keeps the raw divergence measure. Scaled here rather
-    // than where the field is packed, so the CPU warp and the shader see the same mask. This is
-    // the SVPlayer artifact-masking bar, and only it - the MEMC path always ran at full mask.
-    if (algorithm() == static_cast<int>(InterpolationAlgorithm::SVPLAYER)) {
-        const float scale = sv_config_.artifactMaskLevel;
-        if (scale < 1.0f) {
-            const int cap = scale < 0.0f ? 0 : static_cast<int>(scale * 255.0f + 0.5f);
-            auto rescale = [&](uint8_t* m) {
-                for (size_t i = 0; i < nblocks; i++) {
-                    m[i] = static_cast<uint8_t>((m[i] * cap + 127) / 255);
-                }
-            };
-            rescale(maskf_.data());
-            rescale(maskb_.data());
-        }
+    // than where the field is packed, so the CPU warp and the shader see the same mask.
+    const float scale = sv_config_.artifactMaskLevel;
+    if (scale < 1.0f) {
+        const int cap = scale < 0.0f ? 0 : static_cast<int>(scale * 255.0f + 0.5f);
+        auto rescale = [&](uint8_t* m) {
+            for (size_t i = 0; i < nblocks; i++) {
+                m[i] = static_cast<uint8_t>((m[i] * cap + 127) / 255);
+            }
+        };
+        rescale(maskf_.data());
+        rescale(maskb_.data());
     }
 }
 
@@ -1101,8 +1075,7 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     const int bwy = (h + step - 1) / step;
     // SVP's three renderers are alternatives, not a ladder: 0 (algo 11) is the plain time blend,
     // 1 (algo 13) adds the dynamic median, 2 (algo 21) adds cover/uncover instead. Everything
-    // below this line keys off that one number, and blendMode() pins it to 2 for MEMC, so the
-    // baseline keeps taking the branch it has always taken.
+    // below this line keys off that one number, which comes straight from blendAlgorithm.
     const int blendMode = this->blendMode();
     const float t = timestep;
     const float u = 1.0f - t;
@@ -1209,8 +1182,8 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
                     const int mb = (rawMb * (256 - wt) + 128) >> 8;
                     if (blendMode != 2 || (mf | mb) == 0) {
                         // Algo 11, plus algo 13's median when that is the selected renderer.
-                        // This is also the only branch MEMC and algo 21's unoccluded case ever
-                        // reach, so both of them stay byte for byte where they were.
+                        // This is also the only branch algo 21's unoccluded case reaches, so
+                        // that renderer stays byte for byte where it was.
                         uint32_t px = 0;
                         if (blendMode == 1) {
                             const uint8_t* pu0 = in0 + (outRow + static_cast<size_t>(x)) * 4;
@@ -1295,7 +1268,7 @@ void MemcInterpolator::microBench() {
         const long long cpu = threadCpuNs() - c0;
         const long long wall = nsSince(w0);
         const double mb = 4.0 * 10.0;  // 4 reps x (8 MB read + 2 MB written)
-        LOGI_MEMC("BENCH neon wall=%.2f cpu=%.2f ms  %.0f MB/s(wall) %.0f MB/s(cpu) "
+        LOGI_SVP("BENCH neon wall=%.2f cpu=%.2f ms  %.0f MB/s(wall) %.0f MB/s(cpu) "
                   "sink=%u",
                   wall / 1e6, cpu / 1e6, mb * 1e9 / wall, mb * 1e9 / cpu, sink);
     }
@@ -1317,7 +1290,7 @@ void MemcInterpolator::microBench() {
         sink = acc;
         const long long cpu = threadCpuNs() - c0;
         const long long wall = nsSince(w0);
-        LOGI_MEMC("BENCH sad wall=%.2f cpu=%.2f ms  %.2f M calls/s(wall) "
+        LOGI_SVP("BENCH sad wall=%.2f cpu=%.2f ms  %.2f M calls/s(wall) "
                   "%.2f M calls/s(cpu) sink=%d",
                   wall / 1e6, cpu / 1e6, 100.0 / (wall / 1e6), 100.0 / (cpu / 1e6),
                   static_cast<int>(sink));
@@ -1425,9 +1398,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     // Compute raw forward/backward consistency before the cut decision, but keep its reliability
     // bytes separate from the cover masks until that decision is complete. This reuses the two
     // fields already produced above; it neither changes either directional SAD nor gates them.
-    const bool svPlayer = algorithm() == static_cast<int>(InterpolationAlgorithm::SVPLAYER);
-    const size_t consistencyBlocks = (svPlayer && !forwardOnly)
-        ? buildConsistencyMasks(w, h) : 0;
+    const size_t consistencyBlocks = forwardOnly ? 0 : buildConsistencyMasks(w, h);
 
     // Scene-change gate: MVTools' thSCD1/thSCD2, restated as the mean per-pixel luma SAD of the
     // motion-compensated pair. One shot of video sits in single digits; two unrelated frames sit
@@ -1450,8 +1421,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     // The scene gate is the user's to switch off. With it off the warp always runs, even where
     // the two frames have nothing to do with each other - which is what the switch promises -
     // and the search is left to explain the picture on its own.
-    const bool gateScenes = algorithm() != static_cast<int>(InterpolationAlgorithm::SVPLAYER) ||
-                            sv_config_.sceneAdaptive;
+    const bool gateScenes = sv_config_.sceneAdaptive != 0;
     if (gateScenes && nblocks > 0.0) {
         const double scale = 1.0 / (nblocks * kBlock * kBlock);
         const double meanFwd = static_cast<double>(sadFwd) * scale;
@@ -1463,7 +1433,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
             : static_cast<double>(inconsistentBlocks_) / consistencyBlocks;
         const bool bothDirectionsFail = meanFwd > kSceneCutMeanSad &&
                                         meanBwd > kSceneCutMeanSad;
-        const bool oneDirectionMisleading = svPlayer && !forwardOnly &&
+        const bool oneDirectionMisleading = !forwardOnly &&
             highSad > kSceneCutMeanSad && inconsistentFraction >= 0.80;
         if (bothDirectionsFail || oneDirectionMisleading) {
             sceneCut_ = true;
@@ -1471,7 +1441,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
             std::fill(mvf_y_.begin(), mvf_y_.end(), 0);
             std::fill(mvb_x_.begin(), mvb_x_.end(), 0);
             std::fill(mvb_y_.begin(), mvb_y_.end(), 0);
-            LOGI_MEMC("scene cut: compensated SAD %.1f/%.1f, inconsistent %.0f%%, "
+            LOGI_SVP("scene cut: compensated SAD %.1f/%.1f, inconsistent %.0f%%, "
                       "crossfading instead of warping",
                       meanFwd, meanBwd, inconsistentFraction * 100.0);
         }
@@ -1481,7 +1451,7 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     // Preserve the existing cover-mask construction and artifactMaskLevel scaling. Reliability
     // is merged afterward, so the artifact control cannot disable consistency rejection. A scene
     // cut has zeroed fields and already selects the ordinary temporal crossfade.
-    if (svPlayer && !sceneCut_ && consistencyBlocks != 0) {
+    if (!sceneCut_ && consistencyBlocks != 0) {
         const size_t blocks = static_cast<size_t>(bwx) * bwy;
         for (size_t i = 0; i < blocks; ++i) {
             maskf_[i] = std::max(maskf_[i], consistencyf_[i]);
@@ -1527,7 +1497,6 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
 }
 
 int MemcInterpolator::blockStep() const {
-    if (algorithm() != static_cast<int>(InterpolationAlgorithm::SVPLAYER)) return kBlock;
     const int overlap = sv_config_.overlap;
     if (overlap <= 0) return kBlock;
     // SVP's rungs are 0 = none, 1 = 1/8 of the block, 2 = 1/4, 3 = 1/2, and SVP requires the
@@ -1544,7 +1513,6 @@ int MemcInterpolator::blockStep() const {
 }
 
 int MemcInterpolator::blendMode() const {
-    if (algorithm() != static_cast<int>(InterpolationAlgorithm::SVPLAYER)) return 2;
     const int mode = sv_config_.blendAlgorithm;
     return (mode == 0 || mode == 1) ? mode : 2;
 }
@@ -1749,7 +1717,7 @@ void MemcInterpolator::reportStagesIfDue() {
                            ? 100.0 * workPerFrame / (runPerFrame * participants)
                            : 100.0;
 
-    LOGI_MEMC("STAGES n=%lld frame=%.1f setup=%.2f resize=%.2f luma=%.2f "
+    LOGI_SVP("STAGES n=%lld frame=%.1f setup=%.2f resize=%.2f luma=%.2f "
               "lumaCpu=%.2f pyr=%.2f fwd=%.1f bwd=%.1f warp=%.1f ms | pool "
               "runs/frame=%.1f runWall=%.1f work=%.1f eff=%.0f%% thr=%d",
               acc_frames_, frame, setup, resize, luma, lumaCpu, pyr, fwd, bwd, warp,

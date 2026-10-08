@@ -100,7 +100,7 @@ class PlayerActivity : ComponentActivity() {
             // Deliberately no resetForDiscontinuity here. isPlaying is false whenever playback is
             // not *ready* as well as when the user pauses, so every rebuffer used to tear the UDP
             // stream down: discardPending() threw away queued datagrams, dropUntilKeyFrame blanked
-            // the receiver until an IDR arrived, and resetMemcState() flushed the pipeline - which
+            // the receiver until an IDR arrived, and resetInterpolationState() flushed the pipeline - which
             // is the "pauses for a while, then normal, then Signal Interruption again" loop. A
             // pause produces no encoder frames and the muxer's PTS stays monotonic on its own, so
             // the stream simply goes quiet and resumes; nothing needs re-anchoring.
@@ -220,7 +220,7 @@ class PlayerActivity : ComponentActivity() {
                 if (message != null) {
                     Toast.makeText(
                         this@PlayerActivity,
-                        "RIFE Processing Error: $message",
+                        "Processing Error: $message",
                         Toast.LENGTH_SHORT,
                     ).show()
                     rifeController.consumeError()

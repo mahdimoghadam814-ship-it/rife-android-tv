@@ -4,17 +4,12 @@ import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.net.Uri
-import android.os.Handler
-import android.os.HandlerThread
 import android.util.Log
 import androidx.media3.common.SurfaceInfo
 import androidx.media3.common.ColorInfo
 import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
 import com.rife.androidtv.NativeEngine
-import com.rife.androidtv.RifeDiagnosticResult
-import com.rife.androidtv.DeviceProfile
-import com.rife.androidtv.VulkanCapabilities
 import com.rife.androidtv.encode.EncodedStreamSink
 import com.rife.androidtv.encode.HdrHevcEncoder
 import com.rife.androidtv.stream.AudioFallbackFeeder
@@ -40,19 +35,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * App-wide owner of the RIFE / FastDVDnet processing stage.
+ * App-wide owner of the frame processing stage.
  *
  * The controller is a process singleton (Koin `@Single`): the [VideoFrameProcessor] it owns keeps
  * one worker thread, one EGL context and one set of pooled frame buffers for the whole app, and
  * both the player screen (surface routing, engine status overlay) and the Video Processing
  * settings entry drive it through this single instance.
  *
- * The native RIFE engine is initialised lazily on the first RIFE enable, off the main thread,
- * exactly like the previous standalone player did: model initialisation loads the RIFE network
- * from assets and can take seconds.
- *
- * FastDVDnet (scaffold) does NOT initialize the RIFE engine. The two stages have independent
- * lifecycles.
+ * There is no neural engine any more: interpolation is the CPU SVPlayer search, which needs no
+ * model, no Vulkan and no initialisation, so nothing here has a deferred start-up path.
+ * FastDVDnet keeps its own independent lifecycle as a pre-processing stage.
  */
 @UnstableApi
 class RifeEngineController(
@@ -60,9 +52,7 @@ class RifeEngineController(
 ) : RifeController {
     companion object {
         private const val TAG = "RifeEngineController"
-        private const val TAG_DEVICE = "RIFE-DEVICE"
-        private const val TAG_LIFECYCLE = "RIFE-LIFECYCLE"
-        private const val TAG_ERROR = "RIFE-ERROR"
+        private const val TAG_LIFECYCLE = "PIPELINE-LIFECYCLE"
     }
 
     /**
@@ -109,18 +99,6 @@ class RifeEngineController(
     private val _inputSurface = MutableStateFlow<android.view.Surface?>(null)
     override val inputSurface: StateFlow<android.view.Surface?> = _inputSurface.asStateFlow()
 
-    @Volatile
-    private var engineReady = false
-
-    @Volatile
-    private var engineInitStarted = false
-
-    private var initThread: HandlerThread? = null
-
-    @Volatile
-    private var interpolationAlgorithm: FeatureInterpolationAlgorithm =
-        FeatureInterpolationAlgorithm.MEMC
-
     /**
      * Starts the processor's worker thread. Called once when the player screen is created.
      */
@@ -147,35 +125,24 @@ class RifeEngineController(
     }
 
     /**
-     * Enables or disables RIFE interpolation. The enable path resets the pipeline and re-creates
+     * Enables or disables interpolation. The enable path resets the pipeline and re-creates
      * the input surface; the new surface is published through [inputSurface] so the player screen
      * can attach it to the player.
      */
     override fun setRifeEnabled(enabled: Boolean) {
-        if (enabled && interpolationAlgorithm == FeatureInterpolationAlgorithm.RIFE) {
-            // MEMC runs entirely in the native layer and never touches the RIFE model, so
-            // loading it (seconds + ~365 MB RSS) would be pure waste in that mode.
-            ensureEngineInitialized()
-        }
         processor.setRifeEnabled(enabled)
         _processingEnabled.value = processor.isProcessingEnabled
     }
 
     /**
-     * Selects the interpolation backend. The value reaches the native dispatcher immediately, so
-     * the next frame pair is already interpolated by the chosen algorithm.
+     * Selects the interpolation backend. Only SVPlayer remains, so this configures the worker
+     * pool the search runs on; the value reaches the pipeline so the next frame pair is already
+     * running on it.
      */
     override fun setInterpolationAlgorithm(algorithm: FeatureInterpolationAlgorithm) {
-        interpolationAlgorithm = algorithm
-        processor.setInterpolationAlgorithmOrdinal(algorithm.ordinal)
-        // The Kotlin ordinals are the native InterpolationAlgorithm values: RIFE 0, MEMC 1,
-        // SVPLAYER 2, so the engine can tell the two block-matching backends apart.
-        NativeEngine.setInterpolationAlgorithm(algorithm.ordinal)
-        if (algorithm != FeatureInterpolationAlgorithm.RIFE) {
-            // Measured optimum: the ME/MC loops are memory-bound, so going wider than 4 only
-            // adds contention (8 threads was ~2x slower than 4 on an 8-core big.LITTLE device).
-            NativeEngine.setMemcThreadCount(4)
-        }
+        // Measured optimum: the ME/MC loops are memory-bound, so going wider than 4 only
+        // adds contention (8 threads was ~2x slower than 4 on an 8-core big.LITTLE device).
+        NativeEngine.setInterpolationThreadCount(4)
         Log.i(TAG_LIFECYCLE, "Interpolation algorithm: $algorithm")
     }
 
@@ -186,7 +153,7 @@ class RifeEngineController(
      */
     override fun setMemcLevel(multiplier: Float) {
         processor.setMemcLevel(multiplier)
-        Log.i(TAG_LIFECYCLE, "MEMC level: ${multiplier}x")
+        Log.i(TAG_LIFECYCLE, "Interpolation level: ${multiplier}x")
     }
 
     /**
@@ -221,10 +188,10 @@ class RifeEngineController(
 
     /**
      * Enables or disables the FastDVDnet pre-processing stage (scaffold: frames pass through).
-     * FastDVDnet does NOT initialize the RIFE engine - it runs independently.
+     * FastDVDnet does NOT need the interpolator started - it runs independently.
      */
     override fun setFastDvdNetEnabled(enabled: Boolean) {
-        // FastDVDnet scaffold does NOT require RIFE engine initialization.
+        // FastDVDnet scaffold does NOT require interpolation initialisation.
         // It only maintains a temporal history buffer and passes frames through unchanged.
         processor.setFastDvdNetEnabled(enabled)
         _processingEnabled.value = processor.isProcessingEnabled
@@ -289,7 +256,7 @@ class RifeEngineController(
         activeMuxer?.resetForDiscontinuity()
         encoder?.requestKeyFrame()
         // The block-matching pyramid holds state across frames; a seek/stream change invalidates it.
-        NativeEngine.resetMemcState()
+        NativeEngine.resetInterpolationState()
         audioFeeder?.onDiscontinuity(positionMs)
         audioFallbackFeeder?.onDiscontinuity(positionMs)
         subtitleFeeder?.onDiscontinuity(positionMs)
@@ -304,11 +271,6 @@ class RifeEngineController(
         _error.value = null
         return current
     }
-
-    /**
-     * The last native engine status, for the diagnostics dialog.
-     */
-    fun engineStatus(): RifeDiagnosticResult = NativeEngine.getRifeStatus()
 
     // --------------------------------------------------------------------------------------
     // Phase E/F: UDP streaming of processed frames to a TV box
@@ -714,49 +676,4 @@ Log.e(TAG, "Failed to start UDP streaming", e)
         }
     }
 
-    private fun ensureEngineInitialized() {
-        if (engineReady || engineInitStarted) {
-            return
-        }
-        engineInitStarted = true
-        val thread = HandlerThread("RifeEngineInit").apply { start() }
-        initThread = thread
-        Handler(thread.looper).post {
-            try {
-                val initSuccess = NativeEngine.initRife(0)
-                if (initSuccess) {
-                    val baseCacheDir = context.cacheDir.absolutePath
-                    val loadSuccess = NativeEngine.loadRifeModel(
-                        context.assets,
-                        baseCacheDir,
-                        "rife-v4.6",
-                        isV2 = false,
-                        isV4 = true,
-                    )
-                    engineReady = loadSuccess
-                    if (loadSuccess) {
-                        Log.i(TAG_LIFECYCLE, "RIFE engine initialised: modelLoaded=$loadSuccess")
-                        // Log device profile and capabilities
-                        val status = NativeEngine.getRifeStatus()
-                        Log.i(TAG_DEVICE, "Device profile: ${status.deviceProfile}, GPU: ${status.gpuName}, " +
-                                "Vulkan: ${status.vulkanApiVersion}, Capabilities: ${status.vulkanCapabilities}")
-                    } else {
-                        Log.e(TAG_LIFECYCLE, "RIFE engine model load failed")
-                        _error.value = "RIFE model load failed. Check that model assets are packaged."
-                    }
-                } else {
-                    Log.e(TAG_LIFECYCLE, "RIFE engine init failed")
-                    _error.value = "RIFE engine initialization failed."
-                }
-            } catch (t: Throwable) {
-                Log.e(TAG_ERROR, "RIFE engine init crashed", t)
-                _error.value = "RIFE engine initialization crashed: ${t.message}"
-            } finally {
-                // Reset initStarted so a failed initialization can be retried.
-                engineInitStarted = false
-                initThread?.quitSafely()
-                initThread = null
-            }
-        }
-    }
 }

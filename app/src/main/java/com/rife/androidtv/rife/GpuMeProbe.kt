@@ -12,7 +12,7 @@ import java.nio.FloatBuffer
 /**
  * Measures whether moving motion estimation onto the GPU is viable on the device we are running on.
  *
- * The CPU motion estimator owns 70-75% of a MEMC cycle on the TV box (82-105 ms of a 117-142 ms
+ * The CPU motion estimator owns 70-75% of an interpolation cycle on the TV box (82-105 ms of a 117-142 ms
  * total against a 41.6 ms budget), so no amount of CPU tuning reaches the budget. Running ME on the
  * GPU removes that cost and, because the frames then never leave the GPU, also removes the
  * `glReadPixels` + `glTexImage2D` round trip the pipeline pays to get them back (a further ~24 ms).

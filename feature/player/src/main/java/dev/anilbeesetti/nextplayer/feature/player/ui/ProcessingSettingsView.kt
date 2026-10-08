@@ -397,7 +397,6 @@ private fun SvSettingsSection(
 @Composable
 private fun RifeResolutionSetting.resolutionLabel(): String = stringResource(
     when (this) {
-        RifeResolutionSetting.AUTO -> R.string.rife_resolution_auto
         RifeResolutionSetting.ORIGINAL -> R.string.rife_resolution_original
         RifeResolutionSetting.RES_1080P -> R.string.rife_resolution_1080p
         RifeResolutionSetting.RES_720P -> R.string.rife_resolution_720p
@@ -407,20 +406,12 @@ private fun RifeResolutionSetting.resolutionLabel(): String = stringResource(
 
 @Composable
 private fun InterpolationAlgorithmSetting.algorithmLabel(): String = stringResource(
-    when (this) {
-        InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_algorithm_rife
-        InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_algorithm_memc
-        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_algorithm_svplayer
-    },
+    R.string.interpolation_algorithm_svplayer,
 )
 
 @Composable
 private fun InterpolationAlgorithmSetting.interpolationDescription(): String = stringResource(
-    when (this) {
-        InterpolationAlgorithmSetting.RIFE -> R.string.interpolation_description_rife
-        InterpolationAlgorithmSetting.MEMC -> R.string.interpolation_description_memc
-        InterpolationAlgorithmSetting.SVPLAYER -> R.string.interpolation_description_svplayer
-    },
+    R.string.interpolation_description_svplayer,
 )
 
 @Composable

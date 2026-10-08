@@ -1,39 +1,24 @@
 package com.rife.androidtv
 
-import android.content.res.AssetManager
 import android.view.Surface
 import java.nio.ByteBuffer
 
+/**
+ * JNI surface of the SVP-only processing pipeline.
+ *
+ * The library carries exactly two pieces of native code: this bridge and the CPU
+ * block-matching interpolator that implements the SVPlayer search. The RIFE neural network
+ * and the plain MEMC baseline were removed, so there is no model, no Vulkan runtime and no
+ * algorithm selector left - every entry point below is unconditional.
+ */
 object NativeEngine {
     init {
         System.loadLibrary("rife_native")
     }
 
-    @JvmStatic
-    external fun runDiagnostics(): NativeDiagnosticResult
-
-    @JvmStatic
-    external fun initRife(gpuId: Int): Boolean
-
-    @JvmStatic
-    external fun loadRifeModel(assetManager: AssetManager, baseCacheDir: String, modelDir: String, isV2: Boolean, isV4: Boolean): Boolean
-
-    @JvmStatic
-    external fun interpolateFrameBuffers(
-        in0Buffer: ByteBuffer,
-        in1Buffer: ByteBuffer,
-        srcWidth: Int,
-        srcHeight: Int,
-        targetWidth: Int,
-        targetHeight: Int,
-        timestep: Float,
-        outBuffer: ByteBuffer
-    ): Boolean
-
     /**
-     * Runs motion estimation only and packs the result instead of warping: eight bytes per 16x16
-     * block, row-major. [mvBuffer] must hold at least
-     * `ceil(targetWidth/16) * ceil(targetHeight/16) * 8` bytes.
+     * Runs motion estimation only and packs the result instead of warping: eight bytes per
+     * block, row-major, on the grid pitch reported by [motionFieldStep].
      *
      * The first four bytes of each block are forward x, forward y, backward x, backward y - each
      * a whole-pixel vector biased by +128. The next four are the forward and backward
@@ -85,22 +70,28 @@ object NativeEngine {
     external fun getOutputDataSpace(surface: Surface): Int
 
     @JvmStatic
-    external fun runRifeTest(width: Int, height: Int): Boolean
+    external fun interpolateFrameBuffers(
+        in0Buffer: ByteBuffer,
+        in1Buffer: ByteBuffer,
+        srcWidth: Int,
+        srcHeight: Int,
+        targetWidth: Int,
+        targetHeight: Int,
+        timestep: Float,
+        outBuffer: ByteBuffer
+    ): Boolean
 
     @JvmStatic
-    external fun setInterpolationAlgorithm(algorithm: Int)
-
-    @JvmStatic
-    external fun setMemcThreadCount(threads: Int)
+    external fun setInterpolationThreadCount(threads: Int)
 
     /**
      * The pitch, in pixels, that the packed motion grid is laid out on - `ceil(width / step)` by
      * `ceil(height / step)` blocks of eight bytes each.
      *
-     * It is 16 for the MEMC baseline and for SVPlayer with `overlap` off, and smaller when
-     * SVP's overlap is on, because the overlap shrinks the grid pitch rather than widening the
-     * search window. Everything that sizes the field's buffer or indexes it in a shader has to
-     * ask for this rather than assume 16; a mismatch smears the field instead of failing.
+     * It shrinks when SVP's `overlap` is on, because the overlap shrinks the grid pitch rather
+     * than widening the search window. Everything that sizes the field's buffer or indexes it in
+     * a shader has to ask for this rather than assume 16; a mismatch smears the field instead of
+     * failing.
      */
     @JvmStatic
     external fun motionFieldStep(): Int
@@ -111,8 +102,7 @@ object NativeEngine {
      * (`algo 21`). The three are alternatives rather than cumulative rungs.
      *
      * Read from the interpolator rather than from the settings so that the CPU fallback and the
-     * GL shader cannot disagree, and so that it reads 2 for every algorithm but SVPlayer - a
-     * user who picks MEDIAN and then switches back to MEMC must not move MEMC with it.
+     * GL shader cannot disagree.
      */
     @JvmStatic
     external fun motionFieldBlendMode(): Int
@@ -131,12 +121,11 @@ object NativeEngine {
         meScale: Int,
     )
 
+    /** Drops the pyramid and field history held across frames: seek, stream change, discontinuity. */
     @JvmStatic
-    external fun resetMemcState()
+    external fun resetInterpolationState()
 
+    /** Wall-clock duration of the most recent native interpolate()/motionField() call, in ms. */
     @JvmStatic
-    external fun getMemcLastDurationMs(): Double
-
-    @JvmStatic
-    external fun getRifeStatus(): RifeDiagnosticResult
+    external fun getInterpolationLastDurationMs(): Double
 }

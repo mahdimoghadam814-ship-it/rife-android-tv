@@ -65,7 +65,7 @@ data class Statistics(
 )
 
 /**
- * Frame processor for RIFE interpolation and the (scaffold) FastDVDnet pre-processing stage, built
+ * Frame processor for interpolation and the (scaffold) FastDVDnet pre-processing stage, built
  * on the real Media3 [androidx.media3.common.VideoFrameProcessor] surface-input contract.
  *
  * ```
@@ -134,7 +134,7 @@ class VideoFrameProcessor(
         private const val STAGE_HEARTBEAT_MS = 1000L
 
         /**
-         * Bounds the frame-pair interval the MEMC level divides. The same [1ms, 1s] window the
+         * Bounds the frame-pair interval the interpolation level divides. The same [1ms, 1s] window the
          * AUTO policy already accepts, so a seek or a bogus timestamp cannot produce a step of
          * zero or a backlog of frames.
          */
@@ -179,7 +179,7 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Whether RIFE interpolation is active. Input-surface frames are only read back while RIFE or
+     * Whether interpolation is active. Input-surface frames are only read back while interpolation or
      * the FastDVDnet stage is enabled.
      */
     @Volatile
@@ -230,7 +230,7 @@ class VideoFrameProcessor(
         override fun onError(exception: VideoFrameProcessingException) {
             val message = exception.message ?: "unknown Media3 video frame processing error"
             Log.e(TAG, "Media3 VideoFrameProcessor error: $message", exception)
-            reportError("RIFE frame processing failed: $message")
+            reportError("Frame processing failed: $message")
         }
 
         override fun onEnded() {
@@ -276,7 +276,7 @@ class VideoFrameProcessor(
         get() = if (inputSurfaceReady) createdInputSurface else null
 
     // ---------------------------------------------------------------------------------------
-    // RIFE pipeline state. Only ever mutated on the worker thread.
+    // Interpolation pipeline state. Only ever mutated on the worker thread.
     // ---------------------------------------------------------------------------------------
 
     private val frameQueue = ArrayBlockingQueue<FrameData>(FRAME_QUEUE_CAPACITY)
@@ -297,7 +297,6 @@ class VideoFrameProcessor(
     private var pairProcessing = false
     private var streamGeneration = 0L
     private var inFlightPair: Pair<FrameData, FrameData>? = null
-    @Volatile private var interpolationAlgorithmOrdinal = 1
 
     private data class PreparedMotion(
         val field: ByteBuffer?,
@@ -318,10 +317,6 @@ class VideoFrameProcessor(
     private val pendingRenderQueue = ArrayDeque<InFlightWork>()
 
     private var previousFrame: FrameData? = null
-
-    fun setInterpolationAlgorithmOrdinal(ordinal: Int) {
-        interpolationAlgorithmOrdinal = ordinal.coerceIn(0, 2)
-    }
 
     private var frameCountInput = 0
     private var frameCountOutput = 0
@@ -358,7 +353,6 @@ class VideoFrameProcessor(
     private var cachedOutBuf: ByteBuffer? = null
     private var cachedTargetSize = 0
     private var rejectedTargetSize = 0
-    private var lastMemoryBudgetLogNs = 0L
 
     /**
      * Packed motion field for the GPU warp: four bytes per 16x16 block, so a few kilobytes even
@@ -371,35 +365,11 @@ class VideoFrameProcessor(
     private var lastDimsLogH = 0
 
     /**
-     * Adaptive processing resolution (RifeResolution.AUTO).
-     *
-     * [autoDegradeLevel] indexes [autoDegradeLadder] and only ever moves down, so a source that
-     * cannot be held at native resolution settles instead of flapping between two sizes every
-     * reporting window. [autoDenoiseBranch] records which AUTO branch picked the current size: only
-     * the native-4K-denoiser branch is allowed to degrade, because the other two are fixed by
-     * policy and hiding their cost behind a downgrade would mask exactly the work needed to make
-     * them fit. [autoCaptureW]/[autoCaptureH] are the size that branch last asked for, so the
-     * downgrade is logged with what it cost.
-     */
-    private var autoDegradeLevel = 0
-    private var autoDenoiseBranch = false
-    private var autoCaptureW = 0
-    private var autoCaptureH = 0
-
-    /**
      * Set once the motion-aligned denoiser fails for a stream, so the reason is logged a single
-     * time instead of every cycle. The failure is usually permanent for that stream - RIFE cannot
-     * supply a field at all - and a per-frame warning at 24 fps is worse than no warning.
+     * time instead of every cycle. The failure is usually permanent for that stream - the search
+     * cannot supply a field at all - and a per-frame warning at 24 fps is worse than no warning.
      */
     private var denoiseUnavailableLogged = false
-
-    /**
-     * Source frame interval in nanoseconds, taken from the decoder timestamps of the pair being
-     * processed. This is the budget the AUTO policy has to fit inside to hold the native frame
-     * rate, and it is measured rather than configured because the source is what defines it. Zero
-     * until the first pair, and rejected outside [1ms, 1s] so a seek cannot set a nonsense one.
-     */
-    private var sourceIntervalNs = 0L
 
     /** Microseconds between the last pair's two source frames; 0 until a pair has been seen. */
     private var lastPairIntervalUs = 0L
@@ -421,15 +391,14 @@ class VideoFrameProcessor(
         val sourceW = inputWidth
         val sourceH = inputHeight
         if (sourceW <= 0 || sourceH <= 0) return 0 to 0
-        val effective = if (resolution == RifeResolution.AUTO) autoResolution(sourceW, sourceH) else resolution
-        var size = calculateTargetDimensions(sourceW, sourceH, effective)
-        if (size.first.toLong() * size.second * 4L * 13L > FRAME_MEMORY_BUDGET_BYTES) {
-            size = calculateTargetDimensions(sourceW, sourceH, RifeResolution.RES_1080P)
-        }
+        val size = calculateTargetDimensions(sourceW, sourceH, resolution)
         val surfaceW = outputRenderer?.outputSurfaceWidth ?: 0
         val surfaceH = outputRenderer?.outputSurfaceHeight ?: 0
-        if (surfaceW > 0 && surfaceH > 0) size = fitWithin(size.first, size.second, surfaceW, surfaceH)
-        return size
+        return if (surfaceW > 0 && surfaceH > 0) {
+            fitWithin(size.first, size.second, surfaceW, surfaceH)
+        } else {
+            size
+        }
     }
     fun invalidateProcessingSize() { processingWidth = 0; processingHeight = 0 }
     fun currentSourceFrameRate(): Float = sourceFrameRateHint.takeIf { it > 0f }
@@ -532,7 +501,7 @@ class VideoFrameProcessor(
     private var readbackInProgress = false
     private var released = false
 
-    // Per-stage timing window (see TIMING_WINDOW_FRAMES). MEMC is only a few ms per frame yet
+    // Per-stage timing window (see TIMING_WINDOW_FRAMES). Interpolation is only a few ms per frame yet
     // playback lands far below real time on both the TV box and the Poco F7, so the remaining
     // cost has to be located in the GL readback / upload path rather than assumed.
     private var timingStartNs = 0L
@@ -616,7 +585,7 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Enables or disables RIFE interpolation.
+     * Enables or disables interpolation.
      *
      * OFF -> ON flushes all pipeline state and re-creates the Media3 input surface together with its
      * EGL context and SurfaceTexture, so a stale or stalled input surface can never be reused. The
@@ -641,7 +610,7 @@ class VideoFrameProcessor(
 
     /**
      * Enables or disables the FastDVDnet pre-processing stage, i.e. the switch between
-     * "RIFE OFF + FastDVDnet ON" (state 2) and "RIFE OFF + FastDVDnet OFF" (state 1).
+     * "Interpolation OFF + FastDVDnet ON" (state 2) and "Interpolation OFF + FastDVDnet OFF" (state 1).
      */
     fun setFastDvdNetEnabled(enabled: Boolean) {
         if (fastDvdNetEngine.isEnabled == enabled) {
@@ -885,7 +854,7 @@ class VideoFrameProcessor(
         offsetToAddUs: Long
     ) {
         check(inputType == Media3VideoFrameProcessor.INPUT_TYPE_SURFACE) {
-            "RIFE only supports INPUT_TYPE_SURFACE"
+            "Interpolation requires an input Surface"
         }
         if (inputWidth <= 0 || inputHeight <= 0) {
             if (format.width > 0 && format.height > 0) {
@@ -1036,9 +1005,8 @@ class VideoFrameProcessor(
     /** True when the current source is HDR (PQ or HLG), regardless of interpolation state. */
     private fun isHdrSource(): Boolean = ColorInfo.isTransferHdr(sourceColorInfo)
 
-    /** True when HDR source AND MEMC/SVPlayer algorithm is active (for algorithm-specific decisions). */
-    private fun isHdrMemcSource(): Boolean =
-        isRifeEnabled && interpolationAlgorithmOrdinal in 1..2 && isHdrSource()
+    /** True when the pipeline is interpolating and the source is HDR (algorithm-specific decisions). */
+    private fun isHdrMemcSource(): Boolean = isRifeEnabled && isHdrSource()
 
     /**
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
@@ -1052,7 +1020,7 @@ class VideoFrameProcessor(
         runOnWorker("setMemcLevel()") {
             nextOutputUs = Long.MIN_VALUE
         }
-        Log.i(TAG, "MEMC level: ${clamped}x")
+        Log.i(TAG, "Interpolation level: ${clamped}x")
     }
 
     /**
@@ -1191,11 +1159,11 @@ class VideoFrameProcessor(
         inputBitmap: Bitmap,
         timestampIterator: TimestampIterator
     ): Boolean {
-        throw UnsupportedOperationException("RIFE only supports INPUT_TYPE_SURFACE")
+        throw UnsupportedOperationException("Interpolation requires an input Surface")
     }
 
     override fun queueInputTexture(textureId: Int, presentationTimeUs: Long): Boolean {
-        throw UnsupportedOperationException("RIFE only supports INPUT_TYPE_SURFACE")
+        throw UnsupportedOperationException("Interpolation requires an input Surface")
     }
 
     override fun signalEndOfInput() {
@@ -1236,7 +1204,7 @@ class VideoFrameProcessor(
                 block()
             } catch (t: Throwable) {
                 Log.e(TAG, "$action failed on the worker thread", t)
-                reportError("RIFE pipeline error: ${t.message}")
+                reportError("Pipeline error: ${t.message}")
             }
         }
         if (!posted) {
@@ -1350,12 +1318,8 @@ class VideoFrameProcessor(
         lastStatsResetTime = SystemClock.elapsedRealtime()
         lastProcTimeMs = 0L
 
-        // A new stream gets a fresh chance at its native AUTO resolution, and the capture breadcrumb
-        // is cleared so the RES POLICY line is printed again for the new source.
-        autoDegradeLevel = 0
-        autoDenoiseBranch = false
-        autoCaptureW = 0
-        autoCaptureH = 0
+        // The capture breadcrumb is cleared so the RES POLICY line is printed again for the new
+        // source; resolution itself is never inferred, so there is nothing else to reset.
         lastCaptureLogSrcW = -1
         lastCaptureLogSrcH = -1
         lastCaptureLogW = 0
@@ -1582,7 +1546,7 @@ class VideoFrameProcessor(
             frameGrabber = null
             releaseInputSurfaceBundle(newBundle)
             inputSurfaceReady = false
-            reportError("RIFE input surface initialization failed: ${e.message}")
+            reportError("Input surface initialization failed: ${e.message}")
             // The owner has to fall back to normal PlayerView playback, otherwise the processing
             // output surface would sit in front of the user with nothing rendered into it.
             val handler = mainHandler
@@ -1711,7 +1675,7 @@ class VideoFrameProcessor(
         } catch (t: Throwable) {
             droppedFrameCount++
             Log.e(TAG, "Frame capture failed", t)
-            reportError("RIFE frame capture failed: ${t.message}")
+            reportError("Frame capture failed: ${t.message}")
         } finally {
             readbackInProgress = false
         }
@@ -1751,11 +1715,9 @@ class VideoFrameProcessor(
         }
 
         // The readback size is the source size scaled to the configured resolution; the aspect
-        // ratio of the source is preserved, so the frame is never stretched. This is also where
-        // an AUTO source gets downgraded, and where any capture is clamped to the output surface.
+        // ratio of the source is preserved, so the frame is never stretched. The capture is also
+        // clamped to the output surface - never below it as a performance shortcut.
         val (captureWidth, captureHeight) = resolveCaptureDimensions(sourceWidth, sourceHeight)
-        autoCaptureW = captureWidth
-        autoCaptureH = captureHeight
         processingWidth = captureWidth
         processingHeight = captureHeight
 
@@ -1789,7 +1751,7 @@ class VideoFrameProcessor(
                     "surface=${outputRenderer?.outputSurfaceWidth ?: 0}x" +
                     "${outputRenderer?.outputSurfaceHeight ?: 0} " +
                     "res=$resolution memc=$isRifeEnabled denoise=$isDenoiseEnabled " +
-                    "-> capture=${captureWidth}x$captureHeight level=$autoDegradeLevel" + hdrInfo
+                    "-> capture=${captureWidth}x$captureHeight" + hdrInfo
             )
         }
 
@@ -1818,7 +1780,7 @@ class VideoFrameProcessor(
         if (retainHdrSource && !grabber.isHdrSourceSupported) {
             if (!hdrCaptureUnavailableLogged) {
                 hdrCaptureUnavailableLogged = true
-                Log.e(TAG, "HDR MEMC capture requires GLES3 RGBA16F render-target support; refusing the RGBA8 HDR path")
+                Log.e(TAG, "HDR capture requires GLES3 RGBA16F render-target support; refusing the RGBA8 HDR path")
                 reportError("HDR interpolation unavailable: this GLES driver cannot retain a high-precision source")
             }
             droppedFrameCount++
@@ -1877,7 +1839,7 @@ class VideoFrameProcessor(
             Log.d(
                 TAG,
                 "FRAME CAPTURE LOG: decoded=${sourceWidth}x$sourceHeight -> " +
-                    "preRife=${captureWidth}x$captureHeight"
+                    "preInterp=${captureWidth}x$captureHeight"
             )
         }
 
@@ -1947,7 +1909,6 @@ class VideoFrameProcessor(
         val prev = previousFrame
 
         val canPrepareMotionOffThread = prev != null &&
-            interpolationAlgorithmOrdinal in 1..2 &&
             isRifeEnabled &&
             !fastDvdNetEngine.isEnabled &&
             prev.width == nextFrame.width && prev.height == nextFrame.height &&
@@ -2026,8 +1987,7 @@ class VideoFrameProcessor(
         val nextFrame = frameQueue.peek() ?: return
         val prev = prevForNextPair
 
-        val canPrepareMotionOffThread = interpolationAlgorithmOrdinal in 1..2 &&
-            isRifeEnabled &&
+        val canPrepareMotionOffThread = isRifeEnabled &&
             !fastDvdNetEngine.isEnabled &&
             prev.width == nextFrame.width && prev.height == nextFrame.height &&
             outputRenderer?.isWarpInitialized == true
@@ -2078,7 +2038,7 @@ class VideoFrameProcessor(
                 PreparedMotion(field.takeIf { ready }, ready, System.nanoTime() - started)
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "Asynchronous MEMC motion estimation failed", t)
+            Log.e(TAG, "Asynchronous motion estimation failed", t)
             PreparedMotion(null, false, System.nanoTime() - started)
         }
     }
@@ -2119,9 +2079,9 @@ class VideoFrameProcessor(
         }
 
         if (prev.width != nextFrame.width || prev.height != nextFrame.height) {
-            // The resolution changed underneath us: restart the pair instead of feeding RIFE
-            // mismatched buffers.
-            Log.i(TAG, "Frame size changed, restarting the RIFE pair")
+            // The resolution changed underneath us: restart the pair instead of feeding the
+            // interpolator mismatched buffers.
+            Log.i(TAG, "Frame size changed, restarting the interpolation pair")
             releaseFrameBuffer(prev.pixels)
             renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             frameCountOutput++
@@ -2130,10 +2090,10 @@ class VideoFrameProcessor(
             return
         }
 
-        // Native-rate budget for the AUTO policy, straight from the source timestamps.
+        // Source cadence, straight from the decoder timestamps of the pair being processed.
+        // Rejected outside [1ms, 1s] so a seek cannot set a nonsense one.
         val srcIntervalUs = nextFrame.timestampUs - prev.timestampUs
         if (srcIntervalUs in 1_000L..1_000_000L) {
-            sourceIntervalNs = srcIntervalUs * 1_000L
             lastPairIntervalUs = srcIntervalUs
         }
 
@@ -2144,10 +2104,10 @@ class VideoFrameProcessor(
 
         val requiredInputBytes = rifeInputW.toLong() * rifeInputH.toLong() * 4L
 
-        // The JNI layer never checks the output capacity, and RifeEngine::processFrameBuffer() ends
-        // with ncnn::Mat::to_pixels_resize(out_ptr, PIXEL_RGB2RGBA, w, h), which writes exactly
-        // rifeOutputW * rifeOutputH * 4 bytes through that raw pointer. The Java side therefore has
-        // to guarantee that capacity itself.
+        // The JNI layer never checks the output capacity: interpolateFrameBuffers() writes
+        // rifeOutputW * rifeOutputH * 4 bytes straight through the raw pointer that
+        // GetDirectBufferAddress() hands it. The Java side therefore has to guarantee that
+        // capacity itself.
         val requiredOutputBytes = rifeOutputW.toLong() * rifeOutputH.toLong() * 4L
 
         if (!ensureCachedBuffers(requiredInputBytes, requiredOutputBytes, rifeInputW, rifeInputH)) {
@@ -2202,7 +2162,7 @@ class VideoFrameProcessor(
         in1Buf.limit(frameBytes.toInt())
         nsCopy += System.nanoTime() - tCopyStart
 
-        // DIAGNOSTICS: Log checksum of frames before FastDVDnet/RIFE
+        // DIAGNOSTICS: Log checksum of frames before FastDVDnet/interpolation
         var prevChecksum = 0L
         var nextChecksum = 0L
         if (VERBOSE_DIAGNOSTICS) {
@@ -2219,11 +2179,10 @@ class VideoFrameProcessor(
             // State 2: denoise-only. The current frame is cleaned and rendered as-is; no
             // interpolation is attempted and no extra frame is invented.
             if (fastDvdNetEngine.isEnabled) {
-                // With MEMC off nothing else asks for the field, but the denoiser's whole premise
+                // Nothing else on this path asks for the field, but the denoiser's whole premise
                 // is that it samples the history where this pair's content moved to, so it computes
-                // one here. computeMotionField() only reports success for the block-matching
-                // algorithms, so this fails for a RIFE run and the stage's own implementation
-                // takes over.
+                // one here. computeMotionField() reports success for the block-matching search, so
+                // the denoiser always gets a real field.
                 val motionBuf = cachedMotionBuf
                 var presented = false
                 if (motionBuf != null && outputRenderer?.isDenoiseInitialized == true) {
@@ -2252,8 +2211,8 @@ class VideoFrameProcessor(
                     releaseFrameBuffer(prev.pixels)
                     previousFrame = nextFrame
                     updateStats()
-                    // The report is reached only through the RIFE branch below; without a call
-                    // here this state never emits PIPELINE TIMING and its cost stays invisible.
+                    // The report is reached only through the interpolation branch below; without
+                    // a call here this state never emits PIPELINE TIMING and its cost stays invisible.
                     reportStageTiming()
                     return
                 }
@@ -2287,7 +2246,7 @@ class VideoFrameProcessor(
             return
         }
 
-        // State 3 and 4: the FastDVDnet scaffold is optional pre-processing in front of RIFE. When
+        // State 3 and 4: the FastDVDnet scaffold is optional pre-processing in front of the interpolator. When
         // it is off the captured buffers are handed to JNI directly, so no extra copy is made.
         //
         // Both implementations are this same stage, so only one runs. The motion-aligned pass is
@@ -2326,13 +2285,13 @@ class VideoFrameProcessor(
             }
         }
 
-        // DIAGNOSTICS: Log checksum before RIFE JNI
+        // DIAGNOSTICS: Log checksum before the interpolation JNI call
         if (VERBOSE_DIAGNOSTICS) {
             val tChecksumStart = System.nanoTime()
             val src0Checksum = calculateChecksum(src0Buf, rifeInputW, rifeInputH)
             val src1Checksum = calculateChecksum(src1Buf, rifeInputW, rifeInputH)
             nsChecksum += System.nanoTime() - tChecksumStart
-            Log.d(TAG, "PIPELINE CHECKSUM: before RIFE src0 checksum=$src0Checksum src1 checksum=$src1Checksum")
+            Log.d(TAG, "PIPELINE CHECKSUM: before interpolation src0 checksum=$src0Checksum src1 checksum=$src1Checksum")
         }
 
         if (rifeInputW != lastDimsLogW || rifeInputH != lastDimsLogH) {
@@ -2340,9 +2299,8 @@ class VideoFrameProcessor(
             lastDimsLogH = rifeInputH
             Log.i(
                 TAG,
-                "REAL RIFE EXECUTION LOG: preRifeDimensions=${rifeInputW}x$rifeInputH -> " +
-                    "rifeInputDimensions=${rifeInputW}x$rifeInputH -> " +
-                    "rifeOutputDimensions=${rifeOutputW}x$rifeOutputH -> " +
+                "REAL INTERPOLATION LOG: inputDimensions=${rifeInputW}x$rifeInputH -> " +
+                    "outputDimensions=${rifeOutputW}x$rifeOutputH -> " +
                     "renderingSurfaceDimensions=${displaySurfaceWidth}x$displaySurfaceHeight"
             )
         }
@@ -2357,8 +2315,8 @@ class VideoFrameProcessor(
         // crosses JNI is then the packed field - ceil(w/step) * ceil(h/step) * 8 bytes, tens of
         // kB - where step is NativeEngine.motionFieldStep(), not necessarily 16: SVPlayer's
         // overlap setting shrinks the grid pitch so its search windows overlap each other.
-        // computeMotionField() reports false when the algorithm produces no field at all, so
-        // the RIFE path keeps working without this layer knowing about the switch.
+        // computeMotionField() reports false when the search produces no field at all, in which
+        // case the CPU warp further down takes over.
         val motionBuf = preparedMotion?.field ?: cachedMotionBuf
 
         // The emission schedule has to be known before the engine call, not after it. When the
@@ -2499,7 +2457,7 @@ class VideoFrameProcessor(
                 if (hdrComposition) {
                     // The 8-bit readback is analysis-only. If GPU composition fails, skip these
                     // intermediate frames and present the retained HDR source at the pair time.
-                    Log.w(TAG, "HDR MEMC GPU composition failed; presenting retained source frame")
+                    Log.w(TAG, "HDR GPU composition failed; presenting retained source frame")
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
                     presented = true
                 }
@@ -2555,11 +2513,7 @@ class VideoFrameProcessor(
                     // On this path the loop is the stage's only caller, so nothing else can
                     // report a refusal: surface it and put the untouched capture on screen
                     // rather than whatever the output buffer happened to hold.
-                    val status = NativeEngine.getRifeStatus()
-                    reportError(
-                        if (status.lastError.isNotEmpty()) status.lastError
-                        else "RIFE frame interpolation failed"
-                    )
+                    reportError("Frame interpolation failed: the native interpolator refused the pair")
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
                 }
             }
@@ -2581,14 +2535,7 @@ class VideoFrameProcessor(
             nsRender += System.nanoTime() - tRenderStart
             frameCountOutput += times.size
         } else {
-            val status = NativeEngine.getRifeStatus()
-            reportError(
-                if (status.lastError.isNotEmpty()) {
-                    status.lastError
-                } else {
-                    "RIFE frame interpolation failed"
-                }
-            )
+            reportError("Frame interpolation failed: the native interpolator refused the pair")
             val tRenderStart = System.nanoTime()
             renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
             nsRender += System.nanoTime() - tRenderStart
@@ -2609,7 +2556,7 @@ class VideoFrameProcessor(
      * uploads/swaps, so `total` is directly comparable to the frame interval the decoder sees.
      */
     /**
-     * The moments inside one frame pair that the current MEMC level asks the pipeline to emit,
+     * The moments inside one frame pair that the current interpolation level asks the pipeline to emit,
      * expressed as a timestep in [0, 1] where 0 is the previous frame and 1 is this one.
      *
      * The step is the pair's own timestamp interval divided by the multiplier, so the cadence
@@ -2707,32 +2654,6 @@ class VideoFrameProcessor(
         val renderCalls = renderBreakdown[5]
         val dropped = droppedFrameCount - droppedAtWindowStart
         val captured = frameCountInput - capturedAtWindowStart
-
-        // The AUTO policy's native-4K-denoiser branch only keeps its resolution while the native
-        // frame rate holds. One dropped frame in the window is the signal: step down once and log
-        // it, so playback recovers instead of stuttering for the rest of the stream.
-        if (autoDenoiseBranch && autoDegradeLevel < autoDegradeLadder.lastIndex) {
-            val cycleNs = nsPair / n
-            val overBudget = sourceIntervalNs > 0L && cycleNs > sourceIntervalNs.toDouble()
-            if (dropped > 0 || overBudget) {
-                autoDegradeLevel++
-                val hdrInfo = if (isHdrSource()) {
-                    val hdrLeases = frameGrabber?.readbackState() ?: "unknown"
-                    val retainedW = processingWidth
-                    val retainedH = processingHeight
-                    val hdrGrabber = frameGrabber
-                    val hdrSlots = hdrGrabber?.hdrSourceSlots?.size ?: 0
-                    val estMem = hdrSlots.toLong() * (retainedW.toLong() * retainedH * 8L)
-                    " HDR: source=${inputWidth}x$inputHeight processing=${retainedW}x$retainedH retained=$hdrSlots leases=$hdrLeases estimatedMemory=${estMem / 1024 / 1024}MB"
-                } else ""
-                Log.w(
-                    TAG,
-                    "RES POLICY: ${autoCaptureW}x$autoCaptureH cannot hold the native rate " +
-                        "(cycle=${fmtMs(cycleNs)} ms, budget=${fmtMs(sourceIntervalNs.toDouble())} ms, " +
-                        "dropped=$dropped), degrading to ${autoDegradeLadder[autoDegradeLevel]}" + hdrInfo
-                )
-            }
-        }
 
         Log.i(
             TAG,
@@ -2873,7 +2794,7 @@ class VideoFrameProcessor(
             cachedTargetSize = requiredBytesInt
             Log.i(
                 TAG,
-                "Allocated RIFE buffers ($requiredBytesInt bytes each, motion field $motionBytes bytes)"
+                "Allocated interpolation buffers ($requiredBytesInt bytes each, motion field $motionBytes bytes)"
             )
         }
         return true
@@ -2954,7 +2875,7 @@ class VideoFrameProcessor(
     /**
      * Logs, once per stream, that the motion-aligned denoiser could not run and the stage's own
      * implementation is doing the work instead. Called from both branches so the reason is visible
-     * whether MEMC is on (no field) or off (no GL denoise program).
+     * whether the search is on (a field is available) or off (no GL denoise program).
      */
     private fun noteDenoiseUnavailable() {
         if (denoiseUnavailableLogged || !fastDvdNetEngine.isEnabled) {
@@ -2988,7 +2909,7 @@ class VideoFrameProcessor(
     /**
      * Blits already-computed RGBA pixels to the Media3 output surface with GL. The readable range
      * is set explicitly from the destination size instead of being inherited from whatever the
-     * producer left behind: the RIFE output buffer is filled through a raw JNI pointer (so its
+     * producer left behind: the interpolation output buffer is filled through a raw JNI pointer (so its
      * position is never advanced) and the pooled frame buffers may have a capacity larger than
      * this frame.
      *
@@ -3088,93 +3009,29 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Longest source edge at or above which a frame counts as 4K for the AUTO policy. 3000 covers
-     * UHD (3840) and DCI 4K (4096) while staying clear of 1440p (2560).
+     * Longest source edge at or above which a frame counts as 4K for the logging threshold. 3000
+     * covers UHD (3840) and DCI 4K (4096) while staying clear of 1440p (2560). Diagnostic only:
+     * it never changes the size anything is processed at.
      */
     private val auto4kMinDim = 3000
-
-    /** Ladder the AUTO policy steps down when its native-resolution branch drops frames. */
-    private val autoDegradeLadder = arrayOf(
-        RifeResolution.ORIGINAL,
-        RifeResolution.RES_1080P,
-        RifeResolution.RES_720P,
-        RifeResolution.RES_480P,
-    )
 
     /** True when the denoiser stage is on, whichever implementation currently provides it. */
     private val isDenoiseEnabled: Boolean
         get() = fastDvdNetEngine.isEnabled
 
     /**
-     * The processing resolution the engine picks for this source and toggle state (AUTO mode).
-     * The decoder callback, OES readback, native processing, and presentation currently run
-     * serially on one worker. Keep that pipeline's synchronous readback bounded for HD sources:
-     * 720p is processed at 480p, 1080p at 720p, and 4K at 1080p when MEMC is enabled. The
-     * processed image is scaled into the output surface by the present. Sources below 720p keep
-     * their native dimensions so the established 480p path is unchanged.
+     * Capture - and therefore processing - size for a decoded frame: the configured resolution,
+     * aspect-preserved, then clamped to the output surface. The clamp matters because the present
+     * scales the result to fit that surface anyway, so capturing beyond it only buys pixels that
+     * get scaled straight back down.
      *
-     *  * 4K with MEMC on -> 1080p. The interpolation cycle has to fit a 41.6 ms budget and 4K is
-     *    four times the pixels; the result is scaled back up into the output surface by the
-     *    present, which is where that upscaling belongs.
-     *  * 4K with only the denoiser -> native 4K. This is the one branch allowed to run at source
-     *    resolution, and therefore the one that steps down [autoDegradeLadder] while frames are
-     *    dropped (see [reportStageTiming]).
-     */
-    private fun autoResolution(srcW: Int, srcH: Int): RifeResolution {
-        return RifeResolution.ORIGINAL
-    }
-
-    /**
-     * Capture - and therefore processing - size for a decoded frame: the effective resolution
-     * (explicit setting, or [autoResolution] under AUTO), aspect-preserved, then clamped to the
-     * output surface. The clamp matters because the present scales the result to fit that surface
-     * anyway, so capturing beyond it only buys pixels that get scaled straight back down.
+     * Nothing here may lower the size as a performance or memory shortcut. A source that does not
+     * fit is reported by [ensureCachedBuffers] instead of being quietly rendered at fewer pixels,
+     * because a silent downgrade is indistinguishable from a broken pipeline when looking at the
+     * screen.
      */
     private fun resolveCaptureDimensions(srcW: Int, srcH: Int): Pair<Int, Int> {
-        val effective = if (resolution == RifeResolution.AUTO) autoResolution(srcW, srcH) else resolution
-
-        // Whether this call is the AUTO branch that is allowed to degrade. Recomputed every frame
-        // from the toggles and the source, not from the size that was picked, so the ladder keeps
-        // stepping down after the first downgrade.
-        autoDenoiseBranch = resolution == RifeResolution.AUTO &&
-            !isRifeEnabled &&
-            isDenoiseEnabled &&
-            maxOf(srcW, srcH) >= auto4kMinDim
-
-        if (!autoDenoiseBranch && autoDegradeLevel != 0) {
-            // Left the native-4K-denoiser branch (toggle changed, source changed, mode set
-            // explicitly). The ladder belongs to that branch alone, so it starts over rather than
-            // inheriting a downgrade decided under different conditions.
-            autoDegradeLevel = 0
-        }
-
-        var (targetW, targetH) = calculateTargetDimensions(srcW, srcH, effective)
-        val targetBytes = targetW.toLong() * targetH.toLong() * 4L
-        val estimated = targetBytes * 13L
-        if (estimated > FRAME_MEMORY_BUDGET_BYTES) {
-            val safe = calculateTargetDimensions(srcW, srcH, RifeResolution.RES_1080P)
-            targetW = safe.first
-            targetH = safe.second
-            val nowNs = System.nanoTime()
-            if (nowNs - lastMemoryBudgetLogNs >= 1_000_000_000L) {
-                lastMemoryBudgetLogNs = nowNs
-                Log.w(TAG, "4K source -> selected processing resolution ${targetW}x${targetH} -> estimated RGBA memory ${targetW.toLong() * targetH * 4L * 13L} bytes (requested ${estimated} bytes)")
-            }
-        }
-        val targetBytesInt = (targetW.toLong() * targetH * 4L).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-        if (rejectedTargetSize == targetBytesInt) {
-            val fallback = if (effective == RifeResolution.RES_480P) {
-                calculateTargetDimensions(srcW, srcH, RifeResolution.RES_480P)
-            } else {
-                val at720 = calculateTargetDimensions(srcW, srcH, RifeResolution.RES_720P)
-                if ((at720.first.toLong() * at720.second * 4L).toInt() == rejectedTargetSize) {
-                    calculateTargetDimensions(srcW, srcH, RifeResolution.RES_480P)
-                } else at720
-            }
-            targetW = fallback.first
-            targetH = fallback.second
-            Log.w(TAG, "Capture allocation fallback -> ${targetW}x$targetH after rejecting prior buffer size")
-        }
+        val (targetW, targetH) = calculateTargetDimensions(srcW, srcH, resolution)
         val surfaceW = outputRenderer?.outputSurfaceWidth ?: 0
         val surfaceH = outputRenderer?.outputSurfaceHeight ?: 0
         if (surfaceW <= 0 || surfaceH <= 0) return Pair(targetW, targetH)
@@ -3204,12 +3061,6 @@ class VideoFrameProcessor(
         val safeSrcH = srcH.coerceAtLeast(1)
 
         return when (res) {
-            // AUTO is resolved before this is reached (see resolveCaptureDimensions). Handle it
-            // here too so the mapping stays total when called directly; autoResolution() never
-            // returns AUTO, so this cannot recurse.
-            RifeResolution.AUTO ->
-                calculateTargetDimensions(safeSrcW, safeSrcH, autoResolution(safeSrcW, safeSrcH))
-
             RifeResolution.ORIGINAL ->
                 Pair(safeSrcW, safeSrcH)
 
@@ -3262,7 +3113,6 @@ class VideoFrameProcessor(
             val outFps = (frameCountOutput - statsOutputAtStart) / durationSec
 
             val resStr = when (resolution) {
-                RifeResolution.AUTO -> "Auto"
                 RifeResolution.ORIGINAL -> "Original"
                 RifeResolution.RES_1080P -> "1080p"
                 RifeResolution.RES_720P -> "720p"

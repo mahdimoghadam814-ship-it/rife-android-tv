@@ -12,7 +12,7 @@ import androidx.media3.common.SurfaceInfo
 import androidx.media3.common.util.UnstableApi
 
 /**
- * The full-screen surface the RIFE / FastDVDnet output is rendered to while a processing stage is
+ * The full-screen surface the interpolated / FastDVDnet output is rendered to while a processing stage is
  * enabled.
  *
  * It is only composed while processing is on; the real Next Player [PlayerSurface] takes over
