@@ -373,12 +373,24 @@ class AudioPassthroughFeeder(
                         framed
                     }
                     format.mime == MediaFormat.MIMETYPE_AUDIO_AAC && !isAdtsFrame(sample) -> {
-                        // No ADTS descriptor and no sync word: this container's samples are raw
-                        // access units we cannot frame. Sending them unframed under stream_type
-                        // 0x0F would be silent, undetectable corruption - stop the feed and let
-                        // the stream run video-only instead.
-                        Log.e(TAG, "AAC samples are neither ADTS-framed nor frameable; dropping audio")
-                        return
+                        // No ADTS descriptor and no sync word: try to build ADTS header from
+                        // the track's AudioSpecificConfig (csd-0). If we have the config,
+                        // we can frame the raw access units properly.
+                        val framed = format.adts?.let { adts ->
+                            val header = adtsHeader(adts, 7 + size)
+                            val framed = ByteArray(7 + size)
+                            System.arraycopy(header, 0, framed, 0, 7)
+                            System.arraycopy(sample, 0, framed, 7, size)
+                            framed
+                        }
+                        if (framed != null) framed else {
+                            // No ADTS descriptor and no sync word: this container's samples are raw
+                            // access units we cannot frame. Sending them unframed under stream_type
+                            // 0x0F would be silent, undetectable corruption - stop the feed and let
+                            // the stream run video-only instead.
+                            Log.e(TAG, "AAC samples are neither ADTS-framed nor frameable; dropping audio")
+                            return
+                        }
                     }
                     else -> sample
                 }

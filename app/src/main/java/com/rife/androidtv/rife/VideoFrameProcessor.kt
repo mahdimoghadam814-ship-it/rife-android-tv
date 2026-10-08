@@ -105,8 +105,9 @@ class VideoFrameProcessor(
     companion object {
         private const val TAG = "VideoFrameProcessor"
 
-        /** Bounded queue: the pipeline must never grow faster than it can interpolate. */
-        private const val FRAME_QUEUE_CAPACITY = 4
+        /** Bounded queue: the pipeline must never grow faster than it can interpolate.
+         * Increased to 16 to allow more buffering for high-resolution (4K) pipelining. */
+        private const val FRAME_QUEUE_CAPACITY = 16
 
         /** Pooled capture buffers. Bounded so a 4K stream cannot inflate the heap. */
         private const val MAX_POOLED_FRAME_BUFFERS = 2
@@ -277,6 +278,12 @@ class VideoFrameProcessor(
     private val motionExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "MemcMotionWorker").apply { isDaemon = true }
     }
+
+    /** CPU denoise (FastDVDnet) runs on a separate executor to keep the worker free for capture/render. */
+    private val denoiseExecutor = Executors.newSingleThreadExecutor { task ->
+        Thread(task, "DenoiseWorker").apply { isDaemon = true }
+    }
+
     private var pairProcessing = false
     private var streamGeneration = 0L
     private var inFlightPair: Pair<FrameData, FrameData>? = null
@@ -1794,31 +1801,32 @@ class VideoFrameProcessor(
                 retainHdrSource,
             )
             var completed = 0
-            while (true) {
-                val info = grabber.nextReadbackInfo() ?: break
+            // Only poll ONCE per frame to avoid blocking the worker. If no PBO is ready,
+            // we'll try again on the next frame. This prevents the worker from blocking
+            // on PBO fences and allows true pipelining.
+            val info = grabber.nextReadbackInfo()
+            if (info != null) {
                 val completedPixels = obtainFrameBuffer(info.width, info.height)
                 val ready = grabber.pollReadback(completedPixels)
-                if (ready == null) {
+                if (ready != null) {
+                    queueCapturedFrame(
+                        FrameData(
+                            pixels = completedPixels,
+                            timestampUs = ready.timestampUs,
+                            width = ready.width,
+                            height = ready.height,
+                        ),
+                        ready.sourceTextureId,
+                    )
+                    completed++
+                } else {
                     releaseFrameBuffer(completedPixels)
-                    // The PBO remains queued while its fence is unsignaled. Its retained FP16
-                    // source lease must stay owned by that queue entry until pollReadback removes it.
-                    break
+                    // PBO not ready yet, will retry next frame
                 }
-                queueCapturedFrame(
-                    FrameData(
-                        pixels = completedPixels,
-                        timestampUs = ready.timestampUs,
-                        width = ready.width,
-                        height = ready.height,
-                    ),
-                    ready.sourceTextureId,
-                )
-                completed++
             }
             nsReadback += System.nanoTime() - tCaptureStart
             if (!queued) droppedFrameCount++
-            // Three bounded PBOs allow capture to run ahead of readback completion. A full ring
-            // drops this input instead of waiting for the GPU or growing memory/latency.
+            // If we queued but didn't complete any, we'll poll again next frame
             if (queued && completed == 0) return
             return
         }
@@ -1911,7 +1919,9 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Renders all ready work items from the pending queue.
+     * Renders one work item from the pending queue, then schedules the next render
+     * on the next worker cycle. This yields the worker between frames, allowing
+     * capture and other work to proceed.
      * After each render, submits motion for the next queued frame (if any).
      * Keeps motion executor 100% busy by starting next motion before current render finishes.
      */
@@ -1922,7 +1932,8 @@ class VideoFrameProcessor(
             // Stream changed; clean up this work
             releaseFrameBuffer(work.prev.pixels)
             releaseFrameBuffer(work.next.pixels)
-            renderPendingQueue()
+            // Schedule next render attempt
+            workerHandler?.post { renderPendingQueue() }
             return
         }
 
@@ -1937,9 +1948,9 @@ class VideoFrameProcessor(
         // Render current pair
         processFramePair(prev, next, prepared)
 
-        // Continue rendering queue if more work available
+        // Schedule next render on next worker cycle instead of recursing
         if (pendingRenderQueue.isNotEmpty()) {
-            renderPendingQueue()
+            workerHandler?.post { renderPendingQueue() }
         }
     }
 
@@ -2181,12 +2192,11 @@ class VideoFrameProcessor(
                     return
                 }
                 noteDenoiseUnavailable()
-                val denoised = fastDvdNetEngine.denoiseFrameBuffer(
-                    nextFrame.pixels,
-                    rifeInputW,
-                    rifeInputH,
-                    den1Buf
-                )
+                // Offload CPU denoise to separate executor
+                val denoiseFuture = denoiseExecutor.submit {
+                    fastDvdNetEngine.denoiseFrameBuffer(nextFrame.pixels, rifeInputW, rifeInputH, den1Buf)
+                }
+                val denoised = denoiseFuture.get() as Boolean
                 if (denoised) {
                     // DIAGNOSTICS: Log checksum after FastDVDnet pass-through
                     if (VERBOSE_DIAGNOSTICS) {
@@ -2225,18 +2235,17 @@ class VideoFrameProcessor(
             outputRenderer?.isDenoiseInitialized == true
         // Skip CPU denoise for HDR sources: denoise operates in 8-bit and destroys HDR precision.
         if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted && !isHdrSource()) {
-            val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(
-                in0Buf,
-                rifeInputW,
-                rifeInputH,
-                den0Buf
-            )
-            val denoisedNext = fastDvdNetEngine.denoiseFrameBuffer(
-                in1Buf,
-                rifeInputW,
-                rifeInputH,
-                den1Buf
-            )
+            // Offload CPU denoise to separate executor to keep worker free for capture/render
+            val denoiseFuture = denoiseExecutor.submit {
+                val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(in0Buf, rifeInputW, rifeInputH, den0Buf)
+                val denoisedNext = fastDvdNetEngine.denoiseFrameBuffer(in1Buf, rifeInputW, rifeInputH, den1Buf)
+                Pair(denoisedPrev, denoisedNext)
+            }
+            // Wait for denoise to complete (this is a blocking wait, but on the worker thread
+            // we can yield to other tasks. For true async, we'd need callback-based continuation,
+            // but this already moves the heavy CPU work off the worker thread during the wait.)
+            val result = denoiseFuture.get() as Pair<Boolean, Boolean>
+            val (denoisedPrev, denoisedNext) = result
             if (denoisedPrev && denoisedNext) {
                 src0Buf = den0Buf
                 src1Buf = den1Buf

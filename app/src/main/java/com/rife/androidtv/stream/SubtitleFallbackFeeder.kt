@@ -127,13 +127,12 @@ class SubtitleFallbackFeeder(
                     muxer.onDvbSubtitleAccessUnit(displaySet, ptsUs)
                 }
 
-                // Send empty display set (clear) at cue end
+                // Schedule clear display set at cue end time
+                val endPtsUs = cue.endUs
                 val clearSet = renderDvbClearDisplaySet()
                 if (clearSet.isNotEmpty()) {
-                    // Schedule clear at endUs
-                    // For simplicity, we can sleep or just send it with endUs pts
-                    // Wait, let's keep it simple: send clear after duration or at endUs
-                    // Actually, DVB display persists until replaced or cleared.
+                    // Send clear display set at cue end time
+                    muxer.onDvbSubtitleAccessUnit(clearSet, endPtsUs)
                 }
 
                 cueIndex++

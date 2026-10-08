@@ -58,7 +58,7 @@ class OesFrameGrabber {
         var info: ReadbackFrameInfo? = null,
     )
 
-    private val pboSlots = Array(3) { PboSlot() }
+    private val pboSlots = Array(5) { PboSlot() }
     private val pendingPbos = java.util.ArrayDeque<PboSlot>()
     private var pboBytes = 0
     private var pboSupported = false
