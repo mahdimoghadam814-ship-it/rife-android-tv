@@ -7,6 +7,7 @@ on:
       - "main"
       - "feature/*"
       - "test-jules-build"
+      - "cleanup/*"
   pull_request:
     branches:
       - "main"
@@ -19,29 +20,58 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Verify Submodule Contents
+      # The SVP-only project has no submodules: .gitmodules, third_party/ncnn and
+      # third_party/rife-ncnn-vulkan were removed with the RIFE cleanup. These checks assert
+      # the layout the current CMake/Gradle configuration actually needs, and that the removed
+      # RIFE inputs do not come back.
+      - name: Verify SVP-only project layout
         run: |
-          echo "=== Verifying submodule contents ==="
-          ls -la third_party/
-          test -f third_party/ncnn/src/ncnn_glsl_ext.comp && echo "PASS: ncnn_glsl_ext.comp exists" || (echo "FAIL: ncnn_glsl_ext.comp missing" && exit 1)
-          test -f third_party/rife-ncnn-vulkan/src/generate_shader_comp_header.cmake && echo "PASS: generate_shader_comp_header.cmake exists" || (echo "FAIL: generate_shader_comp_header.cmake missing" && exit 1)
+          set -euo pipefail
 
-      - name: Install glslangValidator
-        run: |
-          sudo apt-get update && sudo apt-get install -y glslang-tools
-          which glslangValidator
-          glslangValidator --version
-          echo "/usr/bin" >> $GITHUB_PATH
+          echo "=== Checkout ==="
+          git rev-parse HEAD
+          echo "branch: $(git rev-parse --abbrev-ref HEAD)"
 
-      - name: Run CMake Preflight
-        env:
-          PATH: /usr/bin:/usr/local/bin:${{ env.PATH }}
-        run: |
-          cmake -S app/src/main/cpp -B build/preflight -DCMAKE_BUILD_TYPE=Debug 2>&1 | tail -20
-          cmake --build build/preflight --target rife-preflight 2>&1 | tail -30
+          echo "=== Gradle wrapper ==="
+          test -f ./gradlew || { echo "FAIL: gradlew missing"; exit 1; }
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "FAIL: gradle-wrapper.jar missing"; exit 1; }
+          test -f gradle/wrapper/gradle-wrapper.properties || { echo "FAIL: gradle-wrapper.properties missing"; exit 1; }
+          echo "PASS: gradlew + wrapper jar + wrapper properties present"
+
+          echo "=== Gradle project files ==="
+          test -f settings.gradle.kts || { echo "FAIL: settings.gradle.kts missing"; exit 1; }
+          test -f app/build.gradle.kts || { echo "FAIL: app/build.gradle.kts missing"; exit 1; }
+          test -f gradle/libs.versions.toml || { echo "FAIL: gradle/libs.versions.toml missing"; exit 1; }
+          echo "PASS: Gradle project files present"
+
+          echo "=== Native/CMake configuration required by SVP ==="
+          test -d app/src/main/cpp || { echo "FAIL: app/src/main/cpp missing"; exit 1; }
+          test -f app/src/main/cpp/CMakeLists.txt || { echo "FAIL: app/src/main/cpp/CMakeLists.txt missing"; exit 1; }
+          grep -Eq "add_library\([[:space:]]*rife_native" app/src/main/cpp/CMakeLists.txt \
+            || { echo "FAIL: CMakeLists.txt no longer declares the SVP-only target rife_native"; exit 1; }
+          echo "PASS: app/src/main/cpp/CMakeLists.txt declares add_library(rife_native ...)"
+
+          echo "=== Native sources referenced by the current CMake configuration ==="
+          for src in rife_jni.cpp memc_interpolator.cpp memc_interpolator.h; do
+            test -f "app/src/main/cpp/$src" || { echo "FAIL: app/src/main/cpp/$src missing"; exit 1; }
+            grep -q "$src" app/src/main/cpp/CMakeLists.txt \
+              || [ "$src" = "memc_interpolator.h" ] \
+              || { echo "FAIL: $src is not referenced by CMakeLists.txt"; exit 1; }
+            echo "PASS: app/src/main/cpp/$src"
+          done
+
+          echo "=== Obsolete RIFE inputs must not be reintroduced ==="
+          test ! -f .gitmodules || { echo "FAIL: .gitmodules has been reintroduced"; exit 1; }
+          TRACKED_THIRD_PARTY="$(git ls-files third_party)"
+          if [ -n "$TRACKED_THIRD_PARTY" ]; then
+            echo "FAIL: third_party has tracked files again:"
+            echo "$TRACKED_THIRD_PARTY"
+            exit 1
+          fi
+          echo "PASS: no .gitmodules and no tracked files under third_party/"
+
+          echo "=== Preflight OK ==="
 
   build:
     name: Build Android TV RIFE APK
@@ -52,8 +82,6 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -61,21 +89,14 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
+      # Versions must match the project: compileSdk/targetSdk 37 (gradle/libs.versions.toml),
+      # ndkVersion 26.3.11579264 and CMake 3.22.1 (app/build.gradle.kts).
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
         with:
-          packages: "platform-tools platforms;android-34 build-tools;34.0.0 ndk;26.3.11579264 cmake;3.22.1"
-
-      - name: Install glslangValidator
-        run: |
-          sudo apt-get update && sudo apt-get install -y glslang-tools
-          which glslangValidator
-          glslangValidator --version
-          echo "/usr/bin" >> $GITHUB_PATH
+          packages: "platform-tools platforms;android-37 build-tools;37.0.0 ndk;26.3.11579264 cmake;3.22.1"
 
       - name: Build Debug APK
-        env:
-          PATH: /usr/bin:/usr/local/bin:${{ env.PATH }}
         run: |
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon
@@ -86,14 +107,62 @@ jobs:
           name: app-debug
           path: app/build/outputs/apk/debug/app-debug.apk
 
+      # Expected library name comes from the current SVP-only configuration, not from history:
+      # app/src/main/cpp/CMakeLists.txt declares add_library(rife_native SHARED rife_jni.cpp
+      # memc_interpolator.cpp) and NativeEngine.kt does System.loadLibrary("rife_native").
+      # app/build.gradle.kts filters ABIs to arm64-v8a and armeabi-v7a.
+      - name: Validate SVP native libraries
+        run: |
+          set -euo pipefail
+          EXPECTED_SO="librife_native.so"
+          EXPECTED_ABIS=("arm64-v8a" "armeabi-v7a")
+
+          echo "=== Native libraries produced by the build ==="
+          FOUND="$(find app/build -type f -name "$EXPECTED_SO" -print)"
+          echo "${FOUND:-<none>}"
+          if [ -z "$FOUND" ]; then
+            echo "FAIL: $EXPECTED_SO was not produced by the SVP-only native build"
+            exit 1
+          fi
+
+          APK_PATH="$(find app/build/outputs/apk -name '*.apk' | head -n1)"
+          if [ -z "$APK_PATH" ]; then
+            echo "FAIL: no APK found under app/build/outputs/apk"
+            exit 1
+          fi
+          echo "=== Native libraries inside $APK_PATH ==="
+          unzip -l "$APK_PATH" "lib/*/*.so" | grep "\.so$" || true
+
+          MISSING=()
+          for abi in "${EXPECTED_ABIS[@]}"; do
+            if unzip -l "$APK_PATH" "lib/${abi}/${EXPECTED_SO}" | grep -q "$EXPECTED_SO"; then
+              echo "- ${abi}/${EXPECTED_SO}: OK"
+            else
+              echo "- ${abi}/${EXPECTED_SO}: MISSING"
+              MISSING+=("$abi")
+            fi
+          done
+          if [ "${#MISSING[@]}" -gt 0 ]; then
+            echo "ERROR: missing $EXPECTED_SO for: ${MISSING[*]}"
+            exit 1
+          fi
+          echo "SUCCESS: SVP native libraries verified"
+
       - name: Collect Native Libraries
         run: |
+          set -euo pipefail
           mkdir -p native-libs
           find app/build -type f -name "librife_native.so" -exec cp --parents {} native-libs/ \;
+          if [ -z "$(find native-libs -name 'librife_native.so' -print -quit)" ]; then
+            echo "FAIL: no librife_native.so collected into native-libs/"
+            exit 1
+          fi
+          echo "=== Collected ==="
+          find native-libs -name "*.so" -print
 
       - name: Upload Native Libraries
         uses: actions/upload-artifact@v4
         with:
           name: native-libs
           path: native-libs
-          if-no-files-found: warn
+          if-no-files-found: error

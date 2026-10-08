@@ -12,27 +12,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # third_party/ncnn and third_party/rife-ncnn-vulkan are declared
-          # submodules of this repository and are required by the CMake native build.
-          submodules: recursive
 
-      - name: Verify Submodule Contents
+      - name: Verify SVP-only project layout
         run: |
-          echo "=== Verifying submodule contents ==="
-          ls -la third_party/
-          test -f third_party/ncnn/src/ncnn_glsl_ext.comp && echo "PASS: ncnn_glsl_ext.comp exists" || (echo "FAIL: ncnn_glsl_ext.comp missing" && exit 1)
-          test -f third_party/rife-ncnn-vulkan/src/generate_shader_comp_header.cmake && echo "PASS: generate_shader_comp_header.cmake exists" || (echo "FAIL: generate_shader_comp_header.cmake missing" && exit 1)
-
-      - name: Install glslangValidator
-        run: |
-          sudo apt-get update && sudo apt-get install -y glslang-tools
-          which glslangValidator
-          glslangValidator --version
-
-      - name: Run CMake Preflight
-        run: |
-          cmake -S app/src/main/cpp -B build/preflight -DCMAKE_BUILD_TYPE=Debug 2>&1 | tail -20
-          cmake --build build/preflight --target rife-preflight 2>&1 | tail -30
+          set -euo pipefail
+          echo "=== Checkout ==="; git rev-parse HEAD
+          echo "=== Gradle wrapper ==="
+          test -f ./gradlew || { echo "FAIL: gradlew missing"; exit 1; }
+          test -f gradle/wrapper/gradle-wrapper.jar || { echo "FAIL: wrapper jar missing"; exit 1; }
+          echo "PASS: Gradle wrapper present"
+          echo "=== Native/CMake configuration required by SVP ==="
+          test -d app/src/main/cpp || { echo "FAIL: app/src/main/cpp missing"; exit 1; }
+          test -f app/src/main/cpp/CMakeLists.txt || { echo "FAIL: CMakeLists.txt missing"; exit 1; }
+          grep -Eq "add_library\([[:space:]]*rife_native" app/src/main/cpp/CMakeLists.txt \
+            || { echo "FAIL: SVP-only target rife_native not declared"; exit 1; }
+          echo "PASS: CMakeLists.txt declares add_library(rife_native ...)"
+          echo "=== Native sources referenced by the current CMake configuration ==="
+          for src in rife_jni.cpp memc_interpolator.cpp memc_interpolator.h; do
+            test -f "app/src/main/cpp/$src" || { echo "FAIL: $src missing"; exit 1; }
+            echo "PASS: app/src/main/cpp/$src"
+          done
+          echo "=== Obsolete RIFE inputs must not be reintroduced ==="
+          test ! -f .gitmodules || { echo "FAIL: .gitmodules reintroduced"; exit 1; }
+          if [ -n "$(git ls-files third_party)" ]; then
+            echo "FAIL: third_party has tracked files again"; git ls-files third_party; exit 1
+          fi
+          echo "PASS: no .gitmodules, no tracked third_party files"
+          echo "=== Preflight OK ==="
 
   build-debug-apk:
     name: Build debug APK (ubuntu-latest)
@@ -44,9 +50,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # third_party/ncnn and third_party/rife-ncnn-vulkan are declared
-          # submodules of this repository and are required by the CMake native build.
-          submodules: recursive
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -64,11 +67,6 @@ jobs:
           # (compileSdk 37, ndkVersion 26.3.11579264, cmake 3.22.1).
           packages: "platform-tools platforms;android-37 build-tools;37.0.0 ndk;26.3.11579264 cmake;3.22.1"
 
-      - name: Install glslangValidator
-        run: |
-          sudo apt-get update && sudo apt-get install -y glslang-tools
-          which glslangValidator
-          glslangValidator --version
 
       - name: Build debug APK with Gradle wrapper
         run: |
