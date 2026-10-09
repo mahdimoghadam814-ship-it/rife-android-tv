@@ -49,6 +49,9 @@ class RifeEngineController(
         private const val TAG_ERROR = "RIFE-ERROR"
     }
 
+    // Temporal frame store for bounded frame history
+    private val temporalFrameStore = TemporalFrameStoreImpl()
+
     /**
      * The frame processor. Created eagerly (it only starts its worker thread and creates the input
      * surface; no frame is read back while both stages are off).
