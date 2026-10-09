@@ -365,10 +365,9 @@ class OesFrameGrabber {
         hdrSourceSlots.firstOrNull { it.textureId == textureId }?.inUse = false
     }
 
-    /** Called only at stream discontinuities; makes queued GPU writes safe to discard. */
+    /** Called only at stream discontinuities; makes queued GPU writes safe to discard without pipeline stalls. */
     fun discardPendingReadbacks() {
         if (pendingPbos.isEmpty()) return
-        GLES30.glFinish()
         pendingPbos.forEach { slot ->
             slot.info?.let { releaseSourceTexture(it.sourceTextureId) }
             if (slot.fence != 0L) GLES30.glDeleteSync(slot.fence)
