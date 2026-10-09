@@ -2264,8 +2264,7 @@ class VideoFrameProcessor(
                 return@execute
             }
             val posted = handler.post {
-                // Motion done. Enqueue for rendering, then IMMEDIATELY try to submit next motion.
-                dropMotionLeases(prev, nextFrame)
+                // Motion done. Enqueue for rendering. Leases are kept until after render completes.
                 val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
                 pendingRenderQueue.addLast(work)
 
@@ -2296,6 +2295,7 @@ class VideoFrameProcessor(
             // this item was queued after the drain.
             droppedFrameCount++
             Log.d(TAG, "Dropping work computed against an older stream generation")
+            dropMotionLeases(work.prev, work.next, recycle = false)
             releaseFrameBuffer(work.prev.pixels)
             releaseFrameBuffer(work.next.pixels)
             // Schedule next render attempt
@@ -2314,6 +2314,9 @@ class VideoFrameProcessor(
 
         // Render current pair
         processFramePair(prev, next, prepared)
+
+        // Drop motion leases AFTER render completes, so HDR textures stay alive until consumed.
+        dropMotionLeases(prev, next)
 
         // Schedule next render on next worker cycle instead of recursing
         if (pendingRenderQueue.isNotEmpty()) {
@@ -2348,7 +2351,6 @@ class VideoFrameProcessor(
                 return@execute
             }
             val posted = handler.post {
-                dropMotionLeases(prev, nextFrame)
                 val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
                 pendingRenderQueue.addLast(work)
                 // Note: we do NOT call renderPendingQueue() here to avoid re-entrancy.
