@@ -5,11 +5,11 @@ plugins {
 
 android {
     namespace = "dev.anilbeesetti.nextplayer.feature.player.rife"
-    compileSdk = 36
+    compileSdk = 34
 
     defaultConfig {
         minSdk = 24
-        targetSdk = 36
+        targetSdk = 34
         versionCode = 1
         versionName = "1.0.0-fork"
     }
@@ -35,7 +35,7 @@ android {
 }
 
 dependencies {
-    implementation("androidx.media3:media3-exoplayer:1.4.1")
-    implementation("androidx.media3:media3-common:1.4.1")
-    implementation("androidx.media3:media3-transformer:1.4.1")
+    implementation("androidx.media3:media3-exoplayer:1.3.1")
+    implementation("androidx.media3:media3-common:1.3.1")
+    implementation("androidx.media3:media3-transformer:1.3.1")
 }
