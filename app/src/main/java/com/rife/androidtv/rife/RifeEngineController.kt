@@ -17,6 +17,11 @@ import dev.anilbeesetti.nextplayer.feature.player.rife.RifeStats
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * App-wide owner of the RIFE / FastDVDnet processing stage.
@@ -110,8 +115,8 @@ class RifeEngineController(
 
     private var initThread: HandlerThread? = null
 
-    // Temporal frame store for bounded frame history (Stage 3 integration)
-    private val temporalFrameStore = TemporalFrameStoreImpl()
+    // Background coroutine scope for asynchronous non-blocking pipeline processing
+    private val processingScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     // SVP pipeline coordinator for frame interpolation (Stage 7 integration)
     private val pipelineCoordinator = SvpPipelineCoordinator(context)
@@ -144,6 +149,7 @@ class RifeEngineController(
         frameBridge.stop()
         temporalFrameStore.clear()
         pipelineCoordinator.stop()
+        processingScope.cancel()
         _inputSurface.value = null
         _processingEnabled.value = false
     }
@@ -319,48 +325,22 @@ class RifeEngineController(
     }
 
     /**
-     * Processes frames through the interpolation pipeline.
-     * This should be called when a new frame pair is available for interpolation.
-     * It submits frames to the temporal store, processes frame pairs through the
-     * scheduler, and enqueues output frames to the output queue.
-     *
-     * @return true if a frame pair was processed, false otherwise.
-     */
-    fun processFrameThroughPipeline(): Boolean {
-        // Ensure pipeline is initialized
-        if (!pipelineCoordinator.getStatus().state.isReady) {
-            return false
-        }
-
-        // Process frame pair through the pipeline
-        val processed = pipelineCoordinator.processFramePair()
-
-        // Drain output queue to display path
-        while (true) {
-            val outputFrame = pipelineCoordinator.getNextOutputFrame()
-            if (outputFrame == null) break
-            // TODO: Submit outputFrame to display path (SurfaceView/EGL)
-            // For now, we just log that a frame is ready
-            Log.d("RifeEngineController", "Output frame ready: ${outputFrame.timestampUs}us, intermediate=${outputFrame.isIntermediate}")
-        }
-
-        return true
-    }
-
-    /**
      * Called when a new frame is available from the frame bridge.
-     * Submits the frame to the temporal store and processes the pipeline.
+     * Submits the frame to the temporal store and asynchronously processes the pipeline.
      *
      * @param frameId The unique frame identifier
      * @param metadata Frame metadata including timestamp, dimensions, and format
-     * @return true if the frame was processed, false otherwise
+     * @return true if the frame was added, false otherwise
      */
     fun onFrameAvailable(frameId: Long, metadata: FrameMetadata): Boolean {
         val added = temporalFrameStore.addFrame(metadata)
         if (!added) {
             return false
         }
-        return processFrameThroughPipeline()
+        processingScope.launch {
+            processFrameThroughPipeline()
+        }
+        return true
     }
 
     /**
