@@ -180,7 +180,16 @@ class Media3FrameBridge(
             return null
         }
 
-        val configAttribs = intArrayOf(
+        // Try 10-bit HDR compatible config first, falling back to 8-bit if unsupported
+        val hdrConfigAttribs = intArrayOf(
+            EGL14.EGL_RED_SIZE, 10,
+            EGL14.EGL_GREEN_SIZE, 10,
+            EGL14.EGL_BLUE_SIZE, 10,
+            EGL14.EGL_ALPHA_SIZE, 2,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_NONE
+        )
+        val sdrConfigAttribs = intArrayOf(
             EGL14.EGL_RED_SIZE, 8,
             EGL14.EGL_GREEN_SIZE, 8,
             EGL14.EGL_BLUE_SIZE, 8,
@@ -188,15 +197,24 @@ class Media3FrameBridge(
             EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
             EGL14.EGL_NONE
         )
+
         val configs = arrayOfNulls<android.opengl.EGLConfig>(1)
         val numConfigs = IntArray(1)
-        if (!EGL14.eglChooseConfig(display, configAttribs, 0, configs, 0, 1, numConfigs, 0)) {
+
+        var chosenConfig: android.opengl.EGLConfig? = null
+        if (EGL14.eglChooseConfig(display, hdrConfigAttribs, 0, configs, 0, 1, numConfigs, 0) && numConfigs[0] > 0) {
+            chosenConfig = configs[0]
+        } else if (EGL14.eglChooseConfig(display, sdrConfigAttribs, 0, configs, 0, 1, numConfigs, 0) && numConfigs[0] > 0) {
+            chosenConfig = configs[0]
+        }
+
+        if (chosenConfig == null) {
             Log.e("Media3FrameBridge", "EGL config selection failed")
             return null
         }
 
         val contextAttribs = intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE)
-        val context = EGL14.eglCreateContext(display, configs!![0], EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
+        val context = EGL14.eglCreateContext(display, chosenConfig, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
         if (context == EGL14.EGL_NO_CONTEXT) {
             Log.e("Media3FrameBridge", "EGL context creation failed")
             return null
