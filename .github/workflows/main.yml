@@ -6,6 +6,8 @@ on:
     branches:
       - main
       - master
+      - recover-rife-feature
+      - cleanup/svp-only-root-cause
 
 jobs:
   build:
@@ -35,8 +37,8 @@ jobs:
       - name: Install Android SDK components
         run: |
           sdkmanager \
-            "platforms;android-34" \
-            "build-tools;34.0.0" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
             "cmake;3.22.1" \
             "ndk;26.3.11579264"
 
