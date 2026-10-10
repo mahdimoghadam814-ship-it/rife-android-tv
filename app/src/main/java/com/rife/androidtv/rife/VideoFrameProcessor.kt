@@ -1393,7 +1393,7 @@ class VideoFrameProcessor(
                 block()
             } catch (t: Throwable) {
                 Log.e(TAG, "$action failed on the worker thread", t)
-                reportError("Pipeline error: ${t.message}")
+                reportError("Pipeline error: ${t.message ?: t.javaClass.simpleName}")
             }
         }
         if (!posted) {
@@ -1756,7 +1756,7 @@ class VideoFrameProcessor(
             frameGrabber = null
             releaseInputSurfaceBundle(newBundle)
             inputSurfaceReady = false
-            reportError("Input surface initialization failed: ${e.message}")
+            reportError("Input surface initialization failed: ${e.message ?: e.javaClass.simpleName}")
             // The owner has to fall back to normal PlayerView playback, otherwise the processing
             // output surface would sit in front of the user with nothing rendered into it.
             val handler = mainHandler
@@ -1914,7 +1914,7 @@ class VideoFrameProcessor(
         } catch (t: Throwable) {
             droppedFrameCount++
             Log.e(TAG, "Frame capture failed", t)
-            reportError("Frame capture failed: ${t.message}")
+            reportError("Frame capture failed: ${t.message ?: t.javaClass.simpleName}")
         } finally {
             readbackInProgress = false
         }
@@ -2617,13 +2617,19 @@ class VideoFrameProcessor(
                 var presented = false
                 if (motionBuf != null && outputRenderer?.isDenoiseInitialized == true) {
                     val tFieldStart = System.nanoTime()
-                    val fieldReady = NativeEngine.computeMotionField(
-                        in0Buf, in1Buf,
-                        rifeInputW, rifeInputH,
-                        rifeInputW, rifeInputH,
-                        motionBuf,
-                        forwardOnly = true,
-                    )
+                    var fieldReady = false
+                    try {
+                        fieldReady = NativeEngine.computeMotionField(
+                            in0Buf, in1Buf,
+                            rifeInputW, rifeInputH,
+                            rifeInputW, rifeInputH,
+                            motionBuf,
+                            forwardOnly = true,
+                        )
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "JNI computeMotionField (denoise) crashed: ${e.message ?: e.javaClass.simpleName}", e)
+                        fieldReady = false
+                    }
                     val fieldNs = System.nanoTime() - tFieldStart
                     nsMotion += fieldNs
                     nsJni += fieldNs
@@ -2777,16 +2783,23 @@ class VideoFrameProcessor(
         var motionReady = preparedMotion?.ready ?: false
         if (preparedMotion == null && motionBuf != null && outputRenderer?.isWarpInitialized == true) {
             val tMotionStart = System.nanoTime()
-            motionReady = NativeEngine.computeMotionField(
-                src0Buf,
-                src1Buf,
-                rifeInputW,
-                rifeInputH,
-                rifeOutputW,
-                rifeOutputH,
-                motionBuf,
-                forwardOnly = false,
-            )
+            var fieldReady = false
+            try {
+                fieldReady = NativeEngine.computeMotionField(
+                    src0Buf,
+                    src1Buf,
+                    rifeInputW,
+                    rifeInputH,
+                    rifeOutputW,
+                    rifeOutputH,
+                    motionBuf,
+                    forwardOnly = false,
+                )
+            } catch (e: Throwable) {
+                Log.e(TAG, "JNI computeMotionField crashed: ${e.message ?: e.javaClass.simpleName}", e)
+                fieldReady = false
+            }
+            motionReady = fieldReady
             val motionNs = System.nanoTime() - tMotionStart
             nsMotion += motionNs
             nsJni += motionNs
@@ -2804,16 +2817,25 @@ class VideoFrameProcessor(
             motionReady -> true
             // No point to render, so the CPU loop below never runs and this is the stage's only
             // caller. Its result is what decides whether the pair can be presented at all.
-            intermediate.isEmpty() -> NativeEngine.interpolateFrameBuffers(
-                src0Buf,
-                src1Buf,
-                rifeInputW,
-                rifeInputH,
-                rifeOutputW,
-                rifeOutputH,
-                0.5f,
-                outBuf
-            )
+            intermediate.isEmpty() -> {
+                var interpOk = false
+                try {
+                    interpOk = NativeEngine.interpolateFrameBuffers(
+                        src0Buf,
+                        src1Buf,
+                        rifeInputW,
+                        rifeInputH,
+                        rifeOutputW,
+                        rifeOutputH,
+                        0.5f,
+                        outBuf
+                    )
+                } catch (e: Throwable) {
+                    Log.e(TAG, "JNI interpolateFrameBuffers crashed: ${e.message ?: e.javaClass.simpleName}", e)
+                    interpOk = false
+                }
+                interpOk
+            }
             // The loop below runs the stage once per point; a probe here would run the pair
             // twice. It reports its own failure rather than the probe reporting it for it.
             else -> true
@@ -2957,16 +2979,22 @@ class VideoFrameProcessor(
                 for (i in intermediate.indices) {
                     val t = intermediate[i]
                     val tFallbackInterp = System.nanoTime()
-                    val ok = NativeEngine.interpolateFrameBuffers(
-                        src0Buf,
-                        src1Buf,
-                        rifeInputW,
-                        rifeInputH,
-                        rifeOutputW,
-                        rifeOutputH,
-                        t,
-                        outBuf
-                    )
+                    var ok = false
+                    try {
+                        ok = NativeEngine.interpolateFrameBuffers(
+                            src0Buf,
+                            src1Buf,
+                            rifeInputW,
+                            rifeInputH,
+                            rifeOutputW,
+                            rifeOutputH,
+                            t,
+                            outBuf
+                        )
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "JNI interpolation crashed: ${e.message ?: e.javaClass.simpleName}", e)
+                        ok = false
+                    }
                     val fallbackNs = System.nanoTime() - tFallbackInterp
                     nsInterp += fallbackNs
                     nsJni += fallbackNs
