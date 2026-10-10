@@ -81,6 +81,7 @@ class OesFrameGrabber {
     private var lastRefusalLogNs = 0L
     val isAsyncReadbackSupported: Boolean get() = pboSupported
     val isHdrSourceSupported: Boolean get() = hdrSourceSupported
+    val pendingPboCount: Int get() = pendingPbos.size
 
     /** Compact ring/lease summary so a silent capture stall is readable from a single log line. */
     fun readbackState(): String =
@@ -387,12 +388,13 @@ class OesFrameGrabber {
     }
 
     /** Maps only a signaled PBO, copies into the reusable CPU analysis buffer, then releases it. */
-    fun pollReadback(out: ByteBuffer): ReadbackFrameInfo? {
+    fun pollReadback(out: ByteBuffer, waitTimeoutNs: Long = 0L): ReadbackFrameInfo? {
         val slot = pendingPbos.peekFirst() ?: return null
         val info = slot.info ?: return null
         val sync = slot.fence
         if (sync != 0L) {
-            val wait = GLES30.glClientWaitSync(sync, 0, 0L)
+            val flags = if (waitTimeoutNs > 0) GLES30.GL_SYNC_FLUSH_COMMANDS_BIT else 0
+            val wait = GLES30.glClientWaitSync(sync, flags, waitTimeoutNs)
             if (wait != GLES30.GL_CONDITION_SATISFIED &&
                 wait != GLES30.GL_ALREADY_SIGNALED
             ) return null
