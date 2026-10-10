@@ -211,11 +211,11 @@ class VideoFrameProcessor(
         private const val FALLBACK_FRAME_HEIGHT = 1080
 
         /**
-         * Maximum time a frame can wait in queue before being considered stale (ms).
-         * At 60fps with 4x interpolation, budget per pair = 16.6ms / 4 = 4.15ms per output frame.
-         * Keep 2 frames of latency headroom = ~8ms. Frames older than this are stale.
+         * Floor for the queue-staleness bound (ms). The live bound is two source frame
+         * intervals (see maxQueueLatencyMs()); this floor is what the bound was before it
+         * adapted, so high-rate sources keep the original latency behaviour.
          */
-        private const val MAX_QUEUE_LATENCY_MS = 16L
+        private const val MIN_QUEUE_LATENCY_MS = 16L
 
         /** Dataspace the source probe could not read: API below 33, or the getter threw. */
         private const val DATA_SPACE_NOT_QUERIED = -2
@@ -597,7 +597,6 @@ class VideoFrameProcessor(
 
     /** Observational only; measures the retained FP16 source without touching the render path. */
     private var hdrRepresentationProbe: HdrRepresentationProbe? = null
-    private var hdrOutputInvariantReported = false
 
     /** Set once the GPU warp has refused a pair, so the fallback is reported without spamming. */
     private var warnedGpuWarpFallback = false
@@ -1182,6 +1181,17 @@ class VideoFrameProcessor(
     }
 
     /**
+     * Pushes the present state that depends on the current source into the renderer: which
+     * output encoding to use, and - from the probe's measurement of the actual retained texture -
+     * whether the shader must decode the values before converting them. Called wherever
+     * [hdrOutputMode] is applied so the two can never disagree on a frame.
+     */
+    private fun applyPresentState(renderer: GlOutputRenderer) {
+        renderer.hdrOutputMode = hdrOutputMode()
+        renderer.sourceIsEncoded = hdrRepresentationProbe?.sourceIsEncoded ?: true
+    }
+
+    /**
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
      * next pair already emits at the new cadence; the emission phase is re-anchored from that
      * pair's own timestamps rather than carried over from the old ratio.
@@ -1532,7 +1542,6 @@ class VideoFrameProcessor(
         resetPipelineOnWorker("release")
         hdrRepresentationProbe?.release()
         hdrRepresentationProbe = null
-        hdrOutputInvariantReported = false
         outputRenderer?.release()
         outputRenderer = null
 
@@ -1711,15 +1720,12 @@ class VideoFrameProcessor(
             // A renderer recreated for a new surface has to come up with the level the user
             // picked, not with the shader's own default.
             renderer.denoiseStrength = denoiseStrength
-            // An HDR source presented into an 8-bit window surface would look like a fix and be
-            // a silent precision loss, so the renderer escalates it instead of keeping it to
-            // itself. One report per stream, never per frame.
-            renderer.onHdrOutputInvariant = { message ->
-                if (!hdrOutputInvariantReported) {
-                    hdrOutputInvariantReported = true
-                    reportError(message)
-                }
-            }
+            // The renderer already logs the invariant itself (Log.e, once per window surface).
+            // It is deliberately NOT escalated to reportError: an 8-bit window config is the
+            // normal state of a TV display surface, the PQ dataspace tag is what makes the panel
+            // present HDR, and turning this into a user-facing error made every HDR video look
+            // broken while playback continued correctly underneath.
+            renderer.onHdrOutputInvariant = null
             outputRenderer = renderer
             hdrRepresentationProbe = HdrRepresentationProbe()
 
@@ -2246,18 +2252,39 @@ class VideoFrameProcessor(
         processNextFramePair()
     }
 
+    /**
+     * How long a queued frame may wait before it is discarded as stale: two source frame
+     * intervals, floored at [MIN_QUEUE_LATENCY_MS]. Two intervals is the point where a second
+     * fresher source frame has arrived behind this one, so dropping this one costs no cadence;
+     * below that the frame is still the newest and dropping it would only lower output FPS.
+     * Before the first pair is measured ([lastPairIntervalUs] == 0) the floor applies, which is
+     * the pre-adaptation behaviour.
+     */
+    private fun maxQueueLatencyMs(): Long {
+        val intervalUs = lastPairIntervalUs
+        if (intervalUs <= 0L) return MIN_QUEUE_LATENCY_MS
+        return (intervalUs / 500L).coerceAtLeast(MIN_QUEUE_LATENCY_MS)
+    }
+
     private fun processNextFramePair() {
         if (released) return
         
-        // Discard stale frames that have been in queue too long (latency control)
+        // Discard stale frames that have been in queue too long (latency control). The bound is
+        // two source frame intervals rather than a fixed 16 ms: CPU SVP pair processing grows
+        // with resolution, and once one pair took longer than a fixed 16 ms every frame that
+        // arrived during it was discarded on arrival - collapsing output FPS at exactly the
+        // resolutions too heavy to fit the constant. Two intervals means a frame is only
+        // replaceable once a fresher source frame exists twice over; below one interval it is
+        // still the newest useful frame and is never dropped.
         val nowNs = System.nanoTime()
-        val maxQueueNs = MAX_QUEUE_LATENCY_MS * 1_000_000L
+        val maxQueueLatencyMs = maxQueueLatencyMs()
+        val maxQueueNs = maxQueueLatencyMs * 1_000_000L
         while (true) {
             val head = frameQueue.peek() ?: break
             val ageNs = nowNs - (head.timestampUs * 1000L)
             if (ageNs <= maxQueueNs) break
             frameQueue.poll()?.let { 
-                Log.w(TAG, "Discarding stale frame: queueLatencyMs=${ageNs / 1_000_000L} > ${MAX_QUEUE_LATENCY_MS}ms")
+                Log.w(TAG, "Discarding stale frame: queueLatencyMs=${ageNs / 1_000_000L} > ${maxQueueLatencyMs}ms")
                 releaseFrameBuffer(it.pixels)
                 droppedFrameCount++
             }
@@ -2595,7 +2622,7 @@ class VideoFrameProcessor(
                     nsJni += fieldNs
                     if (fieldReady) {
                         val tRenderStart = System.nanoTime()
-                        outputRenderer?.hdrOutputMode = hdrOutputMode()
+                        outputRenderer?.let { applyPresentState(it) }
                         presented = outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
                             outputRenderer?.presentDenoised(
                                 rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
@@ -2809,7 +2836,7 @@ class VideoFrameProcessor(
             // describe the filter's output, and running the stage's own pass on top would denoise
             // the same frame twice.
             var denoiseReady = false
-            outputRenderer?.hdrOutputMode = hdrOutputMode()
+            outputRenderer?.let { applyPresentState(it) }
             if (gpuDenoiseWanted) {
                 denoiseReady = motionReady && motionBuf != null &&
                     outputRenderer?.renderDenoise(
@@ -2867,6 +2894,19 @@ class VideoFrameProcessor(
                         timestamps
                     ) == true
                 } else if (hdrComposition) {
+                    // The warp presents straight from the retained textures, so the probe - whose
+                    // verdict decides whether the shader decodes before tone-mapping - has to run
+                    // here too, not only in renderFrameToOutput. The context key is built from
+                    // the same fields as that call's key: a mismatched key would read as a
+                    // "changed" source and force a re-probe every time the two present paths
+                    // alternate, turning a once-per-stream measurement into a per-frame stall.
+                    // Rate-limited inside; writes nothing; same thread that owns the context.
+                    hdrRepresentationProbe?.probe(
+                        hdrFrame0, rifeInputW, rifeInputH,
+                        "tex=$hdrFrame0 ${rifeInputW}x${rifeInputH} out=$outputDataSpace " +
+                            "color=${sourceColorInfo ?: "unknown"}"
+                    )
+                    outputRenderer?.let { applyPresentState(it) }
                     outputRenderer?.renderWarpTextures(
                         hdrFrame0, hdrFrame1, motionBuf,
                         rifeInputW, rifeInputH, rifeOutputW, rifeOutputH,
@@ -3517,7 +3557,7 @@ class VideoFrameProcessor(
             )
             // Single present path for both modes: the retained source texture is always worth
             // its full precision, and only the final output encoding differs (PQ vs sRGB).
-            outputRenderer?.hdrOutputMode = hdrOutputMode()
+            outputRenderer?.let { applyPresentState(it) }
             val presented = outputRenderer
                 ?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true
             if (presented) {
@@ -3602,7 +3642,7 @@ class VideoFrameProcessor(
         }
 
         try {
-            renderer.hdrOutputMode = hdrOutputMode()
+            applyPresentState(renderer)
             val success = renderer.render(pixels, width, height, timestampNs)
             if (success) {
                 submittedOutputFrameCount++

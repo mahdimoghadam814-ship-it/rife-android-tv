@@ -63,11 +63,13 @@ class OesFrameGrabber {
     private var pboBytes = 0
     private var pboSupported = false
     internal data class HdrSourceSlot(var textureId: Int = 0, var inUse: Boolean = false)
-    // Pipeline depth = previousFrame(1) + pair in flight(2) + pendingRenderQueue(2) + capturing(1) = 6.
-    // But we only need to retain HDR sources for frames that are still in the pipeline.
-    // Max simultaneous: previousFrame (1) + current pair being processed (2) + 1 pending pair (2) = 5.
-    // Use 5 to allow one spare while keeping GPU memory bounded.
-    internal val hdrSourceSlots = Array(5) { HdrSourceSlot() }
+    // Sized to the pipeline's live-buffer depth, matching MAX_POOLED_FRAME_BUFFERS in
+    // VideoFrameProcessor: frameQueue(4) + previousFrame(1) + in-flight pair(2) + the capture
+    // being enqueued(1) = 8. A pooled buffer's HDR texture is released before it returns to the
+    // pool (finishFrameBufferRelease), so idle pool slots hold no lease. The old count of 5 was
+    // two short of the live depth, and once the pool grew from 2 to 8 the mismatch showed as
+    // "hdr source leases exhausted" refusals that dropped decoded frames - input FPS collapse.
+    internal val hdrSourceSlots = Array(HDR_SOURCE_SLOTS) { HdrSourceSlot() }
     private var hdrFramebuffer = 0
     private var hdrWidth = 0
     private var hdrHeight = 0
@@ -102,6 +104,13 @@ class OesFrameGrabber {
 
     companion object {
         private const val TAG = "OesFrameGrabber"
+
+        /**
+         * Retained HDR source textures, one per live analysis buffer. Matches the pipeline's
+         * live-buffer depth (see [hdrSourceSlots]); internal because the sizing comment cross-
+         * references the pipeline constants it tracks.
+         */
+        internal const val HDR_SOURCE_SLOTS = 8
 
         /**
          * Per-frame capture diagnostics. Costs a whole-buffer pass inside the timed readback, so

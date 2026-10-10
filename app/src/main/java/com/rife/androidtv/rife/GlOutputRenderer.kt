@@ -68,6 +68,7 @@ class GlOutputRenderer {
             varying vec2 vTextureCoord;
             uniform sampler2D uTexture;
             uniform int uIsHdr;
+            uniform int uSourceEncoded;
 
             // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
             vec3 linearToPQ(vec3 linear) {
@@ -82,10 +83,25 @@ class GlOutputRenderer {
                 return pow(numerator / denominator, vec3(m2));
             }
 
-            // HDR 8 present (uIsHdr == 2): the source holds linear light on the PQ scale, where
-            // 1.0 is 10000 nits and 100-nit reference white sits at 0.01. Scale so reference
-            // white lands on SDR full white, clip everything above it (the plain clip
-            // tone-map), then apply the sRGB OETF an untagged 8-bit surface is read with.
+            // SMPTE ST 2084 (PQ) EOTF - converts PQ code values back to linear light on the
+            // same 0..1 = 0..10000 nits scale linearToPQ() consumes. The measured source is
+            // display-encoded (PQ code values), so this is what runs before any tone-map.
+            vec3 pqToLinear(vec3 pq) {
+                const float m1 = 2610.0 / 4096.0;
+                const float m2 = 2523.0 / 4096.0 * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 4096.0 * 32.0;
+                const float c3 = 2392.0 / 4096.0 * 32.0;
+                vec3 cp = pow(max(pq, vec3(0.0)), vec3(1.0 / m2));
+                vec3 numerator = max(cp - vec3(c1), vec3(0.0));
+                vec3 denominator = vec3(c2) - vec3(c3) * cp;
+                return pow(numerator / denominator, vec3(1.0 / m1));
+            }
+
+            // HDR 8 present (uIsHdr == 2): decode to linear if the source is encoded, scale so
+            // 100-nit reference white lands on SDR full white, clip everything above it (the
+            // plain clip tone-map), then apply the sRGB OETF an untagged 8-bit surface is read
+            // with.
             vec3 linearToSdr(vec3 linear) {
                 vec3 sdr = clamp(linear * 100.0, 0.0, 1.0);
                 vec3 lo = sdr * 12.92;
@@ -96,9 +112,13 @@ class GlOutputRenderer {
             void main() {
                 vec3 color = texture2D(uTexture, vTextureCoord).rgb;
                 if (uIsHdr == 1) {
-                    color = linearToPQ(color);
+                    // PQ out: an encoded source already holds the code values, so re-encoding
+                    // would crush them - only a linear source needs the conversion.
+                    if (uSourceEncoded == 0) {
+                        color = linearToPQ(color);
+                    }
                 } else if (uIsHdr == 2) {
-                    color = linearToSdr(color);
+                    color = linearToSdr(uSourceEncoded == 1 ? pqToLinear(color) : color);
                 }
                 gl_FragColor = vec4(color, 1.0);
             }
@@ -177,6 +197,7 @@ private const val WARP_FRAGMENT_SHADER = """
             // fallback path and this one can never disagree about what they are rendering.
             uniform int uBlendMode;
             uniform int uIsHdr;
+            uniform int uSourceEncoded;
             // Per-channel median of three, as a + b + c - min - max.
             vec3 median3(vec3 a, vec3 b, vec3 c) {
                 return a + b + c - min(min(a, b), c) - max(max(a, b), c);
@@ -195,10 +216,24 @@ private const val WARP_FRAGMENT_SHADER = """
                 return pow(numerator / denominator, vec3(m2));
             }
 
-            // HDR 8 present (uIsHdr == 2): the source holds linear light on the PQ scale, where
-            // 1.0 is 10000 nits and 100-nit reference white sits at 0.01. Scale so reference
-            // white lands on SDR full white, clip everything above it (the plain clip
-            // tone-map), then apply the sRGB OETF an untagged 8-bit surface is read with.
+            // SMPTE ST 2084 (PQ) EOTF - the measured source is display-encoded, so this is what
+            // decodes it back to linear before any tone-map. Same 0..1 = 0..10000 nits scale.
+            vec3 pqToLinear(vec3 pq) {
+                const float m1 = 2610.0 / 4096.0;
+                const float m2 = 2523.0 / 4096.0 * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 4096.0 * 32.0;
+                const float c3 = 2392.0 / 4096.0 * 32.0;
+                vec3 cp = pow(max(pq, vec3(0.0)), vec3(1.0 / m2));
+                vec3 numerator = max(cp - vec3(c1), vec3(0.0));
+                vec3 denominator = vec3(c2) - vec3(c3) * cp;
+                return pow(numerator / denominator, vec3(1.0 / m1));
+            }
+
+            // HDR 8 present (uIsHdr == 2): decode to linear if the source is encoded, scale so
+            // 100-nit reference white lands on SDR full white, clip everything above it (the
+            // plain clip tone-map), then apply the sRGB OETF an untagged 8-bit surface is read
+            // with.
             vec3 linearToSdr(vec3 linear) {
                 vec3 sdr = clamp(linear * 100.0, 0.0, 1.0);
                 vec3 lo = sdr * 12.92;
@@ -253,9 +288,11 @@ private const val WARP_FRAGMENT_SHADER = """
                     blended = mix(termF, termB, uTimestep);
                 }
                 if (uIsHdr == 1) {
-                    blended = linearToPQ(blended);
+                    if (uSourceEncoded == 0) {
+                        blended = linearToPQ(blended);
+                    }
                 } else if (uIsHdr == 2) {
-                    blended = linearToSdr(blended);
+                    blended = linearToSdr(uSourceEncoded == 1 ? pqToLinear(blended) : blended);
                 }
                 gl_FragColor = vec4(blended, 1.0);
             }
@@ -299,6 +336,7 @@ private const val WARP_FRAGMENT_SHADER = """
             uniform vec2 uMotionOffset;
             uniform float uHasHistory;
             uniform int uIsHdr;
+            uniform int uSourceEncoded;
             // Multiplier on the history blend, from the denoise level. It scales how strongly a
             // pixel may be replaced by its own motion-compensated counterpart - the similarity
             // gate below still rejects the moment the two frames disagree by more than their own
@@ -319,10 +357,24 @@ private const val WARP_FRAGMENT_SHADER = """
                 return pow(numerator / denominator, vec3(m2));
             }
 
-            // HDR 8 present (uIsHdr == 2): the source holds linear light on the PQ scale, where
-            // 1.0 is 10000 nits and 100-nit reference white sits at 0.01. Scale so reference
-            // white lands on SDR full white, clip everything above it (the plain clip
-            // tone-map), then apply the sRGB OETF an untagged 8-bit surface is read with.
+            // SMPTE ST 2084 (PQ) EOTF - the measured source is display-encoded, so this is what
+            // decodes it back to linear before any tone-map. Same 0..1 = 0..10000 nits scale.
+            vec3 pqToLinear(vec3 pq) {
+                const float m1 = 2610.0 / 4096.0;
+                const float m2 = 2523.0 / 4096.0 * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 4096.0 * 32.0;
+                const float c3 = 2392.0 / 4096.0 * 32.0;
+                vec3 cp = pow(max(pq, vec3(0.0)), vec3(1.0 / m2));
+                vec3 numerator = max(cp - vec3(c1), vec3(0.0));
+                vec3 denominator = vec3(c2) - vec3(c3) * cp;
+                return pow(numerator / denominator, vec3(1.0 / m1));
+            }
+
+            // HDR 8 present (uIsHdr == 2): decode to linear if the source is encoded, scale so
+            // 100-nit reference white lands on SDR full white, clip everything above it (the
+            // plain clip tone-map), then apply the sRGB OETF an untagged 8-bit surface is read
+            // with.
             vec3 linearToSdr(vec3 linear) {
                 vec3 sdr = clamp(linear * 100.0, 0.0, 1.0);
                 vec3 lo = sdr * 12.92;
@@ -357,9 +409,11 @@ private const val WARP_FRAGMENT_SHADER = """
                     }
                 }
                 if (uIsHdr == 1) {
-                    merged = linearToPQ(merged);
+                    if (uSourceEncoded == 0) {
+                        merged = linearToPQ(merged);
+                    }
                 } else if (uIsHdr == 2) {
-                    merged = linearToSdr(merged);
+                    merged = linearToSdr(uSourceEncoded == 1 ? pqToLinear(merged) : merged);
                 }
                 gl_FragColor = vec4(merged, 1.0);
             }
@@ -461,17 +515,21 @@ private const val WARP_FRAGMENT_SHADER = """
      * straight into the `uIsHdr` int uniform of the blit, warp and denoise programs:
      *
      *  * [HDR_OUTPUT_SDR] (0) - passthrough; the source is display-encoded SDR already.
-     *  * [HDR_OUTPUT_PQ] (1) - linear light to PQ code values, for an output tagged HDR (HDR 10).
-     *  * [HDR_OUTPUT_SDR8] (2) - linear light to the sRGB OETF with the PQ-scale 100-nit
-     *    reference white normalised to 1.0 and the highlights above it clipped: an HDR source
-     *    presented as 8-bit SDR with no HDR metadata (HDR 8).
+     *  * [HDR_OUTPUT_PQ] (1) - for an output tagged HDR (HDR 10). A linear source is encoded to
+     *    PQ code values; an encoded source ([sourceIsEncoded]) is passed through, because it
+     *    already holds them and re-encoding would crush the midtones.
+     *  * [HDR_OUTPUT_SDR8] (2) - an HDR source presented as 8-bit SDR with no HDR metadata
+     *    (HDR 8): decode to linear when the source is encoded, scale so the PQ-scale 100-nit
+     *    reference white normalises to 1.0, clip the highlights above it (the plain clip
+     *    tone-map), then apply the sRGB OETF an untagged 8-bit surface is read with.
      *
      * Going [HDR_OUTPUT_PQ] runs the output invariant: an HDR source presented into a window
      * surface whose config has fewer than ten bits per channel loses the precision the whole HDR
      * path exists to keep, and loses it silently, because the picture still appears. The setter
-     * escalates that through [onHdrOutputInvariant] rather than downgrading the request, since
-     * downgrading is exactly the workaround the pipeline is not allowed to fall back to.
-     * [HDR_OUTPUT_SDR8] deliberately skips it: an 8-bit surface is what that mode asks for.
+     * escalates that through [onHdrOutputInvariant]; when that is null (the current wiring) it is
+     * log-only, because an 8-bit display surface is the norm on Android TVs and the PQ dataspace
+     * tag is what makes the panel present HDR. [HDR_OUTPUT_SDR8] deliberately skips it: an 8-bit
+     * surface is what that mode asks for.
      */
     @Volatile
     var hdrOutputMode = HDR_OUTPUT_SDR
@@ -482,8 +540,22 @@ private const val WARP_FRAGMENT_SHADER = """
         }
 
     /**
+     * What the measured source texture holds, pushed into the `uSourceEncoded` uniform of the
+     * blit, warp and denoise programs. True (1) when the pixels are display-encoded PQ/HLG-like
+     * code values, from [HdrRepresentationProbe.representation] - the probe measures the actual
+     * texture, because the stream's branding does not survive the decoder's YUV-to-RGB conversion
+     * reliably enough to decide. When encoded, [HDR_OUTPUT_PQ] passes the values through (they
+     * already are PQ) and [HDR_OUTPUT_SDR8] decodes with the PQ EOTF before tone-mapping; when
+     * linear, the conversions run directly. Defaults to encoded until a measurement says
+     * otherwise, which is the near-universal decoder behaviour.
+     */
+    @Volatile
+    var sourceIsEncoded = true
+
+    /**
      * Raised once per window surface when an HDR source is about to be presented into a surface
-     * that cannot carry HDR precision. Wired by the owner so it becomes a reported error.
+     * that cannot carry HDR precision. Null (the current wiring) keeps it log-only inside
+     * [enforceHdrOutputInvariant]; set by an owner that wants it escalated.
      */
     @Volatile
     var onHdrOutputInvariant: ((String) -> Unit)? = null
@@ -499,7 +571,9 @@ private const val WARP_FRAGMENT_SHADER = """
     private var hdrInvariantLoggedForSurface = false
 
     private var uIsHdrHandle = -1
+    private var uSourceEncodedHandle = -1
     private var warpUIsHdr = -1
+    private var warpUSourceEncoded = -1
 
     private var denUContentScale = -1
     private var denUCurrent = -1
@@ -512,6 +586,7 @@ private const val WARP_FRAGMENT_SHADER = """
     private var denUHasHistory = -1
     private var denUStrength = -1
     private var denUIsHdr = -1
+    private var denUSourceEncoded = -1
 
     /** The frame being denoised, uploaded once per call. Kept separate from the warp's pair. */
     private var denCurrentTex = 0
@@ -670,6 +745,7 @@ private const val WARP_FRAGMENT_SHADER = """
         uTextureHandle = GLES20.glGetUniformLocation(program, "uTexture")
         uContentScaleHandle = GLES20.glGetUniformLocation(program, "uContentScale")
         uIsHdrHandle = GLES20.glGetUniformLocation(program, "uIsHdr")
+        uSourceEncodedHandle = GLES20.glGetUniformLocation(program, "uSourceEncoded")
 
         if (aPositionHandle < 0 || aTextureCoordHandle < 0 || uTextureHandle < 0 ||
             uContentScaleHandle < 0
@@ -749,6 +825,7 @@ private const val WARP_FRAGMENT_SHADER = """
         warpUBlendMode = GLES20.glGetUniformLocation(newProgram, "uBlendMode")
         warpUTimestep = GLES20.glGetUniformLocation(newProgram, "uTimestep")
         warpUIsHdr = GLES20.glGetUniformLocation(newProgram, "uIsHdr")
+        warpUSourceEncoded = GLES20.glGetUniformLocation(newProgram, "uSourceEncoded")
 
         if (warpAPosition < 0 || warpATexCoord < 0 || warpUContentScale < 0 ||
             warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 || warpUMask < 0 ||
@@ -821,6 +898,7 @@ private const val WARP_FRAGMENT_SHADER = """
         denUHasHistory = GLES20.glGetUniformLocation(newProgram, "uHasHistory")
         denUStrength = GLES20.glGetUniformLocation(newProgram, "uStrength")
         denUIsHdr = GLES20.glGetUniformLocation(newProgram, "uIsHdr")
+        denUSourceEncoded = GLES20.glGetUniformLocation(newProgram, "uSourceEncoded")
         if (denDPosition < 0 || denDTexCoord < 0 || denUContentScale < 0 ||
             denUCurrent < 0 || denUHistory < 0 || denUMotion < 0 || denUMask < 0 ||
             denUTargetSize < 0 || denUMotionGrid < 0 || denUMotionOffset < 0 ||
@@ -879,38 +957,41 @@ private const val WARP_FRAGMENT_SHADER = """
             return
         }
 
-        val strict = intArrayOf(
-            EGL14.EGL_RED_SIZE, 8,
-            EGL14.EGL_GREEN_SIZE, 8,
-            EGL14.EGL_BLUE_SIZE, 8,
-            EGL14.EGL_ALPHA_SIZE, 8,
+        // The 10-bit config is tried first, because an HDR source presented through it is the
+        // whole point of the HDR path and eglCreateWindowSurface's EGL_BAD_MATCH is a clean
+        // signal: a native window whose buffers are RGBA8888 rejects the RGB10_A2 config and the
+        // 8-bit fallback below gets the same surface the old order would have produced. A window
+        // that can carry 10-bit - a Main10 encoder input, or a display queue that has already
+        // renegotiated its format for HDR - would never be reached by the old 8-bit-first order,
+        // because the 8-bit config matches it too and the 10-bit attempt never ran.
+        val hdr = intArrayOf(
+            EGL14.EGL_RED_SIZE, 10,
+            EGL14.EGL_GREEN_SIZE, 10,
+            EGL14.EGL_BLUE_SIZE, 10,
+            EGL14.EGL_ALPHA_SIZE, 2,
             EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
             EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
             EGL14.EGL_NONE
         )
-        var created = createWindowSurface(display, surface, strict, attempt = "strict8bit")
+        var created = createWindowSurface(display, surface, hdr, attempt = "hdr10bit")
         if (created == null) {
-            // A Main10 encoder's input surface is a 10-bit buffer, and an 8-bit config cannot
-            // match it. RGB10_A2 is the 10-bit layout every GLES2 driver exposes; if the surface
-            // is 8-bit this query simply fails and the relaxed fallback below takes over.
-            val hdr = intArrayOf(
-                EGL14.EGL_RED_SIZE, 10,
-                EGL14.EGL_GREEN_SIZE, 10,
-                EGL14.EGL_BLUE_SIZE, 10,
-                EGL14.EGL_ALPHA_SIZE, 2,
+            val strict = intArrayOf(
+                EGL14.EGL_RED_SIZE, 8,
+                EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8,
+                EGL14.EGL_ALPHA_SIZE, 8,
                 EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
                 EGL14.EGL_NONE
             )
-            created = createWindowSurface(display, surface, hdr, attempt = "hdr10bit")
+            created = createWindowSurface(display, surface, strict, attempt = "strict8bit")
         }
         if (created == null) {
-            // The display surface has always matched RGBA8888, but a MediaCodec encoder input
-            // surface is allocated by the codec and may be 10-bit (RGBA_1010102). An
-            // EGL_BAD_MATCH from eglCreateWindowSurface is the only signal that gives us, and
-            // giving up there would leave no path at all, so retry with the component sizes
-            // unconstrained and let the driver pick the format the native window actually is.
-            Log.w(TAG, "RGBA8888 did not match the surface; retrying with the driver's own format")
+            // Neither fixed width matched the surface. An EGL_BAD_MATCH from
+            // eglCreateWindowSurface is the only signal that gives us, and giving up there would
+            // leave no path at all, so retry with the component sizes unconstrained and let the
+            // driver pick the format the native window actually is.
+            Log.w(TAG, "Fixed-width configs did not match the surface; retrying relaxed")
             val relaxed = intArrayOf(
                 EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
@@ -1388,6 +1469,7 @@ private const val WARP_FRAGMENT_SHADER = """
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
         GLES20.glUniform1i(uIsHdrHandle, hdrOutputMode)
+        GLES20.glUniform1i(uSourceEncodedHandle, if (sourceIsEncoded) 1 else 0)
 
         // The quad no longer covers the whole surface whenever the aspect ratios differ, so the
         // bars are painted black instead of leaving the previous frame's contents on screen.
@@ -1489,6 +1571,7 @@ private const val WARP_FRAGMENT_SHADER = """
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
         GLES20.glUniform1i(uIsHdrHandle, hdrOutputMode)
+        GLES20.glUniform1i(uSourceEncodedHandle, if (sourceIsEncoded) 1 else 0)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         vertexBuffer.position(0)
@@ -1791,6 +1874,7 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glUniform1f(denUHasHistory, if (src != 0) 1.0f else 0.0f)
         GLES20.glUniform1f(denUStrength, denoiseStrength)
         GLES20.glUniform1i(denUIsHdr, hdrOutputMode)
+        GLES20.glUniform1i(denUSourceEncoded, if (sourceIsEncoded) 1 else 0)
         // Always full frame: this pass writes a texture, it does not letterbox into a surface, so
         // it must not touch contentScaleX/Y - the present that follows shares those two.
         GLES20.glUniform2f(denUContentScale, 1.0f, 1.0f)
@@ -1996,6 +2080,7 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glUniform2f(warpUMotionOffset, motionOffset, motionOffset)
         GLES20.glUniform1i(warpUBlendMode, warpBlendMode)
         GLES20.glUniform1i(warpUIsHdr, hdrOutputMode)
+        GLES20.glUniform1i(warpUSourceEncoded, if (sourceIsEncoded) 1 else 0)
 
         updateContentScale(targetWidth, targetHeight, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(warpUContentScale, contentScaleX, contentScaleY)
@@ -2082,6 +2167,7 @@ private const val WARP_FRAGMENT_SHADER = """
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
         GLES20.glUniform1i(uIsHdrHandle, hdrOutputMode)
+        GLES20.glUniform1i(uSourceEncodedHandle, if (sourceIsEncoded) 1 else 0)
 
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)

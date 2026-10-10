@@ -28,6 +28,36 @@ import java.nio.ShortBuffer
 @UnstableApi
 class HdrRepresentationProbe {
 
+    /** What the sampled texture holds, decided by magnitude (see class doc). */
+    enum class Representation {
+        /** No successful measurement yet. */
+        UNKNOWN,
+        /** PQ/HLG-like code values, frame means in the tenths. */
+        ENCODED,
+        /** Linear light on the PQ scale, 100-nit white near 0.01. */
+        LINEAR,
+        /** Distribution between the two populations; treat as [ENCODED] (see [sourceIsEncoded]). */
+        INDETERMINATE,
+    }
+
+    /**
+     * The last measurement's verdict. Read by the present path to pick the shader conversion, so
+     * this - not the stream's branding - decides whether the source is decoded before tone-mapping.
+     */
+    @Volatile
+    var representation: Representation = Representation.UNKNOWN
+        private set
+
+    /**
+     * What the shaders should assume: anything that is not measured LINEAR is treated as encoded.
+     * The decoder's YUV-to-RGB conversion copies code values without applying the transfer
+     * function, so encoded is the near-universal reality for HDR streams, and guessing encoded on
+     * genuinely linear content costs a dark picture that the next measurement corrects - while
+     * guessing linear on encoded content is the clip-to-white failure this flag exists to end.
+     */
+    val sourceIsEncoded: Boolean
+        get() = representation != Representation.LINEAR
+
     private var probeFbo = 0
     private var floatBuffer: FloatBuffer? = null
     private var halfBuffer: ShortBuffer? = null
@@ -60,6 +90,7 @@ class HdrRepresentationProbe {
         lastProbeNs = 0L
         firstSeenNs = 0L
         lastSourceKey = ""
+        representation = Representation.UNKNOWN
         intensity.clear()
     }
 
@@ -75,6 +106,7 @@ class HdrRepresentationProbe {
         firstSeenNs = 0L
         lastProbeNs = 0L
         lastSourceKey = ""
+        representation = Representation.UNKNOWN
     }
 
     /**
@@ -312,16 +344,23 @@ class HdrRepresentationProbe {
                 "darkest=${f(minR)}/${f(minG)}/${f(minB)}"
         )
         // The magnitude test, stated in the log so the line carries the conclusion and not only
-        // the evidence. This does not touch the shader: it is the measurement that decides, not
-        // the decision itself.
-        val verdict = when {
-            mean >= 0.10 || p50 >= 0.10 ->
-                "ENCODED (PQ/HLG-like code values) - re-applying linearToPQ would crush them"
-            mean <= 0.02 && p99 <= 0.25 ->
-                "LINEAR (0..1 over 10000 nits) - linearToPQ would be required"
-            else -> "INDETERMINATE - distribution sits between the two populations"
+        // the evidence. The verdict is published on [representation], which the present path reads
+        // to select the shader conversion - measured, not guessed.
+        representation = when {
+            mean >= 0.10 || p50 >= 0.10 -> Representation.ENCODED
+            mean <= 0.02 && p99 <= 0.25 -> Representation.LINEAR
+            else -> Representation.INDETERMINATE
         }
-        Log.i(TAG, "[HDRREP] representation=$verdict | shader left untouched by this probe")
+        val verdict = when (representation) {
+            Representation.ENCODED ->
+                "ENCODED (PQ/HLG-like code values) - decode before tone-mapping, do not re-encode"
+            Representation.LINEAR ->
+                "LINEAR (0..1 over 10000 nits) - linearToPQ/linearToSdr apply directly"
+            Representation.INDETERMINATE ->
+                "INDETERMINATE - distribution sits between the two populations; treating as ENCODED"
+            Representation.UNKNOWN -> "UNKNOWN"
+        }
+        Log.i(TAG, "[HDRREP] representation=$verdict | sourceIsEncoded=$sourceIsEncoded")
     }
 
     private fun percentile(sorted: FloatArray, q: Double): Float {
