@@ -30,9 +30,15 @@ import java.io.File
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 
 /**
  * App-wide owner of the frame processing stage.
@@ -49,11 +55,27 @@ import kotlinx.coroutines.flow.asStateFlow
 @UnstableApi
 class RifeEngineController(
     private val context: Context,
+    private val preferencesRepository: dev.anilbeesetti.nextplayer.core.data.repository.PreferencesRepository,
 ) : RifeController {
     companion object {
         private const val TAG = "RifeEngineController"
         private const val TAG_LIFECYCLE = "PIPELINE-LIFECYCLE"
     }
+
+    /**
+     * HDR 10 vs HDR 8 for the current stream. Seeded from the persisted preference so a setting
+     * made while no player is open is already correct when the processor is constructed, and
+     * then kept in sync by the collector in [start]. Written only from the main thread; the
+     * processor applies its copy on the worker.
+     */
+    private val _hdr10Enabled =
+        MutableStateFlow(preferencesRepository.playerPreferences.value.hdr10Enabled)
+    var hdr10Enabled: Boolean
+        get() = _hdr10Enabled.value
+        set(value) {
+            _hdr10Enabled.value = value
+            processor.setHdr10Enabled(value)
+        }
 
     /**
      * The frame processor. Created eagerly (it only starts its worker thread and creates the input
@@ -76,10 +98,14 @@ class RifeEngineController(
             Log.e(TAG, "Input surface unavailable; processing stages stay off")
             _inputSurface.value = null
         },
+        hdr10Enabled = hdr10Enabled,
     )
 
     private val _processingEnabled = MutableStateFlow(false)
     override val processingEnabled: StateFlow<Boolean> = _processingEnabled.asStateFlow()
+
+    /** Collector of preference changes; created per [start], cancelled by [stop]. */
+    private var preferenceScope: CoroutineScope? = null
 
     private val _stats = MutableStateFlow(
         RifeStats(
@@ -104,6 +130,20 @@ class RifeEngineController(
      */
     override fun start() {
         processor.start()
+        // Observe HDR 10/HDR 8 preference changes while the player screen owns us. A fresh scope
+        // per start: a scope cancelled by stop() could never be launched in again, and a second
+        // start without a stop must not leak the first collector.
+        preferenceScope?.cancel()
+        val scope = CoroutineScope(SupervisorJob())
+        preferenceScope = scope
+        scope.launch {
+            preferencesRepository.playerPreferences
+                .map { it.hdr10Enabled }
+                .distinctUntilChanged()
+                .collect { enabled ->
+                    hdr10Enabled = enabled
+                }
+        }
     }
 
     /**
@@ -118,6 +158,8 @@ class RifeEngineController(
         processor.stop()
         _inputSurface.value = null
         _processingEnabled.value = false
+        preferenceScope?.cancel()
+        preferenceScope = null
     }
 
     override fun getInputFrameSize(): Pair<Int, Int> {

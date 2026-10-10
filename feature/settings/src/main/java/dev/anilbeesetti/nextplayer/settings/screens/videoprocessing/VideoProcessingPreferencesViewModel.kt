@@ -49,6 +49,7 @@ class VideoProcessingPreferencesViewModel(
             is VideoProcessingPreferencesUiEvent.ShowDialog -> showDialog(action.value)
             is VideoProcessingPreferencesUiEvent.ToggleRife -> toggleRife()
             is VideoProcessingPreferencesUiEvent.ToggleFastDvdNet -> toggleFastDvdNet()
+            is VideoProcessingPreferencesUiEvent.ToggleHdr10 -> toggleHdr10()
             is VideoProcessingPreferencesUiEvent.UpdateRifeResolution -> updateRifeResolution(action.value)
             is VideoProcessingPreferencesUiEvent.UpdateInterpolationAlgorithm -> updateInterpolationAlgorithm(action.value)
             is VideoProcessingPreferencesUiEvent.UpdateMemcLevel -> updateMemcLevel(action.value)
@@ -75,6 +76,14 @@ class VideoProcessingPreferencesViewModel(
         viewModelScope.launch {
             preferencesRepository.updatePlayerPreferences {
                 it.copy(fastDvdNetEnabled = !it.fastDvdNetEnabled)
+            }
+        }
+    }
+
+    private fun toggleHdr10() {
+        viewModelScope.launch {
+            preferencesRepository.updatePlayerPreferences {
+                it.copy(hdr10Enabled = !it.hdr10Enabled)
             }
         }
     }
@@ -138,6 +147,7 @@ sealed interface VideoProcessingPreferencesUiEvent {
     data class ShowDialog(val value: VideoProcessingDialog?) : VideoProcessingPreferencesUiEvent
     data object ToggleRife : VideoProcessingPreferencesUiEvent
     data object ToggleFastDvdNet : VideoProcessingPreferencesUiEvent
+    data object ToggleHdr10 : VideoProcessingPreferencesUiEvent
     data class UpdateRifeResolution(val value: RifeResolutionSetting) : VideoProcessingPreferencesUiEvent
     data class UpdateInterpolationAlgorithm(val value: InterpolationAlgorithmSetting) : VideoProcessingPreferencesUiEvent
     data class UpdateMemcLevel(val value: MemcLevelSetting) : VideoProcessingPreferencesUiEvent

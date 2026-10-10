@@ -100,7 +100,8 @@ class VideoFrameProcessor(
     private val onStatisticsUpdated: (Statistics) -> Unit,
     private val onError: (String) -> Unit,
     private val onInputSurfaceCreated: (Surface) -> Unit = {},
-    private val onInputSurfaceFailed: () -> Unit = {}
+    private val onInputSurfaceFailed: () -> Unit = {},
+    private var hdr10Enabled: Boolean = true
 ) : Media3VideoFrameProcessor {
 
     companion object {
@@ -113,34 +114,45 @@ class VideoFrameProcessor(
          */
         private const val FRAME_QUEUE_CAPACITY = 4
 
-        /** Pooled capture buffers. Bounded so a 4K stream cannot inflate the heap. */
-        private const val MAX_POOLED_FRAME_BUFFERS = 2
+        /**
+         * Pooled capture buffers, bounded so the idle pool cannot dominate the heap: at 4K an
+         * 8-deep pool is ~266 MB, and the budget check below counts it explicitly. 8 matches the
+         * pipeline's pipelined depth (4-slot queue + previous frame + in-flight pair) so a full
+         * cycle's frames can be recycled instead of re-allocated every time.
+         */
+        private const val MAX_POOLED_FRAME_BUFFERS = 8
 
         /**
          * Worst-case number of full-resolution RGBA frames the pipeline can own at the same
-         * instant: 4 in the frame queue + 1 previous frame + 2 pooled + 3 working buffers
-         * (input0, input1, output). The denoiser's 2 scratch buffers are added only while the
-         * denoiser is on, because they are allocated only while it is on.
+         * instant: 4 in the frame queue + 1 previous frame + 8 pooled (idle but allocated) +
+         * 3 working buffers (input0, input1, output). The denoiser's 2 scratch buffers are added
+         * only while the denoiser is on, because they are allocated only while it is on.
+         * Corrected when the pool grew from 2 to 8; the count only feeds the budget estimate.
          */
-        private const val LIVE_CAPTURE_FRAMES = 10L
-        private const val LIVE_CAPTURE_FRAMES_DENOISED = 12L
+        private const val LIVE_CAPTURE_FRAMES = 16L
+        private const val LIVE_CAPTURE_FRAMES_DENOISED = 18L
 
         /**
          * Upper bound on that frame set before the pipeline gives up and passes frames through
-         * instead of interpolating. It is sized so a 4K frame set (~330 MB) is attempted, and so
-         * anything clearly beyond it (6K and up) is not. It is a refusal, never a downscale: the
-         * capture size is never changed because of it.
+         * instead of interpolating. Sized against the device this runs on (12 GB RAM): the worst
+         * real set at 4K is ~0.6 GB (18 x 33 MB) and at 8K ~2.4 GB (18 x 133 MB), both well
+         * inside 4 GiB, so every real format up to 8K is attempted; only a set needing more than
+         * 4 GiB (a single RGBA frame over ~430 MB, i.e. beyond any shipped video format) is
+         * refused. It is a refusal, never a downscale: the capture size is never changed because
+         * of it. The budget is a threshold, not a reservation - it never pre-allocates.
          */
-        private const val FRAME_MEMORY_BUDGET_BYTES = 512L * 1024L * 1024L
+        private const val FRAME_MEMORY_BUDGET_BYTES = 4L * 1024L * 1024L * 1024L
 
         /**
          * Cool-down before a stage that refused a size because a direct allocation threw is tried
          * again. An OutOfMemoryError here is usually the previous size's buffers still waiting on
          * their Cleaner rather than a size that can never fit, so waiting recovers; latching the
          * refusal for the rest of the stream does not. The over-budget refusal above is a property
-         * of the size itself and is therefore still latched.
+         * of the size itself and is therefore still latched. 200 ms is one or two capture cycles
+         * at 24-30 fps - long enough for Cleaner to run, short enough that a transient refusal
+         * does not read as the pulsing a 1 s dead window produces.
          */
-        private const val ALLOCATION_RETRY_COOLDOWN_NS = 1_000_000_000L
+        private const val ALLOCATION_RETRY_COOLDOWN_NS = 200_000_000L
 
         /** Bounds the log line that reports a refusal and the retry that follows it. */
         private const val ALLOCATION_LOG_INTERVAL_NS = 1_000_000_000L
@@ -733,6 +745,15 @@ class VideoFrameProcessor(
         }
     }
 
+    fun setHdr10Enabled(enabled: Boolean) {
+        runOnWorker("setHdr10Enabled") {
+            hdr10Enabled = enabled
+            // The dataspace tag follows the mode: HDR 10 keeps the decoder's HDR tag, HDR 8
+            // must present untagged or the display would read sRGB pixels as PQ.
+            applyOutputDataSpace()
+        }
+    }
+
     /**
      * Enables or disables the FastDVDnet pre-processing stage, i.e. the switch between
      * "Interpolation OFF + FastDVDnet ON" (state 2) and "Interpolation OFF + FastDVDnet OFF" (state 1).
@@ -1150,6 +1171,17 @@ class VideoFrameProcessor(
     private fun isHdrSource(): Boolean = ColorInfo.isTransferHdr(sourceColorInfo)
 
     /**
+     * The output encoding the present must use for the current source, from [hdr10Enabled]:
+     * SDR sources always pass through; an HDR source is presented as PQ for HDR 10, or as
+     * 8-bit sRGB SDR (clip tone-map, no HDR dataspace tag) when the HDR 8 mode is selected.
+     */
+    private fun hdrOutputMode(): Int = when {
+        !isHdrSource() -> GlOutputRenderer.HDR_OUTPUT_SDR
+        hdr10Enabled -> GlOutputRenderer.HDR_OUTPUT_PQ
+        else -> GlOutputRenderer.HDR_OUTPUT_SDR8
+    }
+
+    /**
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
      * next pair already emits at the new cadence; the emission phase is re-anchored from that
      * pair's own timestamps rather than carried over from the old ratio.
@@ -1224,8 +1256,12 @@ class VideoFrameProcessor(
      * so the processed path is displayed exactly like the bypass path, and the colour-metadata
      * value otherwise. SDR stays at `0` either way.
      */
-    private fun effectiveOutputDataSpace(): Int =
-        if (outputDataSpace != 0 && codecDataSpace != 0) codecDataSpace else outputDataSpace
+    private fun effectiveOutputDataSpace(): Int = when {
+        // HDR 8 mode: the pixels are sRGB-encoded, so the window must carry no HDR tag.
+        !hdr10Enabled -> 0
+        outputDataSpace != 0 && codecDataSpace != 0 -> codecDataSpace
+        else -> outputDataSpace
+    }
 
     /**
      * Puts the tag back if something took it away. EGL silently resets the dataspace when it
@@ -1902,7 +1938,7 @@ class VideoFrameProcessor(
         } else {
             DATA_SPACE_NOT_QUERIED
         }
-        val shaderHdr = outputRenderer?.isHdr ?: false
+        val shaderHdr = outputRenderer?.hdrOutputMode ?: GlOutputRenderer.HDR_OUTPUT_SDR
         val retained = hdr && frameGrabber?.isHdrSourceSupported == true
         val key = "$mime|$codecs|$color|$surfaceDataSpace|$outputDataSpace|$hdr|$shaderHdr|$retained"
         val now = System.nanoTime()
@@ -1922,7 +1958,7 @@ class VideoFrameProcessor(
                 "surfaceDataSpace=$surfaceDataSpace(${describeDataSpace(surfaceDataSpace)}) " +
                 "outputDataSpace=$outputDataSpace(${describeDataSpace(outputDataSpace)}) " +
                 "codecDataSpace=$codecDataSpace(${describeDataSpace(codecDataSpace)}) " +
-                "isHdrSource=$hdr shaderIsHdr=$shaderHdr " +
+                "isHdrSource=$hdr shaderHdrMode=$shaderHdr " +
                 "captureFormat=${if (retained) "GL_RGBA16F" else "GL_RGBA8"} " +
                 "fp16Retained=$retained"
         )
@@ -2315,7 +2351,11 @@ class VideoFrameProcessor(
         // Render current pair
         processFramePair(prev, next, prepared)
 
-        // Drop motion leases AFTER render completes, so HDR textures stay alive until consumed.
+        // Drop both leases only AFTER render completes: 'next' still needs its lease during the
+        // present, and trySubmitNextMotion above has already taken the fresh lease that carries
+        // it through the next pair's motion computation (its count goes 2 -> 1 here, not 0).
+        // Dropping only 'prev' would leave every frame with one residual lease, so no buffer
+        // would ever re-enter the pool and the HDR source texture would never be released.
         dropMotionLeases(prev, next)
 
         // Schedule next render on next worker cycle instead of recursing
@@ -2555,7 +2595,7 @@ class VideoFrameProcessor(
                     nsJni += fieldNs
                     if (fieldReady) {
                         val tRenderStart = System.nanoTime()
-                        outputRenderer?.isHdr = isHdrSource()
+                        outputRenderer?.hdrOutputMode = hdrOutputMode()
                         presented = outputRenderer?.renderDenoise(in1Buf, motionBuf, rifeInputW, rifeInputH) == true &&
                             outputRenderer?.presentDenoised(
                                 rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
@@ -2769,7 +2809,7 @@ class VideoFrameProcessor(
             // describe the filter's output, and running the stage's own pass on top would denoise
             // the same frame twice.
             var denoiseReady = false
-            outputRenderer?.isHdr = isHdrSource()
+            outputRenderer?.hdrOutputMode = hdrOutputMode()
             if (gpuDenoiseWanted) {
                 denoiseReady = motionReady && motionBuf != null &&
                     outputRenderer?.renderDenoise(
@@ -3381,7 +3421,7 @@ class VideoFrameProcessor(
         // later. ArrayDeque has no duplicate check, so without this the buffer would occupy two
         // slots and `obtainFrameBuffer()` could hand the same memory to two live frames.
         if (frameBufferPool.any { it === buffer }) return
-        if (frameBufferPool.size >= minOf(MAX_POOLED_FRAME_BUFFERS, 2)) return
+        if (frameBufferPool.size >= MAX_POOLED_FRAME_BUFFERS) return
         buffer.clear()
         frameBufferPool.add(buffer)
     }
@@ -3475,12 +3515,16 @@ class VideoFrameProcessor(
                 "tex=$hdrTexture ${frame.width}x${frame.height} out=$outputDataSpace " +
                     "color=${sourceColorInfo ?: "unknown"}"
             )
-            outputRenderer?.isHdr = isHdrSource()
-            if (outputRenderer?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true) {
+            // Single present path for both modes: the retained source texture is always worth
+            // its full precision, and only the final output encoding differs (PQ vs sRGB).
+            outputRenderer?.hdrOutputMode = hdrOutputMode()
+            val presented = outputRenderer
+                ?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true
+            if (presented) {
                 submittedOutputFrameCount++
             } else {
                 droppedOutputFrameCount++
-                Log.e(TAG, "HDR source texture presentation failed; refusing RGBA8 fallback")
+                Log.e(TAG, "HDR source texture presentation failed")
             }
             return
         }
@@ -3558,7 +3602,7 @@ class VideoFrameProcessor(
         }
 
         try {
-            renderer.isHdr = isHdrSource()
+            renderer.hdrOutputMode = hdrOutputMode()
             val success = renderer.render(pixels, width, height, timestampNs)
             if (success) {
                 submittedOutputFrameCount++

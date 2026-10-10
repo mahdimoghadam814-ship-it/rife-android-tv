@@ -167,6 +167,13 @@ private fun VideoProcessingPreferencesScreenContent(
                     onClick = {
                         onAction(VideoProcessingPreferencesUiEvent.ShowDialog(VideoProcessingDialog.DenoiseLevelDialog))
                     },
+                )
+                PreferenceSwitch(
+                    title = stringResource(id = R.string.hdr10_processing),
+                    description = stringResource(id = R.string.hdr10_processing_description),
+                    icon = NextIcons.Brightness,
+                    isChecked = state.preferences.hdr10Enabled,
+                    onClick = { onAction(VideoProcessingPreferencesUiEvent.ToggleHdr10) },
                     isLastItem = true,
                 )
             }

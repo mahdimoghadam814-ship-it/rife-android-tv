@@ -37,6 +37,11 @@ class GlOutputRenderer {
     companion object {
         private const val TAG = "GlOutputRenderer"
 
+        /** Output mode values for [GlOutputRenderer.hdrOutputMode] / the `uIsHdr` uniform. */
+        const val HDR_OUTPUT_SDR = 0
+        const val HDR_OUTPUT_PQ = 1
+        const val HDR_OUTPUT_SDR8 = 2
+
         /**
          * Per-frame render diagnostics. Runs twice per interpolated pair and includes whole-buffer
          * checksums plus three EGL queries, so it is off while profiling the real cost.
@@ -77,10 +82,23 @@ class GlOutputRenderer {
                 return pow(numerator / denominator, vec3(m2));
             }
 
+            // HDR 8 present (uIsHdr == 2): the source holds linear light on the PQ scale, where
+            // 1.0 is 10000 nits and 100-nit reference white sits at 0.01. Scale so reference
+            // white lands on SDR full white, clip everything above it (the plain clip
+            // tone-map), then apply the sRGB OETF an untagged 8-bit surface is read with.
+            vec3 linearToSdr(vec3 linear) {
+                vec3 sdr = clamp(linear * 100.0, 0.0, 1.0);
+                vec3 lo = sdr * 12.92;
+                vec3 hi = 1.055 * pow(sdr, vec3(0.4166666667)) - 0.055;
+                return mix(lo, hi, step(vec3(0.0031308), sdr));
+            }
+
             void main() {
                 vec3 color = texture2D(uTexture, vTextureCoord).rgb;
-                if (uIsHdr != 0) {
+                if (uIsHdr == 1) {
                     color = linearToPQ(color);
+                } else if (uIsHdr == 2) {
+                    color = linearToSdr(color);
                 }
                 gl_FragColor = vec4(color, 1.0);
             }
@@ -177,6 +195,17 @@ private const val WARP_FRAGMENT_SHADER = """
                 return pow(numerator / denominator, vec3(m2));
             }
 
+            // HDR 8 present (uIsHdr == 2): the source holds linear light on the PQ scale, where
+            // 1.0 is 10000 nits and 100-nit reference white sits at 0.01. Scale so reference
+            // white lands on SDR full white, clip everything above it (the plain clip
+            // tone-map), then apply the sRGB OETF an untagged 8-bit surface is read with.
+            vec3 linearToSdr(vec3 linear) {
+                vec3 sdr = clamp(linear * 100.0, 0.0, 1.0);
+                vec3 lo = sdr * 12.92;
+                vec3 hi = 1.055 * pow(sdr, vec3(0.4166666667)) - 0.055;
+                return mix(lo, hi, step(vec3(0.0031308), sdr));
+            }
+
             void main() {
                 vec2 p = vTextureCoord * uTargetSize - 0.5;
                 vec2 g = (p + uMotionOffset) / uMotionGrid;
@@ -223,8 +252,10 @@ private const val WARP_FRAGMENT_SHADER = """
                     }
                     blended = mix(termF, termB, uTimestep);
                 }
-                if (uIsHdr != 0) {
+                if (uIsHdr == 1) {
                     blended = linearToPQ(blended);
+                } else if (uIsHdr == 2) {
+                    blended = linearToSdr(blended);
                 }
                 gl_FragColor = vec4(blended, 1.0);
             }
@@ -288,6 +319,17 @@ private const val WARP_FRAGMENT_SHADER = """
                 return pow(numerator / denominator, vec3(m2));
             }
 
+            // HDR 8 present (uIsHdr == 2): the source holds linear light on the PQ scale, where
+            // 1.0 is 10000 nits and 100-nit reference white sits at 0.01. Scale so reference
+            // white lands on SDR full white, clip everything above it (the plain clip
+            // tone-map), then apply the sRGB OETF an untagged 8-bit surface is read with.
+            vec3 linearToSdr(vec3 linear) {
+                vec3 sdr = clamp(linear * 100.0, 0.0, 1.0);
+                vec3 lo = sdr * 12.92;
+                vec3 hi = 1.055 * pow(sdr, vec3(0.4166666667)) - 0.055;
+                return mix(lo, hi, step(vec3(0.0031308), sdr));
+            }
+
             void main() {
                 // The quad's V runs opposite to framebuffer row order: the vertex at the top of the
                 // viewport carries v = 0 but lands in framebuffer row height-1. Sampling at
@@ -314,8 +356,10 @@ private const val WARP_FRAGMENT_SHADER = """
                         merged = mix(cur, his, clamp(w * gate * uStrength, 0.0, 1.0));
                     }
                 }
-                if (uIsHdr != 0) {
+                if (uIsHdr == 1) {
                     merged = linearToPQ(merged);
+                } else if (uIsHdr == 2) {
+                    merged = linearToSdr(merged);
                 }
                 gl_FragColor = vec4(merged, 1.0);
             }
@@ -413,20 +457,28 @@ private const val WARP_FRAGMENT_SHADER = """
     var denoiseStrength = 1f
 
     /**
-     * Whether the shaders must convert their input to PQ before writing it out.
+     * What the shaders must convert their input to before writing it out; the value is pushed
+     * straight into the `uIsHdr` int uniform of the blit, warp and denoise programs:
      *
-     * Going true runs the output invariant: an HDR source presented into a window surface whose
-     * config has fewer than ten bits per channel loses the precision the whole HDR path exists to
-     * keep, and loses it silently, because the picture still appears. The setter escalates that
-     * through [onHdrOutputInvariant] rather than downgrading the request, since downgrading is
-     * exactly the workaround the pipeline is not allowed to fall back to.
+     *  * [HDR_OUTPUT_SDR] (0) - passthrough; the source is display-encoded SDR already.
+     *  * [HDR_OUTPUT_PQ] (1) - linear light to PQ code values, for an output tagged HDR (HDR 10).
+     *  * [HDR_OUTPUT_SDR8] (2) - linear light to the sRGB OETF with the PQ-scale 100-nit
+     *    reference white normalised to 1.0 and the highlights above it clipped: an HDR source
+     *    presented as 8-bit SDR with no HDR metadata (HDR 8).
+     *
+     * Going [HDR_OUTPUT_PQ] runs the output invariant: an HDR source presented into a window
+     * surface whose config has fewer than ten bits per channel loses the precision the whole HDR
+     * path exists to keep, and loses it silently, because the picture still appears. The setter
+     * escalates that through [onHdrOutputInvariant] rather than downgrading the request, since
+     * downgrading is exactly the workaround the pipeline is not allowed to fall back to.
+     * [HDR_OUTPUT_SDR8] deliberately skips it: an 8-bit surface is what that mode asks for.
      */
     @Volatile
-    var isHdr = false
+    var hdrOutputMode = HDR_OUTPUT_SDR
         set(value) {
             if (field == value) return
             field = value
-            if (value) enforceHdrOutputInvariant("isHdr turned on")
+            if (value == HDR_OUTPUT_PQ) enforceHdrOutputInvariant("HDR 10 output turned on")
         }
 
     /**
@@ -880,7 +932,7 @@ private const val WARP_FRAGMENT_SHADER = """
                 "attempt=$windowConfigAttempt eglConfig=${describeConfig()} " +
                 "colorBits=$outputColorBits bits10BitConfigAvailable=${tenBitConfigAvailable()})"
         )
-        if (isHdr) enforceHdrOutputInvariant("surface created")
+        if (hdrOutputMode == HDR_OUTPUT_PQ) enforceHdrOutputInvariant("surface created")
     }
 
     /** Adds a preview consumer while the primary window is the encoder input Surface. */
@@ -1335,7 +1387,7 @@ private const val WARP_FRAGMENT_SHADER = """
         // difference is a stretched or invisible frame, and one glUniform2f is not worth it.
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
-        GLES20.glUniform1i(uIsHdrHandle, if (isHdr) 1 else 0)
+        GLES20.glUniform1i(uIsHdrHandle, hdrOutputMode)
 
         // The quad no longer covers the whole surface whenever the aspect ratios differ, so the
         // bars are painted black instead of leaving the previous frame's contents on screen.
@@ -1436,7 +1488,7 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glUniform1i(uTextureHandle, 0)
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
-        GLES20.glUniform1i(uIsHdrHandle, if (isHdr) 1 else 0)
+        GLES20.glUniform1i(uIsHdrHandle, hdrOutputMode)
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         vertexBuffer.position(0)
@@ -1738,7 +1790,7 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glUniform2f(denUMotionOffset, motionOffset, motionOffset)
         GLES20.glUniform1f(denUHasHistory, if (src != 0) 1.0f else 0.0f)
         GLES20.glUniform1f(denUStrength, denoiseStrength)
-        GLES20.glUniform1i(denUIsHdr, if (isHdr) 1 else 0)
+        GLES20.glUniform1i(denUIsHdr, hdrOutputMode)
         // Always full frame: this pass writes a texture, it does not letterbox into a surface, so
         // it must not touch contentScaleX/Y - the present that follows shares those two.
         GLES20.glUniform2f(denUContentScale, 1.0f, 1.0f)
@@ -1943,7 +1995,7 @@ private const val WARP_FRAGMENT_SHADER = """
         val motionOffset = motionOffsetFor(warpGridStep)
         GLES20.glUniform2f(warpUMotionOffset, motionOffset, motionOffset)
         GLES20.glUniform1i(warpUBlendMode, warpBlendMode)
-        GLES20.glUniform1i(warpUIsHdr, if (isHdr) 1 else 0)
+        GLES20.glUniform1i(warpUIsHdr, hdrOutputMode)
 
         updateContentScale(targetWidth, targetHeight, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(warpUContentScale, contentScaleX, contentScaleY)
@@ -2029,7 +2081,7 @@ private const val WARP_FRAGMENT_SHADER = """
 
         updateContentScale(width, height, surfaceWidth, surfaceHeight)
         GLES20.glUniform2f(uContentScaleHandle, contentScaleX, contentScaleY)
-        GLES20.glUniform1i(uIsHdrHandle, if (isHdr) 1 else 0)
+        GLES20.glUniform1i(uIsHdrHandle, hdrOutputMode)
 
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)

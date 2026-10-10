@@ -36,7 +36,10 @@ class AppModule {
      * Processing settings entry drive it through the [RifeController] interface.
      */
     @Single(binds = [RifeController::class])
-    fun provideRifeController(context: Context): RifeController = RifeEngineController(context)
+    fun provideRifeController(
+        context: Context,
+        preferencesRepository: PreferencesRepository,
+    ): RifeController = RifeEngineController(context, preferencesRepository)
 
     @Single
     fun provideImageLoader(

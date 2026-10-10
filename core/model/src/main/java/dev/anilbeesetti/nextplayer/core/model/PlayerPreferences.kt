@@ -55,6 +55,7 @@ data class PlayerPreferences(
     val fastDvdNetEnabled: Boolean = false,
     val denoiseLevel: DenoiseLevelSetting = DenoiseLevelSetting.BALANCED,
     val svPlayerSettings: SvPlayerSettings = SvPlayerSettings(),
+    val hdr10Enabled: Boolean = true,
 
     // UDP Streaming Preferences (Phase E/F transport to TV box)
     val udpStreamingEnabled: Boolean = false,

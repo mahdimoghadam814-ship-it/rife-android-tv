@@ -580,4 +580,6 @@
     <string name="denoise_level_light">Light</string>
     <string name="denoise_level_balanced">Balanced</string>
     <string name="denoise_level_strong">Strong</string>
+    <string name="hdr10_processing">HDR 10 Processing</string>
+    <string name="hdr10_processing_description">On: HDR content stays on the HDR 10 path (PQ, tagged output). Off: HDR content is converted to 8-bit SDR for output with no HDR metadata</string>
 </resources>
