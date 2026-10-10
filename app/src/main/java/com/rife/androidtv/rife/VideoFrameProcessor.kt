@@ -2162,19 +2162,15 @@ class VideoFrameProcessor(
                 timestampUs,
                 retainHdrSource,
             )
-
+            var completed = 0
+            // Only poll ONCE per frame to avoid blocking the worker. If no PBO is ready,
+            // we'll try again on the next frame. This prevents the worker from blocking
+            // on PBO fences and allows true pipelining.
             val tPollStart = System.nanoTime()
-            var completedCount = 0
-            // Drain all ready PBOs. If the ring is nearly full, wait up to 5ms for the head to finish
-            // to avoid overflowing and dropping the entire ring.
-            while (true) {
-                val info = grabber.nextReadbackInfo() ?: break
+            val info = grabber.nextReadbackInfo()
+            if (info != null) {
                 val completedPixels = obtainFrameBuffer(info.width, info.height)
-
-                // Use a 5ms timeout ONLY if the ring is getting dangerously full (>= 3 pending)
-                val waitTimeoutNs = if (grabber.pendingPboCount >= 3) 5_000_000L else 0L
-                val ready = grabber.pollReadback(completedPixels, waitTimeoutNs)
-
+                val ready = grabber.pollReadback(completedPixels)
                 if (ready != null) {
                     queueCapturedFrame(
                         FrameData(
@@ -2185,17 +2181,17 @@ class VideoFrameProcessor(
                         ),
                         ready.sourceTextureId,
                     )
-                    completedCount++
+                    completed++
                 } else {
                     releaseFrameBuffer(completedPixels)
-                    // Head not ready yet, and we already tried waiting if it was full.
-                    break
+                    // PBO not ready yet, will retry next frame
                 }
             }
-
             nsPoll += System.nanoTime() - tPollStart
             nsReadback += System.nanoTime() - tCaptureStart
             if (!queued) droppedFrameCount++
+            // If we queued but didn't complete any, we'll poll again next frame
+            if (queued && completed == 0) return
             return
         }
 

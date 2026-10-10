@@ -388,13 +388,12 @@ class OesFrameGrabber {
     }
 
     /** Maps only a signaled PBO, copies into the reusable CPU analysis buffer, then releases it. */
-    fun pollReadback(out: ByteBuffer, waitTimeoutNs: Long = 0L): ReadbackFrameInfo? {
+    fun pollReadback(out: ByteBuffer): ReadbackFrameInfo? {
         val slot = pendingPbos.peekFirst() ?: return null
         val info = slot.info ?: return null
         val sync = slot.fence
         if (sync != 0L) {
-            val flags = if (waitTimeoutNs > 0) GLES30.GL_SYNC_FLUSH_COMMANDS_BIT else 0
-            val wait = GLES30.glClientWaitSync(sync, flags, waitTimeoutNs)
+            val wait = GLES30.glClientWaitSync(sync, 0, 0L)
             if (wait != GLES30.GL_CONDITION_SATISFIED &&
                 wait != GLES30.GL_ALREADY_SIGNALED
             ) return null
