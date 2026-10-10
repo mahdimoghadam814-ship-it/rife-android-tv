@@ -216,7 +216,7 @@ class VideoFrameProcessor(
          * intervals (see maxQueueLatencyMs()); this floor is what the bound was before it
          * adapted, so high-rate sources keep the original latency behaviour.
          */
-        private const val MIN_QUEUE_LATENCY_MS = 16L
+        private const val MIN_QUEUE_LATENCY_MS = 250L
 
         /** Dataspace the source probe could not read: API below 33, or the getter threw. */
         private const val DATA_SPACE_NOT_QUERIED = -2
