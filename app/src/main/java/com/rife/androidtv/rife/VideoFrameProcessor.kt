@@ -2661,11 +2661,13 @@ class VideoFrameProcessor(
                 val denoised = if (isHdrSource()) {
                     false
                 } else {
-                    // Offload CPU denoise to separate executor
-                    val denoiseFuture = denoiseExecutor.submit {
+                    // Offload CPU denoise to separate executor. Callable (not Runnable) is
+                    // required: submit(Runnable) returns Future<Void> whose get() is null,
+                    // and `null as Boolean` throws "null cannot be cast to non-null type".
+                    val denoiseFuture = denoiseExecutor.submit(java.util.concurrent.Callable {
                         fastDvdNetEngine.denoiseFrameBuffer(nextFrame.pixels, rifeInputW, rifeInputH, den1Buf)
-                    }
-                    denoiseFuture.get() as Boolean
+                    })
+                    denoiseFuture.get() ?: false
                 }
                 if (denoised) {
                     // DIAGNOSTICS: Log checksum after FastDVDnet pass-through
@@ -2708,16 +2710,18 @@ class VideoFrameProcessor(
         if (fastDvdNetEngine.isEnabled && !gpuDenoiseWanted && !isHdrSource() &&
             den0Buf != null && den1Buf != null
         ) {
-            // Offload CPU denoise to separate executor to keep worker free for capture/render
-            val denoiseFuture = denoiseExecutor.submit {
+            // Offload CPU denoise to separate executor. Callable (not Runnable) is required:
+            // submit(Runnable) returns Future<Void> whose get() is null, and
+            // `null as Pair` throws "null cannot be cast to non-null type".
+            val denoiseFuture = denoiseExecutor.submit(java.util.concurrent.Callable {
                 val denoisedPrev = fastDvdNetEngine.denoiseFrameBuffer(in0Buf, rifeInputW, rifeInputH, den0Buf)
                 val denoisedNext = fastDvdNetEngine.denoiseFrameBuffer(in1Buf, rifeInputW, rifeInputH, den1Buf)
                 Pair(denoisedPrev, denoisedNext)
-            }
+            })
             // Wait for denoise to complete (this is a blocking wait, but on the worker thread
             // we can yield to other tasks. For true async, we'd need callback-based continuation,
             // but this already moves the heavy CPU work off the worker thread during the wait.)
-            val result = denoiseFuture.get() as Pair<Boolean, Boolean>
+            val result = denoiseFuture.get() ?: Pair(false, false)
             val (denoisedPrev, denoisedNext) = result
             if (denoisedPrev && denoisedNext) {
                 src0Buf = den0Buf
