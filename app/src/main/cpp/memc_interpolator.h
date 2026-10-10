@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace rife {
@@ -173,7 +174,10 @@ public:
     // Replaces the SVPlayer tuning surface. Takes effect on the next motionField()/interpolate()
     // call; the caller only writes it from the pipeline thread while a frame pair is not in
     // flight, so it needs no lock of its own.
-    void setSvConfig(const SvConfig& config) { sv_config_ = config; }
+    void setSvConfig(const SvConfig& config) {
+        std::lock_guard<std::mutex> lk(interp_mutex_);
+        sv_config_ = config;
+    }
     const SvConfig& svConfig() const { return sv_config_; }
 
     // Wall-clock duration of the most recent interpolate() call, for diagnostics.
@@ -325,6 +329,7 @@ private:
     std::atomic<bool> dirty_{false};
 
     std::unique_ptr<MemcPool> pool_;
+    std::mutex interp_mutex_;
 
     // Scratch, allocated once per resolution instead of per frame.
     std::vector<uint8_t> luma0_, luma1_;

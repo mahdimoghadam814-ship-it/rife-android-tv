@@ -408,14 +408,30 @@ private:
                 if (stop_.load(std::memory_order_acquire)) return;
                 std::unique_lock<std::mutex> lk(m_);
                 seen = gen_.load(std::memory_order_relaxed);
+                if (!fn_) {
+                    // Spurious wakeup or state corruption - skip this iteration
+                    continue;
+                }
                 copy = *fn_;
                 b = begin_ + index * chunk_;
                 e = std::min(end_, b + chunk_);
+                // Clamp to valid range
+                if (b < begin_) b = begin_;
+                if (e > end_) e = end_;
             }
             long long workNs = 0;
-            if (e > b) {
+            if (e > b && copy) {
                 const auto tWork = std::chrono::steady_clock::now();
-                copy(b, e);
+                try {
+                    copy(b, e);
+                } catch (const std::exception& ex) {
+                    // Log and continue - don't let a worker exception crash the process
+                    __android_log_print(ANDROID_LOG_ERROR, "SVP",
+                        "Worker %d caught exception: %s", index, ex.what());
+                } catch (...) {
+                    __android_log_print(ANDROID_LOG_ERROR, "SVP",
+                        "Worker %d caught unknown exception", index);
+                }
                 workNs = nsSince(tWork);
             }
             {
@@ -462,12 +478,14 @@ MemcInterpolator::MemcInterpolator() : pool_(new MemcPool()) {}
 MemcInterpolator::~MemcInterpolator() = default;
 
 void MemcInterpolator::setThreadCount(int threads) {
+    std::lock_guard<std::mutex> lk(interp_mutex_);
     const int t = threads < 1 ? 1 : (threads > 8 ? 8 : threads);
     threads_.store(t, std::memory_order_relaxed);
     pool_->ensureCount(t);
 }
 
 void MemcInterpolator::reset() {
+    std::lock_guard<std::mutex> lk(interp_mutex_);
     dirty_.store(true, std::memory_order_release);
 }
 
@@ -1465,12 +1483,14 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
 }
 
 bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
-                                   int srcW, int srcHeight,
-                                   int targetWidth, int targetHeight,
-                                   float timestep,
-                                   uint8_t* out) {
+                                    int srcW, int srcHeight,
+                                    int targetWidth, int targetHeight,
+                                    float timestep,
+                                    uint8_t* out) {
     if (!out) return false;
     if (timestep < 0.0f || timestep > 1.0f) return false;
+
+    std::lock_guard<std::mutex> lk(interp_mutex_);
 
     const auto t0 = std::chrono::steady_clock::now();
     const uint8_t* a = nullptr;
@@ -1653,12 +1673,14 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
 }
 
 bool MemcInterpolator::motionField(const uint8_t* src0, const uint8_t* src1,
-                                   int srcW, int srcHeight,
-                                   int targetWidth, int targetHeight,
-                                   uint8_t* outMv, size_t outMvBytes,
-                                   bool forwardOnly) {
+                                    int srcW, int srcHeight,
+                                    int targetWidth, int targetHeight,
+                                    uint8_t* outMv, size_t outMvBytes,
+                                    bool forwardOnly) {
     if (!outMv) return false;
     if (outMvBytes < motionFieldBytes(targetWidth, targetHeight, blockStep())) return false;
+
+    std::lock_guard<std::mutex> lk(interp_mutex_);
 
     const auto t0 = std::chrono::steady_clock::now();
     if (!prepare(src0, src1, srcW, srcHeight, targetWidth, targetHeight, forwardOnly)) {
