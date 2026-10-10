@@ -48,7 +48,8 @@ data class FrameData(
     val pixels: ByteBuffer,
     val timestampUs: Long,
     val width: Int,
-    val height: Int
+    val height: Int,
+    val enqueuedNs: Long = System.nanoTime()
 )
 
 data class Statistics(
@@ -361,6 +362,7 @@ class VideoFrameProcessor(
     private val motionExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "SvpMotionWorker").apply { isDaemon = true }
     }
+    private var cachedOffThreadMotionBuf: ByteBuffer? = null
 
     /** CPU denoise (FastDVDnet) runs on a separate executor to keep the worker free for capture/render. */
     private val denoiseExecutor = Executors.newSingleThreadExecutor { task ->
@@ -2160,15 +2162,19 @@ class VideoFrameProcessor(
                 timestampUs,
                 retainHdrSource,
             )
-            var completed = 0
-            // Only poll ONCE per frame to avoid blocking the worker. If no PBO is ready,
-            // we'll try again on the next frame. This prevents the worker from blocking
-            // on PBO fences and allows true pipelining.
+
             val tPollStart = System.nanoTime()
-            val info = grabber.nextReadbackInfo()
-            if (info != null) {
+            var completedCount = 0
+            // Drain all ready PBOs. If the ring is nearly full, wait up to 5ms for the head to finish
+            // to avoid overflowing and dropping the entire ring.
+            while (true) {
+                val info = grabber.nextReadbackInfo() ?: break
                 val completedPixels = obtainFrameBuffer(info.width, info.height)
-                val ready = grabber.pollReadback(completedPixels)
+
+                // Use a 5ms timeout ONLY if the ring is getting dangerously full (>= 3 pending)
+                val waitTimeoutNs = if (grabber.pendingPboCount >= 3) 5_000_000L else 0L
+                val ready = grabber.pollReadback(completedPixels, waitTimeoutNs)
+
                 if (ready != null) {
                     queueCapturedFrame(
                         FrameData(
@@ -2179,17 +2185,17 @@ class VideoFrameProcessor(
                         ),
                         ready.sourceTextureId,
                     )
-                    completed++
+                    completedCount++
                 } else {
                     releaseFrameBuffer(completedPixels)
-                    // PBO not ready yet, will retry next frame
+                    // Head not ready yet, and we already tried waiting if it was full.
+                    break
                 }
             }
+
             nsPoll += System.nanoTime() - tPollStart
             nsReadback += System.nanoTime() - tCaptureStart
             if (!queued) droppedFrameCount++
-            // If we queued but didn't complete any, we'll poll again next frame
-            if (queued && completed == 0) return
             return
         }
 
@@ -2281,18 +2287,18 @@ class VideoFrameProcessor(
         val maxQueueNs = maxQueueLatencyMs * 1_000_000L
         while (true) {
             val head = frameQueue.peek() ?: break
-            val ageNs = nowNs - (head.timestampUs * 1000L)
+            val ageNs = nowNs - head.enqueuedNs
             if (ageNs <= maxQueueNs) break
-            frameQueue.poll()?.let { 
+            frameQueue.poll()?.let {
                 Log.w(TAG, "Discarding stale frame: queueLatencyMs=${ageNs / 1_000_000L} > ${maxQueueLatencyMs}ms")
                 releaseFrameBuffer(it.pixels)
                 droppedFrameCount++
             }
         }
-        
+
         val nextFrame = frameQueue.poll() ?: return
         // Track queue latency for this frame
-        val queueLatencyMs = (nowNs - (nextFrame.timestampUs * 1000L)) / 1_000_000L
+        val queueLatencyMs = (nowNs - nextFrame.enqueuedNs) / 1_000_000L
         nsQueueLatency += queueLatencyMs
         queueLatencySamples++
         
@@ -2442,7 +2448,12 @@ class VideoFrameProcessor(
             if (bytes <= 0L || bytes > Int.MAX_VALUE) {
                 PreparedMotion(null, false, System.nanoTime() - started)
             } else {
-                val field = ByteBuffer.allocateDirect(bytes.toInt())
+                var field = cachedOffThreadMotionBuf
+                if (field == null || field.capacity() < bytes) {
+                    field = ByteBuffer.allocateDirect(bytes.toInt())
+                    cachedOffThreadMotionBuf = field
+                }
+                field.clear()
                 val ready = NativeEngine.computeMotionField(
                     prev.pixels, nextFrame.pixels,
                     nextFrame.width, nextFrame.height,
