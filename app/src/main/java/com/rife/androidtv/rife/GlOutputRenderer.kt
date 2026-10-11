@@ -709,6 +709,23 @@ private const val WARP_FRAGMENT_SHADER = """
         get() = program != 0 && textureId != 0
 
     /**
+     * Whether the window (or encoder) surface this renderer presents into exists. Every render
+     * path drops without it, so a pipeline that captures and processes but never presents shows
+     * this as false - which is the difference between "frames are broken" and "frames never
+     * reached a surface".
+     */
+    val hasWindowSurface: Boolean
+        get() = windowSurface != null
+
+    /**
+     * Presentation attempts that failed (eglSwapBuffers error, or nothing submitted at all).
+     * Counted so the stage heartbeat can distinguish a frame that was drawn from a frame that
+     * actually reached the compositor.
+     */
+    var swapFailureCount = 0
+        private set
+
+    /**
      * Creates the blit program and the output texture. Must be called with [context] current.
      */
     fun init(context: EGLContext) {
@@ -830,12 +847,12 @@ private const val WARP_FRAGMENT_SHADER = """
         if (warpAPosition < 0 || warpATexCoord < 0 || warpUContentScale < 0 ||
             warpUFrame0 < 0 || warpUFrame1 < 0 || warpUMotion < 0 || warpUMask < 0 ||
             warpUTargetSize < 0 || warpUMotionGrid < 0 || warpUMotionOffset < 0 ||
-            warpUBlendMode < 0 ||
-            warpUTimestep < 0
+            warpUBlendMode < 0 || warpUTimestep < 0 ||
+            warpUIsHdr < 0 || warpUSourceEncoded < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
             warpProgram = 0
-            Log.w(TAG, "warp program is missing expected uniforms; CPU warp stays in use")
+            Log.w(TAG, "warp program is missing expected uniforms (uIsHdr=$warpUIsHdr uSourceEncoded=$warpUSourceEncoded); CPU warp stays in use")
             return
         }
 
@@ -904,10 +921,10 @@ private const val WARP_FRAGMENT_SHADER = """
             denUTargetSize < 0 || denUMotionGrid < 0 || denUMotionOffset < 0 ||
             denUHasHistory < 0 ||
             denUStrength < 0 ||
-            denUIsHdr < 0
+            denUIsHdr < 0 || denUSourceEncoded < 0
         ) {
             GLES20.glDeleteProgram(newProgram)
-            Log.w(TAG, "denoise program is missing a location; the stage keeps its own path")
+            Log.w(TAG, "denoise program is missing a location (uIsHdr=$denUIsHdr uSourceEncoded=$denUSourceEncoded); the stage keeps its own path")
             return
         }
         denoiseProgram = newProgram
@@ -954,37 +971,48 @@ private const val WARP_FRAGMENT_SHADER = """
         surfaceWidth = 0
         surfaceHeight = 0
         if (surface == null || !surface.isValid) {
+            // A null surface is the normal release path. A non-null but invalid one is not: the
+            // caller published an output surface that is already gone, and without this log the
+            // window surface silently never exists while every later present reports
+            // "renderer not ready" - a black screen with no line pointing at its cause.
+            if (surface != null) {
+                Log.w(
+                    TAG,
+                    "Output window surface NOT created: published Surface is invalid; " +
+                        "presentation stays off until a valid one arrives"
+                )
+            }
             return
         }
 
-        // The 10-bit config is tried first, because an HDR source presented through it is the
-        // whole point of the HDR path and eglCreateWindowSurface's EGL_BAD_MATCH is a clean
-        // signal: a native window whose buffers are RGBA8888 rejects the RGB10_A2 config and the
-        // 8-bit fallback below gets the same surface the old order would have produced. A window
-        // that can carry 10-bit - a Main10 encoder input, or a display queue that has already
-        // renegotiated its format for HDR - would never be reached by the old 8-bit-first order,
-        // because the 8-bit config matches it too and the 10-bit attempt never ran.
-        val hdr = intArrayOf(
-            EGL14.EGL_RED_SIZE, 10,
-            EGL14.EGL_GREEN_SIZE, 10,
-            EGL14.EGL_BLUE_SIZE, 10,
-            EGL14.EGL_ALPHA_SIZE, 2,
+        // Try the 8-bit config first: the display SurfaceView is RGBA8888 on virtually all
+        // Android devices (TVs and phones alike), so this succeeds immediately and avoids
+        // the complexity of 10-bit display surfaces where dataspace tagging can behave
+        // inconsistently. The 10-bit config is kept as a fallback for encoder input surfaces
+        // (Main10) which require it; those surfaces reject the 8-bit config with EGL_BAD_MATCH.
+        val strict = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
             EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
             EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
             EGL14.EGL_NONE
         )
-        var created = createWindowSurface(display, surface, hdr, attempt = "hdr10bit")
+        var created = createWindowSurface(display, surface, strict, attempt = "strict8bit")
         if (created == null) {
-            val strict = intArrayOf(
-                EGL14.EGL_RED_SIZE, 8,
-                EGL14.EGL_GREEN_SIZE, 8,
-                EGL14.EGL_BLUE_SIZE, 8,
-                EGL14.EGL_ALPHA_SIZE, 8,
+            // An encoder input surface (Main10) is a 10-bit buffer and rejects the 8-bit config.
+            // RGB10_A2 is the 10-bit layout every GLES2 driver exposes.
+            val hdr = intArrayOf(
+                EGL14.EGL_RED_SIZE, 10,
+                EGL14.EGL_GREEN_SIZE, 10,
+                EGL14.EGL_BLUE_SIZE, 10,
+                EGL14.EGL_ALPHA_SIZE, 2,
                 EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
                 EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
                 EGL14.EGL_NONE
             )
-            created = createWindowSurface(display, surface, strict, attempt = "strict8bit")
+            created = createWindowSurface(display, surface, hdr, attempt = "hdr10bit")
         }
         if (created == null) {
             // Neither fixed width matched the surface. An EGL_BAD_MATCH from
@@ -1368,7 +1396,9 @@ private const val WARP_FRAGMENT_SHADER = """
             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, context)
             if (mirrorSuccess) mirrorSwapCount++
         }
-        return primarySuccess && mirrorSuccess
+        val success = primarySuccess && mirrorSuccess
+        if (!success) swapFailureCount++
+        return success
     }
 
     private fun releaseMirrorSurface() {
@@ -1409,7 +1439,16 @@ private const val WARP_FRAGMENT_SHADER = """
         if (program == 0 || textureId == 0 || eglDisplay == null ||
             eglContext == null || eglSurface == null
         ) {
-            Log.w(TAG, "render(): renderer not ready (program=$program texture=$textureId); frame dropped")
+            // The old message printed only program/texture, which are almost always non-zero by
+            // the time a frame reaches here: a missing window surface - the one condition that
+            // blacks out every mode - was indistinguishable from a failed init.
+            Log.w(
+                TAG,
+                "render(): renderer not ready (program=$program texture=$textureId " +
+                    "display=${eglDisplay != null} context=${eglContext != null} " +
+                    "window=${eglSurface != null} " +
+                    "publishedSurfaceValid=${outputSurface?.isValid == true}); frame dropped"
+            )
             return false
         }
         if (width <= 0 || height <= 0) {
@@ -1431,11 +1470,10 @@ private const val WARP_FRAGMENT_SHADER = """
         }
 
         var tPhase = System.nanoTime()
-        if (surfaceWidth != width || surfaceHeight != height) {
-            // The window surface keeps the size of the SurfaceView; the viewport is set from the
-            // actual surface size so the frame is never stretched by a stale viewport.
-            updateSurfaceSize()
-        }
+        // Always re-query: the old gate compared the frame size against the surface size, so a
+        // resize that left the frame dimensions equal to the stale surface dimensions was never
+        // noticed and the viewport stayed wrong. The query is idempotent and only logs on change.
+        updateSurfaceSize()
         nsCurrent += System.nanoTime() - tPhase
 
         if (VERBOSE_DIAGNOSTICS) {
@@ -1553,16 +1591,32 @@ private const val WARP_FRAGMENT_SHADER = """
 
     /** Presents a retained GPU source texture without converting it through the RGBA8 analysis buffer. */
     fun renderTexture(sourceTexture: Int, width: Int, height: Int, timestampNs: Long = 0L): Boolean {
-        val eglDisplay = display ?: return false
-        val eglContext = context ?: return false
-        val eglSurface = windowSurface ?: return false
-        if (program == 0 || sourceTexture == 0 || width <= 0 || height <= 0 ||
-            !bindWindow(eglDisplay, eglSurface, eglContext)
-        ) {
-            Log.w(TAG, "renderTexture(): renderer not ready (program=$program sourceTexture=$sourceTexture); frame dropped")
+        val eglDisplay = display
+        val eglContext = context
+        val eglSurface = windowSurface
+        if (eglDisplay == null || eglContext == null || eglSurface == null) {
+            // This is the HDR present path; the old `?: return false` dropped the frame with no
+            // line at all, so a missing window surface looked like an HDR-only fault.
+            Log.w(
+                TAG,
+                "renderTexture(): EGL not ready (display=${eglDisplay != null} " +
+                    "context=${eglContext != null} window=${eglSurface != null}); frame dropped"
+            )
             return false
         }
-        if (surfaceWidth != width || surfaceHeight != height) updateSurfaceSize()
+        if (program == 0 || sourceTexture == 0 || width <= 0 || height <= 0) {
+            Log.w(
+                TAG,
+                "renderTexture(): renderer not ready (program=$program sourceTexture=$sourceTexture " +
+                    "size=${width}x$height); frame dropped"
+            )
+            return false
+        }
+        if (!bindWindow(eglDisplay, eglSurface, eglContext)) {
+            Log.w(TAG, "renderTexture(): bindWindow failed; frame dropped")
+            return false
+        }
+        updateSurfaceSize()
         GLES20.glViewport(0, 0, surfaceWidth.coerceAtLeast(1), surfaceHeight.coerceAtLeast(1))
         GLES20.glUseProgram(program)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -1674,9 +1728,8 @@ private const val WARP_FRAGMENT_SHADER = """
         }
 
         var tPhase = System.nanoTime()
-        if (surfaceWidth != targetWidth || surfaceHeight != targetHeight) {
-            updateSurfaceSize()
-        }
+        // Unconditional: gating on frame size vs surface size (the wrong axis) missed resizes.
+        updateSurfaceSize()
         nsCurrent += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
@@ -1945,8 +1998,12 @@ private const val WARP_FRAGMENT_SHADER = """
         if (frame0 == 0 || frame1 == 0 || denTexW != srcWidth || denTexH != srcHeight) {
             return false
         }
+        // The timestamps have to travel: without them outputTimestampNs keeps whatever the last
+        // path left there, and eglPresentationTimeANDROID then stamps a non-monotonic time, which
+        // the BufferQueue is entitled to drop - a frame that was drawn but never shown.
         return renderWarpWithTextures(
-            frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight, timesteps
+            frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight,
+            timesteps, timestamps
         )
     }
 
@@ -1969,6 +2026,14 @@ private const val WARP_FRAGMENT_SHADER = """
         val eglContext = context
         val eglSurface = windowSurface
         if (warpProgram == 0 || eglDisplay == null || eglContext == null || eglSurface == null) {
+            // Logged, unlike the other guards here: this is the state that blacks out the screen
+            // while the caller can only report "the warp refused the pair".
+            Log.w(
+                TAG,
+                "renderWarpWithTextures: warp program not ready or EGL invalid " +
+                    "(program=$warpProgram display=${eglDisplay != null} " +
+                    "context=${eglContext != null} window=${eglSurface != null})"
+            )
             return false
         }
         if (srcWidth <= 0 || srcHeight <= 0 || targetWidth <= 0 || targetHeight <= 0) {
@@ -1983,9 +2048,8 @@ private const val WARP_FRAGMENT_SHADER = """
         }
 
         var tPhase = System.nanoTime()
-        if (surfaceWidth != targetWidth || surfaceHeight != targetHeight) {
-            updateSurfaceSize()
-        }
+        // Unconditional: gating on frame size vs surface size (the wrong axis) missed resizes.
+        updateSurfaceSize()
         nsCurrent += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
@@ -2095,6 +2159,10 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glClearColor(0.0f, 0.0f, 0.0f, 1.0f)
 
         // Per-timestep: only update timestep uniform, draw, swap
+        // A timestep is only "presented" once its swap succeeded. Reporting true here for a draw
+        // that never reached the compositor told the caller the pair was on screen, which both
+        // counted it as submitted and suppressed the CPU fallback that would have shown it.
+        var presented = false
         for (index in timesteps.indices) {
             val timestep = timesteps[index]
             if (timestep < 0.0f || timestep > 1.0f) {
@@ -2115,7 +2183,9 @@ private const val WARP_FRAGMENT_SHADER = """
                 Log.e(TAG, "Warp blit failed with GL error 0x${error.toString(16)}")
             }
 
-            swapBuffers(eglDisplay, eglSurface, "warp")
+            if (swapBuffers(eglDisplay, eglSurface, "warp")) {
+                presented = true
+            }
             renderCalls++
             warpDrawCalls++
         }
@@ -2123,7 +2193,7 @@ private const val WARP_FRAGMENT_SHADER = """
         GLES20.glDisableVertexAttribArray(warpAPosition)
         GLES20.glDisableVertexAttribArray(warpATexCoord)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, 0)
-        return true
+        return presented
     }
 
     /**
@@ -2151,9 +2221,8 @@ private const val WARP_FRAGMENT_SHADER = """
         }
 
         var tPhase = System.nanoTime()
-        if (surfaceWidth != width || surfaceHeight != height) {
-            updateSurfaceSize()
-        }
+        // Unconditional: gating on frame size vs surface size (the wrong axis) missed resizes.
+        updateSurfaceSize()
         nsCurrent += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
@@ -2516,6 +2585,13 @@ private const val WARP_FRAGMENT_SHADER = """
             resetDenoise()
             GLES20.glDeleteProgram(denoiseProgram)
             denoiseProgram = 0
+        }
+        // The blit program was never deleted and `program` was never cleared, so init()'s
+        // `if (program != 0) return` would accept a released renderer whose texture no longer
+        // exists: isInitialized() then stays false and every frame drops as "not initialized".
+        if (program != 0) {
+            GLES20.glDeleteProgram(program)
+            program = 0
         }
         denDPosition = -1
         denDTexCoord = -1

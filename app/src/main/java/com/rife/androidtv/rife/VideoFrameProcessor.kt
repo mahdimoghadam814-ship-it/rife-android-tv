@@ -175,6 +175,14 @@ class VideoFrameProcessor(
         private const val STAGE_HEARTBEAT_MS = 1000L
 
         /**
+         * Cadence of the retry that re-applies the published output surface to a renderer that
+         * has no window surface. Creating an EGL window surface can fail for reasons only the
+         * driver knows; retrying every frame would repeat an expensive failing call at the frame
+         * rate, so the attempt is bounded and each outcome is logged.
+         */
+        private const val OUTPUT_SURFACE_RETRY_NS = 1_000_000_000L
+
+        /**
          * Bounds the frame-pair interval the interpolation level divides. The same [1ms, 1s] window the
          * AUTO policy already accepts, so a seek or a bogus timestamp cannot produce a step of
          * zero or a backlog of frames.
@@ -405,6 +413,7 @@ class VideoFrameProcessor(
     private var surfaceRecoveryRequested = false
     private var lastCaptureContentLogNs = 0L
     private var lastRenderContentLogNs = 0L
+    private var lastOutputSurfaceRetryNs = 0L
     private var diagnosticOutputStartCount = 0L
     private var diagnosticWindowStartNs = 0L
     private var droppedOutputAtWindowStart = 0L
@@ -954,13 +963,29 @@ class VideoFrameProcessor(
             val stalled = isProcessingEnabled && stagePrevArrival > 0 && arrival == 0L
             if (moved || stalled) {
                 val f = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
+                // Names the first output-side gate that is not satisfied. A black screen with
+                // healthy fps here means capture and processing are fine and the fault is
+                // presentation; window=N is the state where nothing can reach the compositor.
+                val renderer = outputRenderer
+                val outSurface = activeOutputSurface()
+                val gates =
+                    "gates=pendingInfo=${if (pendingOutputSurfaceInfo != null) "Y" else "N"} " +
+                        "surface=${when {
+                            outSurface == null -> "none"
+                            outSurface.isValid -> "valid"
+                            else -> "INVALID"
+                        }} " +
+                        "renderer=${if (renderer != null) "Y" else "N"} " +
+                        "init=${renderer?.isInitialized == true} " +
+                        "window=${renderer?.hasWindowSurface == true} " +
+                        "swapFail=${renderer?.swapFailureCount ?: 0}"
                 Log.i(
                     TAG,
                     "[STAGE] decoderArrivalFps=${f(arrival / windowSec)} " +
                         "capturedFps=${f(captured / windowSec)} " +
                         "processedFps=${f(processed / windowSec)} " +
                         "generatedOutFps=${f(submitted / windowSec)} " +
-                        "droppedIn=$droppedIn droppedOut=$droppedOut queue=$queue" +
+                        "droppedIn=$droppedIn droppedOut=$droppedOut queue=$queue $gates" +
                         if (stalled) " | STALLED: decoder delivered no frames this second" else ""
                 )
             }
@@ -1058,34 +1083,46 @@ class VideoFrameProcessor(
             val display = bundleDisplay()
             if (display == null) {
                 // The output window surface can only be created on the input bundle's EGL
-                // display, and the renderer is (re)created together with that bundle, so there
-                // is nothing to update while no bundle exists.
+                // display. The pending surface is kept so the renderer built together with that
+                // bundle can be given it by applyPendingOutputSurface(); nothing is lost here.
                 Log.i(TAG, "Output surface update skipped: no input EGL display yet")
                 return@runOnWorker
             }
             if (outputSurfaceInfo == null) {
                 Log.i(TAG, "Output surface released")
-                if (encodeSurface == null) {
-                    outputRenderer?.setOutputSurface(display, null)
-                } else {
-                    outputRenderer?.setMirrorOutputSurface(null)
-                }
             } else {
                 Log.i(
                     TAG,
                     "Output surface set: ${outputSurfaceInfo.width}x${outputSurfaceInfo.height} " +
                         "(orientationDegrees=${outputSurfaceInfo.orientationDegrees})"
                 )
-                // While an encode owns the window the preview surface is only recorded: swapping
-                // the renderer over to it mid-encode would tear the stream in half.
-                if (encodeSurface == null) {
-                    outputRenderer?.setOutputSurface(display, outputSurfaceInfo.surface)
-                    applyOutputDataSpace()
-                } else {
-                    outputRenderer?.setMirrorOutputSurface(outputSurfaceInfo.surface)
-                    applyOutputDataSpace()
-                }
             }
+            applyPendingOutputSurface()
+        }
+    }
+
+    /**
+     * Points the current renderer at [pendingOutputSurfaceInfo]. The renderer's lifetime is tied
+     * to the input EGL bundle, not to that field: recreating the bundle builds a fresh renderer
+     * that has never seen the published surface. Without this call at every swap point the
+     * surface stays published, every guard in renderBufferToOutput passes, and every present
+     * still drops inside render() because no window surface exists - a black screen with healthy
+     * frame counts and no error.
+     *
+     * While an encode owns the window the preview surface is only recorded: swapping the
+     * renderer over to it mid-encode would tear the stream in half.
+     */
+    private fun applyPendingOutputSurface() {
+        val renderer = outputRenderer ?: return
+        val display = bundleDisplay() ?: return
+        val info = pendingOutputSurfaceInfo
+        if (encodeSurface == null) {
+            renderer.setOutputSurface(display, info?.surface)
+        } else {
+            renderer.setMirrorOutputSurface(info?.surface)
+        }
+        if (info != null) {
+            applyOutputDataSpace()
         }
     }
 
@@ -1739,6 +1776,19 @@ class VideoFrameProcessor(
             inputSurfaceReady = true
             inputSurfaceEverAttached = false
             registerInputStreamOnWorker(currentFrameInfo())
+
+            // The renderer above is brand new and knows nothing about an output surface that was
+            // published while the previous one existed (or before this bundle had a display).
+            // Re-apply it here, or every present drops inside render() with no window surface.
+            val pendingOut = pendingOutputSurfaceInfo
+            if (pendingOut != null) {
+                applyPendingOutputSurface()
+                Log.i(
+                    TAG,
+                    "Re-applied pending output surface ${pendingOut.width}x${pendingOut.height} " +
+                        "to the recreated renderer"
+                )
+            }
 
             Log.i(
                 TAG,
@@ -3651,6 +3701,26 @@ class VideoFrameProcessor(
             Log.w(TAG, "renderBufferToOutput: renderer not initialized; frame dropped")
             droppedOutputFrameCount++
             return
+        }
+        if (!renderer.hasWindowSurface && pendingOutputSurfaceInfo != null) {
+            // Every guard above passes while render() still drops: the window surface was never
+            // created for this renderer (creation failed earlier, or the renderer was rebuilt
+            // after the surface was published). Retry instead of dropping forever - the first
+            // success re-applies the dataspace tag as well.
+            val retryNs = System.nanoTime()
+            if (retryNs - lastOutputSurfaceRetryNs >= OUTPUT_SURFACE_RETRY_NS) {
+                lastOutputSurfaceRetryNs = retryNs
+                Log.w(
+                    TAG,
+                    "renderBufferToOutput: output surface is published but the renderer has no " +
+                        "window surface; re-applying it"
+                )
+                applyPendingOutputSurface()
+            }
+            if (!renderer.hasWindowSurface) {
+                droppedOutputFrameCount++
+                return
+            }
         }
 
         val requiredBytes = width.toLong() * height.toLong() * 4L
