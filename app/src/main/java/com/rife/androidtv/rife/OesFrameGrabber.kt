@@ -342,6 +342,15 @@ class OesFrameGrabber {
             true
         } catch (t: Throwable) {
             Log.w(TAG, "Could not queue pixel-buffer readback", t)
+            // The slot is annotated before the fence is created. Leaving info/fence set would
+            // make `firstOrNull { it.info == null }` skip this slot from now on, silently
+            // shrinking the ring until every frame is refused as "pbo ring full".
+            if (slot.fence != 0L) {
+                GLES30.glDeleteSync(slot.fence)
+                slot.fence = 0L
+            }
+            slot.info = null
+            pendingPbos.remove(slot)
             releaseSourceTexture(sourceTextureId)
             false
         }
@@ -394,6 +403,18 @@ class OesFrameGrabber {
         val sync = slot.fence
         if (sync != 0L) {
             val wait = GLES30.glClientWaitSync(sync, 0, 0L)
+            if (wait == GLES30.GL_WAIT_FAILED) {
+                // A dead or invalid sync never becomes satisfied, so this head would report
+                // "not ready" forever, the ring would fill, and capture would refuse every
+                // frame - a permanent blackout that looks like a healthy pipeline from outside.
+                Log.w(
+                    TAG,
+                    "glClientWaitSync failed (GL error 0x${GLES20.glGetError().toString(16)}); " +
+                        "discarding the stuck readback"
+                )
+                discardHeadPbo(slot)
+                return null
+            }
             if (wait != GLES30.GL_CONDITION_SATISFIED &&
                 wait != GLES30.GL_ALREADY_SIGNALED
             ) return null
@@ -405,7 +426,13 @@ class OesFrameGrabber {
         }
         try {
             val mapped = GlUtil.mapPixelBufferObject(slot.id, byteCount.toInt())
-                ?: return null
+            if (mapped == null) {
+                // Signalled but unmap-able: same wedge as a dead sync - the head would never
+                // advance and the ring would refuse every subsequent frame.
+                Log.w(TAG, "Pixel-buffer map returned null on a signaled readback; discarding it")
+                discardHeadPbo(slot)
+                return null
+            }
             out.clear()
             out.limit(byteCount.toInt())
             mapped.position(0)
