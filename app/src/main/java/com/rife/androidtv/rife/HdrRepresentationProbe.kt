@@ -346,9 +346,11 @@ class HdrRepresentationProbe {
         // The magnitude test, stated in the log so the line carries the conclusion and not only
         // the evidence. The verdict is published on [representation], which the present path reads
         // to select the shader conversion - measured, not guessed.
+        // LINEAR threshold tightened: require a slightly higher p99 ceiling and a non-trivial
+        // max intensity to avoid misclassifying dark/fade-to-black scenes as linear light.
         representation = when {
             mean >= 0.10 || p50 >= 0.10 -> Representation.ENCODED
-            mean <= 0.02 && p99 <= 0.25 -> Representation.LINEAR
+            mean <= 0.02 && p99 <= 0.15 && maxIntensity > 0.05 -> Representation.LINEAR
             else -> Representation.INDETERMINATE
         }
         val verdict = when (representation) {
