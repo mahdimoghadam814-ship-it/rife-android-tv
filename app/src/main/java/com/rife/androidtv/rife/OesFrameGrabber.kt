@@ -48,13 +48,17 @@ class OesFrameGrabber {
     /**
      * A per-frame HDR to SDR conversion request. [transfer] is [TONEMAP_TRANSFER_PQ] or
      * [TONEMAP_TRANSFER_HLG]; [bt2020ToBt709] applies the primaries matrix when the source
-     * reports BT.2020. The capture shader decodes the transfer curve, converts the primaries,
-     * rolls luminance off onto SDR white and encodes to sRGB, so the RGBA8 analysis buffer
-     * holds ordinary SDR pixels and everything downstream runs unchanged.
+     * reports BT.2020; [sourceIsLinear] indicates the OES samples are already linear light on
+     * the PQ scale (HdrRepresentationProbe LINEAR) rather than PQ/HLG-encoded code values, so
+     * the shader must skip the transfer decode. The capture shader decodes the transfer curve
+     * when needed, converts the primaries, rolls luminance off onto SDR white and encodes to
+     * sRGB, so the RGBA8 analysis buffer holds ordinary SDR pixels and everything downstream
+     * runs unchanged.
      */
     data class ToneMapRequest(
         val transfer: Int,
         val bt2020ToBt709: Boolean,
+        val sourceIsLinear: Boolean = false,
     )
 
     data class ReadbackFrameInfo(
@@ -134,8 +138,10 @@ class OesFrameGrabber {
             tmTextureHandle = GLES20.glGetUniformLocation(newProgram, "uTexture")
             tmTransferHandle = GLES20.glGetUniformLocation(newProgram, "uTransfer")
             tmBt2020Handle = GLES20.glGetUniformLocation(newProgram, "uBt2020ToBt709")
+            tmSourceLinearHandle = GLES20.glGetUniformLocation(newProgram, "uSourceLinear")
             if (tmPositionHandle < 0 || tmTexCoordHandle < 0 || tmStMatrixHandle < 0 ||
-                tmTextureHandle < 0 || tmTransferHandle < 0 || tmBt2020Handle < 0
+                tmTextureHandle < 0 || tmTransferHandle < 0 || tmBt2020Handle < 0 ||
+                tmSourceLinearHandle < 0
             ) {
                 GLES20.glDeleteProgram(newProgram)
                 throw IllegalStateException("tone-map program is missing expected uniforms")
@@ -219,10 +225,14 @@ class OesFrameGrabber {
          * PQ (ST 2084) decodes through its EOTF onto the same 0..1 = 0..10000 nits scale
          * GlOutputRenderer uses, scaled here to 100-nit-relative units; HLG decodes through the
          * inverse OETF to scene light and the ^1.2 system OOTF, with scene 1.0 placed at 10
-         * (1000 nits). The optional BT.2020 to BT.709 matrix runs on that linear light, then a
-         * Hable luminance roll-off (reference white preserved just below SDR full, highlights up
-         * to a 1000-nit white point compressed into range) scales RGB by the luma ratio so hue
-         * is kept, and the sRGB OETF produces the untagged 8-bit values the rest of the pipeline
+         * (1000 nits). When [uSourceLinear] is set the samples are already linear light on the
+         * PQ scale (measured by HdrRepresentationProbe), so the transfer decode is skipped and
+         * the values scale directly to 100-nit-relative units - applying an EOTF to already-
+         * linear light is what produces the washed-out overexposure this branch guards against.
+         * The optional BT.2020 to BT.709 matrix runs on that linear light, then a Hable
+         * luminance roll-off (reference white preserved just below SDR full, highlights up to a
+         * 1000-nit white point compressed into range) scales RGB by the luma ratio so hue is
+         * kept, and the sRGB OETF produces the untagged 8-bit values the rest of the pipeline
          * already treats as SDR.
          */
         private const val TONEMAP_FRAGMENT_SHADER = """
@@ -236,6 +246,7 @@ class OesFrameGrabber {
             uniform samplerExternalOES uTexture;
             uniform int uTransfer;
             uniform int uBt2020ToBt709;
+            uniform int uSourceLinear;
 
             // SMPTE ST 2084 (PQ) EOTF: code values to linear light, 0..1 over 0..10000 nits.
             vec3 pqToLinear(vec3 pq) {
@@ -284,7 +295,12 @@ class OesFrameGrabber {
             void main() {
                 vec3 code = texture2D(uTexture, vTextureCoord).rgb;
                 vec3 lin100;
-                if (uTransfer == 2) {
+                if (uSourceLinear == 1) {
+                    // Already linear light on the PQ scale (0..1 = 0..10000 nits): no EOTF,
+                    // just rescale to 100-nit-relative units so the tone-map below is
+                    // numerically identical to the encoded path's post-decode values.
+                    lin100 = max(code, vec3(0.0)) * 100.0;
+                } else if (uTransfer == 2) {
                     lin100 = pow(max(hlgToScene(code), vec3(0.0)), vec3(1.2)) * 10.0;
                 } else {
                     lin100 = pqToLinear(code) * 100.0;
@@ -342,6 +358,7 @@ class OesFrameGrabber {
     private var tmTextureHandle = -1
     private var tmTransferHandle = -1
     private var tmBt2020Handle = -1
+    private var tmSourceLinearHandle = -1
     private var toneMapFailed = false
 
     private var externalTextureId = 0
@@ -697,6 +714,7 @@ class OesFrameGrabber {
                 },
             )
             GLES20.glUniform1i(tmBt2020Handle, if (toneMap.bt2020ToBt709) 1 else 0)
+            GLES20.glUniform1i(tmSourceLinearHandle, if (toneMap.sourceIsLinear) 1 else 0)
         } else {
             GLES20.glUniform1i(uTextureHandle, TEXTURE_UNIT)
             GLES20.glUniformMatrix4fv(uStMatrixHandle, 1, false, stMatrix, 0)
@@ -896,6 +914,7 @@ class OesFrameGrabber {
                     },
                 )
                 GLES20.glUniform1i(tmBt2020Handle, if (toneMap.bt2020ToBt709) 1 else 0)
+                GLES20.glUniform1i(tmSourceLinearHandle, if (toneMap.sourceIsLinear) 1 else 0)
             } else {
                 GLES20.glUniform1i(uTextureHandle, TEXTURE_UNIT)
                 GLES20.glUniformMatrix4fv(uStMatrixHandle, 1, false, stMatrix, 0)
@@ -1140,6 +1159,7 @@ class OesFrameGrabber {
         tmTextureHandle = -1
         tmTransferHandle = -1
         tmBt2020Handle = -1
+        tmSourceLinearHandle = -1
         toneMapFailed = false
         releaseFbo()
         if (program != 0) {

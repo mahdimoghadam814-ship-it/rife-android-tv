@@ -218,6 +218,44 @@ class VideoFrameProcessor(
             enabled && (colorTransfer == C.COLOR_TRANSFER_ST2084 ||
                 colorTransfer == C.COLOR_TRANSFER_HLG)
 
+        /**
+         * The full conversion-selection policy for one frame: whether the capture-stage tone-map
+         * runs, and if so whether the OES samples are already linear light (skip the transfer
+         * decode) or encoded PQ/HLG code values (apply it). UNKNOWN defers to the HDR retain
+         * path so the probe can measure - applying an EOTF to unmeasured samples is the
+         * destructive guess this policy exists to prevent. INDETERMINATE is treated as encoded
+         * (the probe's own [HdrRepresentationProbe.sourceIsEncoded] rule). Extracted as a pure
+         * decision so the policy can be tested without a pipeline or a GL context.
+         */
+        internal fun toneMapDecision(
+            enabled: Boolean,
+            colorTransfer: Int?,
+            shaderCompiled: Boolean,
+            representation: HdrRepresentationProbe.Representation?,
+        ): ToneMapDecision = when {
+            !enabled || colorTransfer == null ||
+                !(colorTransfer == C.COLOR_TRANSFER_ST2084 ||
+                    colorTransfer == C.COLOR_TRANSFER_HLG) ->
+                ToneMapDecision.HdrRetain("not-wanted")
+            !shaderCompiled ->
+                ToneMapDecision.HdrRetain("shader-unavailable")
+            representation == null || representation == HdrRepresentationProbe.Representation.UNKNOWN ->
+                ToneMapDecision.HdrRetain("representation-unmeasured")
+            representation == HdrRepresentationProbe.Representation.LINEAR ->
+                ToneMapDecision.ToneMap(sourceIsLinear = true)
+            else ->
+                // ENCODED, or INDETERMINATE which the probe's own rule treats as encoded.
+                ToneMapDecision.ToneMap(sourceIsLinear = false)
+        }
+
+        /** What the capture should do for this frame, from [toneMapDecision]. */
+        internal sealed class ToneMapDecision {
+            /** Keep the HDR retain path; [reason] is logged once per stream. */
+            data class HdrRetain(val reason: String) : ToneMapDecision()
+            /** Run the capture-stage tone-map; [sourceIsLinear] skips the transfer decode. */
+            data class ToneMap(val sourceIsLinear: Boolean) : ToneMapDecision()
+        }
+
         /** The supported interpolation ratios, matching the clamp in setMemcLevel(). */
         private const val MIN_INTERPOLATION_RATIO = 2.0
         private const val MAX_INTERPOLATION_RATIO = 4.0
@@ -678,7 +716,8 @@ class VideoFrameProcessor(
     @Volatile private var hdrToSdrToneMap: Boolean = false
     /** Set on the worker once the grabber has answered whether its tone-map shader compiled. */
     @Volatile private var toneMapAvailable: Boolean = false
-    private var toneMapUnavailableLogged = false
+    /** One-shot log: representation still UNKNOWN or shader unavailable while tone-map is on. */
+    private var toneMapBootstrapLogged = false
     /** Sticky request for the next capture, rebuilt from the volatiles on every cycle. */
     private var toneMapRequest: OesFrameGrabber.ToneMapRequest? = null
 
@@ -872,7 +911,7 @@ class VideoFrameProcessor(
         if (hdrToSdrToneMap == enabled) return
         hdrToSdrToneMap = enabled
         runOnWorker("setHdrToSdrToneMap") {
-            toneMapUnavailableLogged = false
+            toneMapBootstrapLogged = false
             resetPipelineOnWorker("tonemap_toggled")
             applyOutputDataSpace()
             logToneMapState("user=${if (enabled) "on" else "off"}")
@@ -881,17 +920,37 @@ class VideoFrameProcessor(
 
     /**
      * True while the tone-map conversion should run for the current source: the toggle is on,
-     * the source positively reports PQ or HLG, and the capture shader compiled. Read on the
-     * worker only; [toneMapAvailable] is answered by the first capture that needs it.
+     * the source positively reports PQ or HLG, the capture shader compiled, AND the probe has
+     * measured the OES representation (so the shader knows whether to apply the transfer
+     * decode). Until the probe reports, the HDR retain path runs for one or more frames so the
+     * probe can measure; applying an EOTF to unmeasured samples is what produced the washed-out
+     * overexposure this gate exists to prevent. Read on the worker only; [toneMapAvailable] is
+     * answered by the first capture that needs it.
      */
     private fun toneMapEffective(): Boolean =
-        hdrToSdrToneMap && toneMapWanted(true, sourceColorInfo?.colorTransfer) && toneMapAvailable
+        hdrToSdrToneMap && toneMapWanted(true, sourceColorInfo?.colorTransfer) &&
+            toneMapAvailable && toneMapRepresentationKnown()
+
+    /**
+     * Whether [HdrRepresentationProbe] has measured this stream's OES samples as either encoded
+     * or linear. UNKNOWN means no successful measurement yet - the capture must not apply a
+     * transfer decode until this is answered, because the wrong decode is destructive while
+     * the right one is a no-op on the wrong input only if we skip it.
+     */
+    private fun toneMapRepresentationKnown(): Boolean {
+        val rep = hdrRepresentationProbe?.representation ?: return false
+        return rep == HdrRepresentationProbe.Representation.ENCODED ||
+            rep == HdrRepresentationProbe.Representation.LINEAR ||
+            rep == HdrRepresentationProbe.Representation.INDETERMINATE
+    }
 
     private fun logToneMapState(detail: String) {
+        val rep = hdrRepresentationProbe?.representation
         val mode = if (toneMapEffective()) {
-            "active transfer=${sourceColorInfo?.colorTransfer}"
+            "active transfer=${sourceColorInfo?.colorTransfer} rep=$rep " +
+                "linear=${rep == HdrRepresentationProbe.Representation.LINEAR}"
         } else {
-            "inactive hdr10=$hdr10Enabled available=$toneMapAvailable"
+            "inactive hdr10=$hdr10Enabled available=$toneMapAvailable rep=$rep"
         }
         Log.i(TAG, "[TONEMAP] $mode ($detail)")
     }
@@ -1315,6 +1374,7 @@ class VideoFrameProcessor(
         runOnWorker("setSourceColorInfo") {
             hdrCaptureUnavailableLogged = false
             hdrProbeLogged = false
+            toneMapBootstrapLogged = false
             hdrRepresentationProbe?.reset()
             Log.i(TAG, "[HDR] inputColor=${colorInfo ?: "unknown"} outputDataSpace=$outputDataSpace")
             logToneMapState("source changed")
@@ -2338,19 +2398,24 @@ class VideoFrameProcessor(
         }
         val tCaptureStart = timingStartNs
         val timestampUs = texture.timestamp / 1000L
-        // HDR to SDR conversion, decided per frame: the shader is compiled on first use, and a
-        // failed compile falls back to the retained-HDR path (with a single log) rather than
-        // presenting PQ code values as SDR.
+        // HDR to SDR conversion, decided per frame via the pure [toneMapDecision] policy: the
+        // shader is compiled on first use, a failed compile falls back to the retained-HDR path
+        // (with a single log), and the probe must have measured the OES representation before
+        // any transfer decode runs - applying an EOTF to unmeasured samples is what produced
+        // the washed-out overexposure this gate exists to prevent.
         var toneMapReq: OesFrameGrabber.ToneMapRequest? = null
-        if (hdrToSdrToneMap && isHdrSource() && toneMapWanted(true, sourceColorInfo?.colorTransfer)) {
-            if (!toneMapAvailable && !grabber.ensureToneMap()) {
-                if (!toneMapUnavailableLogged) {
-                    toneMapUnavailableLogged = true
-                    Log.e(TAG, "[TONEMAP] capture shader unavailable; keeping the HDR path")
+        val decision = toneMapDecision(
+            enabled = hdrToSdrToneMap && isHdrSource(),
+            colorTransfer = sourceColorInfo?.colorTransfer,
+            shaderCompiled = toneMapAvailable || grabber.ensureToneMap(),
+            representation = hdrRepresentationProbe?.representation,
+        )
+        when (decision) {
+            is VideoFrameProcessor.Companion.ToneMapDecision.ToneMap -> {
+                if (!toneMapAvailable) {
+                    toneMapAvailable = true
+                    logToneMapState("shader ready")
                 }
-            } else {
-                val wasAvailable = toneMapAvailable
-                toneMapAvailable = true
                 toneMapReq = OesFrameGrabber.ToneMapRequest(
                     transfer = if (sourceColorInfo?.colorTransfer == C.COLOR_TRANSFER_HLG) {
                         OesFrameGrabber.TONEMAP_TRANSFER_HLG
@@ -2358,8 +2423,15 @@ class VideoFrameProcessor(
                         OesFrameGrabber.TONEMAP_TRANSFER_PQ
                     },
                     bt2020ToBt709 = sourceColorInfo?.colorSpace == C.COLOR_SPACE_BT2020,
+                    sourceIsLinear = decision.sourceIsLinear,
                 )
-                if (!wasAvailable) logToneMapState("shader ready")
+            }
+            is VideoFrameProcessor.Companion.ToneMapDecision.HdrRetain -> {
+                // Log the interesting retain reasons once; "not-wanted" is the normal SDR case.
+                if (decision.reason != "not-wanted" && !toneMapBootstrapLogged) {
+                    toneMapBootstrapLogged = true
+                    Log.i(TAG, "[TONEMAP] retaining HDR: ${decision.reason}")
+                }
             }
         }
         val retainHdrSource = isHdrSource() && toneMapReq == null
@@ -2381,36 +2453,37 @@ class VideoFrameProcessor(
                 retainHdrSource,
                 toneMapReq,
             )
-            var completed = 0
-            // Only poll ONCE per frame to avoid blocking the worker. If no PBO is ready,
-            // we'll try again on the next frame. This prevents the worker from blocking
-            // on PBO fences and allows true pipelining.
+            // Drain every signaled PBO each capture, not just one. Polling once per frame
+            // leaves the ring at the mercy of the GPU's completion order: when the readback
+            // takes longer than the frame interval at high resolutions, the oldest slot is
+            // still unsignaled at poll time, the ring fills, and enqueueReadbackWithRecovery
+            // then discards every pending frame in one jump - the periodic stall that reads
+            // as wave-like judder. pollReadback uses a zero-timeout glClientWaitSync, so a
+            // drain loop costs nothing while the head is not ready and empties the ring
+            // whenever the GPU finishes several readbacks between captures.
             val tPollStart = System.nanoTime()
-            val info = grabber.nextReadbackInfo()
-            if (info != null) {
+            while (true) {
+                val info = grabber.nextReadbackInfo() ?: break
                 val completedPixels = obtainFrameBuffer(info.width, info.height)
                 val ready = grabber.pollReadback(completedPixels)
-                if (ready != null) {
-                    queueCapturedFrame(
-                        FrameData(
-                            pixels = completedPixels,
-                            timestampUs = ready.timestampUs,
-                            width = ready.width,
-                            height = ready.height,
-                        ),
-                        ready.sourceTextureId,
-                    )
-                    completed++
-                } else {
+                if (ready == null) {
                     releaseFrameBuffer(completedPixels)
-                    // PBO not ready yet, will retry next frame
+                    // Head PBO not signaled yet; it will be retried on the next capture.
+                    break
                 }
+                queueCapturedFrame(
+                    FrameData(
+                        pixels = completedPixels,
+                        timestampUs = ready.timestampUs,
+                        width = ready.width,
+                        height = ready.height,
+                    ),
+                    ready.sourceTextureId,
+                )
             }
             nsPoll += System.nanoTime() - tPollStart
             nsReadback += System.nanoTime() - tCaptureStart
             if (!queued) droppedFrameCount++
-            // If we queued but didn't complete any, we'll poll again next frame
-            if (queued && completed == 0) return
             return
         }
 
