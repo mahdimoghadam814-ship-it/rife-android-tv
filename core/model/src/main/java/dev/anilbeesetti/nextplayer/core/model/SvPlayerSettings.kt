@@ -98,4 +98,16 @@ data class SvPlayerSettings(
     val sceneAdaptive: Boolean = true,
     /** Luma downscale the search runs at: 1 is full resolution, 2 is half. */
     val meScale: Int = 1,
+    /**
+     * Converts an HDR (PQ or HLG) source to SDR inside the pipeline instead of presenting the
+     * PQ code values through the HDR 10 / HDR 8 output modes.
+     *
+     * The conversion happens once, at capture: the OES frame is decoded (PQ EOTF or HLG inverse
+     * OETF + OOTF), converted from BT.2020 to BT.709 when the primaries say so, rolled off with
+     * a luminance tone curve and encoded to sRGB into the RGBA8 analysis buffer. Everything
+     * downstream - motion search, blend, denoise, the output window tag - then runs on ordinary
+     * SDR pixels, so the picture no longer depends on the display honouring HDR metadata. Only
+     * applies when the source actually reports PQ or HLG; an SDR source is untouched.
+     */
+    val hdrToSdrToneMap: Boolean = false,
 )

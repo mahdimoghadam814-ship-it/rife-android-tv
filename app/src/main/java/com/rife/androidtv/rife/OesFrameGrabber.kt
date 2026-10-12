@@ -45,6 +45,18 @@ import java.nio.FloatBuffer
 @UnstableApi
 class OesFrameGrabber {
 
+    /**
+     * A per-frame HDR to SDR conversion request. [transfer] is [TONEMAP_TRANSFER_PQ] or
+     * [TONEMAP_TRANSFER_HLG]; [bt2020ToBt709] applies the primaries matrix when the source
+     * reports BT.2020. The capture shader decodes the transfer curve, converts the primaries,
+     * rolls luminance off onto SDR white and encodes to sRGB, so the RGBA8 analysis buffer
+     * holds ordinary SDR pixels and everything downstream runs unchanged.
+     */
+    data class ToneMapRequest(
+        val transfer: Int,
+        val bt2020ToBt709: Boolean,
+    )
+
     data class ReadbackFrameInfo(
         val timestampUs: Long,
         val width: Int,
@@ -88,7 +100,56 @@ class OesFrameGrabber {
     fun readbackState(): String =
         "pbo=$pboSupported pending=${pendingPbos.size}/${pboSlots.size} " +
             "hdrLeases=${hdrSourceSlots.count { it.inUse }}/${hdrSourceSlots.size} " +
-            "hdrTex=${hdrSourceSlots.count { it.textureId != 0 }} copy=$copyProgram"
+            "hdrTex=${hdrSourceSlots.count { it.textureId != 0 }} copy=$copyProgram " +
+            "toneMap=${if (toneMapProgram != 0) "ready" else if (toneMapFailed) "failed" else "idle"}"
+
+    /**
+     * Compiles the HDR to SDR conversion program on first use. Must be called with the owning
+     * EGL context current. A compile failure is remembered so the caller can fall back to the
+     * retained-HDR path for the rest of the session instead of retrying every frame.
+     */
+    fun ensureToneMap(): Boolean {
+        if (toneMapProgram != 0) return true
+        if (toneMapFailed) return false
+        try {
+            val vertex = compileShader(GLES20.GL_VERTEX_SHADER, VERTEX_SHADER)
+            val fragment = compileShader(GLES20.GL_FRAGMENT_SHADER, TONEMAP_FRAGMENT_SHADER)
+            val newProgram = GLES20.glCreateProgram()
+            if (newProgram == 0) throw IllegalStateException("glCreateProgram failed")
+            GLES20.glAttachShader(newProgram, vertex)
+            GLES20.glAttachShader(newProgram, fragment)
+            GLES20.glLinkProgram(newProgram)
+            GLES20.glDeleteShader(vertex)
+            GLES20.glDeleteShader(fragment)
+            val status = IntArray(1)
+            GLES20.glGetProgramiv(newProgram, GLES20.GL_LINK_STATUS, status, 0)
+            if (status[0] != GLES20.GL_TRUE) {
+                val log = GLES20.glGetProgramInfoLog(newProgram)
+                GLES20.glDeleteProgram(newProgram)
+                throw IllegalStateException("tone-map program failed to link: $log")
+            }
+            tmPositionHandle = GLES20.glGetAttribLocation(newProgram, "aPosition")
+            tmTexCoordHandle = GLES20.glGetAttribLocation(newProgram, "aTextureCoord")
+            tmStMatrixHandle = GLES20.glGetUniformLocation(newProgram, "uSTMatrix")
+            tmTextureHandle = GLES20.glGetUniformLocation(newProgram, "uTexture")
+            tmTransferHandle = GLES20.glGetUniformLocation(newProgram, "uTransfer")
+            tmBt2020Handle = GLES20.glGetUniformLocation(newProgram, "uBt2020ToBt709")
+            if (tmPositionHandle < 0 || tmTexCoordHandle < 0 || tmStMatrixHandle < 0 ||
+                tmTextureHandle < 0 || tmTransferHandle < 0 || tmBt2020Handle < 0
+            ) {
+                GLES20.glDeleteProgram(newProgram)
+                throw IllegalStateException("tone-map program is missing expected uniforms")
+            }
+            toneMapProgram = newProgram
+            Log.i(TAG, "Tone-map program ready")
+            return true
+        } catch (t: Throwable) {
+            toneMapFailed = true
+            toneMapProgram = 0
+            Log.w(TAG, "HDR to SDR tone-map shader unavailable; keeping the HDR path", t)
+            return false
+        }
+    }
 
     /**
      * Every `false` from [enqueueReadback] discards a decoded frame, so a persistent failure would
@@ -113,6 +174,10 @@ class OesFrameGrabber {
          * references the pipeline constants it tracks.
          */
         internal const val HDR_SOURCE_SLOTS = 8
+
+        /** Tone-map transfer identifiers for [ToneMapRequest.transfer]. */
+        internal const val TONEMAP_TRANSFER_PQ = 1
+        internal const val TONEMAP_TRANSFER_HLG = 2
 
         /** One [RECOVER] line per second: enough to see a discard storm, cheap enough to keep. */
         private const val RECOVERY_LOG_INTERVAL_NS = 1_000_000_000L
@@ -148,6 +213,97 @@ class OesFrameGrabber {
             }
         """
 
+        /**
+         * HDR to SDR conversion, run at capture so the RGBA8 analysis buffer holds sRGB pixels.
+         *
+         * PQ (ST 2084) decodes through its EOTF onto the same 0..1 = 0..10000 nits scale
+         * GlOutputRenderer uses, scaled here to 100-nit-relative units; HLG decodes through the
+         * inverse OETF to scene light and the ^1.2 system OOTF, with scene 1.0 placed at 10
+         * (1000 nits). The optional BT.2020 to BT.709 matrix runs on that linear light, then a
+         * Hable luminance roll-off (reference white preserved just below SDR full, highlights up
+         * to a 1000-nit white point compressed into range) scales RGB by the luma ratio so hue
+         * is kept, and the sRGB OETF produces the untagged 8-bit values the rest of the pipeline
+         * already treats as SDR.
+         */
+        private const val TONEMAP_FRAGMENT_SHADER = """
+            #extension GL_OES_EGL_image_external : require
+            #ifdef GL_FRAGMENT_PRECISION_HIGH
+            precision highp float;
+            #else
+            precision mediump float;
+            #endif
+            varying vec2 vTextureCoord;
+            uniform samplerExternalOES uTexture;
+            uniform int uTransfer;
+            uniform int uBt2020ToBt709;
+
+            // SMPTE ST 2084 (PQ) EOTF: code values to linear light, 0..1 over 0..10000 nits.
+            vec3 pqToLinear(vec3 pq) {
+                const float m1 = 2610.0 / 4096.0;
+                const float m2 = 2523.0 / 4096.0 * 128.0;
+                const float c1 = 3424.0 / 4096.0;
+                const float c2 = 2413.0 / 4096.0 * 32.0;
+                const float c3 = 2392.0 / 4096.0 * 32.0;
+                vec3 cp = pow(max(pq, vec3(0.0)), vec3(1.0 / m2));
+                vec3 numerator = max(cp - vec3(c1), vec3(0.0));
+                vec3 denominator = vec3(c2) - vec3(c3) * cp;
+                return pow(numerator / denominator, vec3(1.0 / m1));
+            }
+
+            // ARIB STD-B67 (HLG) inverse OETF: display code values to scene light, 0..1.
+            vec3 hlgToScene(vec3 hlg) {
+                const float a = 0.17883277;
+                const float b = 1.0 - 4.0 * a;
+                const float c = 0.55991073;
+                vec3 e = max(hlg, vec3(0.0));
+                vec3 lo = e * e / 3.0;
+                vec3 hi = (exp((e - c) / a) + b) / 12.0;
+                return mix(lo, hi, step(vec3(0.5), e));
+            }
+
+            // BT.2020 to BT.709 primaries, column-major (applied to linear light).
+            mat3 bt2020To709Matrix() {
+                return mat3(
+                    1.6605, -0.1246, -0.0182,
+                    -0.5876, 1.1329, -0.1006,
+                    -0.0728, -0.0083, 1.1187
+                );
+            }
+
+            // Hable filmic curve, used as a scalar luminance roll-off normalized by hable(W).
+            float hable(float x) {
+                const float A = 0.22;
+                const float B = 0.30;
+                const float C = 0.10;
+                const float D = 0.20;
+                const float E = 0.01;
+                const float F = 0.30;
+                return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+            }
+
+            void main() {
+                vec3 code = texture2D(uTexture, vTextureCoord).rgb;
+                vec3 lin100;
+                if (uTransfer == 2) {
+                    lin100 = pow(max(hlgToScene(code), vec3(0.0)), vec3(1.2)) * 10.0;
+                } else {
+                    lin100 = pqToLinear(code) * 100.0;
+                }
+                if (uBt2020ToBt709 == 1) {
+                    lin100 = bt2020To709Matrix() * lin100;
+                }
+                lin100 = max(lin100, vec3(0.0));
+                const float W = 10.0;
+                float Y = dot(lin100, vec3(0.2126, 0.7152, 0.0722));
+                float mappedY = hable(Y) / hable(W);
+                float scale = Y > 1e-5 ? mappedY / Y : 0.0;
+                vec3 sdr = clamp(lin100 * scale, 0.0, 1.0);
+                vec3 lo = sdr * 12.92;
+                vec3 hi = 1.055 * pow(sdr, vec3(0.4166666667)) - 0.055;
+                gl_FragColor = vec4(mix(lo, hi, step(vec3(0.0031308), sdr)), 1.0);
+            }
+        """
+
         /** Clip-space positions of a full-screen triangle strip. */
         private val FULL_QUAD_VERTICES = floatArrayOf(
             -1.0f, -1.0f, 0.0f,
@@ -175,6 +331,18 @@ class OesFrameGrabber {
     private var aTextureCoordHandle = -1
     private var uStMatrixHandle = -1
     private var uTextureHandle = -1
+
+    // HDR to SDR conversion program, compiled on first request so the ordinary SDR path never
+    // pays for it. A failed compile is sticky: the caller falls back to the retained-HDR path
+    // rather than silently presenting PQ code values as SDR.
+    private var toneMapProgram = 0
+    private var tmPositionHandle = -1
+    private var tmTexCoordHandle = -1
+    private var tmStMatrixHandle = -1
+    private var tmTextureHandle = -1
+    private var tmTransferHandle = -1
+    private var tmBt2020Handle = -1
+    private var toneMapFailed = false
 
     private var externalTextureId = 0
 
@@ -295,9 +463,16 @@ class OesFrameGrabber {
         height: Int,
         timestampUs: Long,
         retainHdrSource: Boolean = false,
+        toneMap: ToneMapRequest? = null,
     ): Boolean {
         if (!pboSupported || width <= 0 || height <= 0) {
             return refuse("unsupported pbo=$pboSupported size=${width}x$height")
+        }
+        if (toneMap != null && toneMapProgram == 0) {
+            // The processor only passes a request after ensureToneMap() succeeded, so this is a
+            // defensive refusal: drawing without the conversion would present PQ code values as
+            // SDR, which is exactly what the tone-map path exists to prevent.
+            return refuse("tonemap requested but unavailable")
         }
         val bytesLong = width.toLong() * height.toLong() * 4L
         if (bytesLong <= 0L || bytesLong > Int.MAX_VALUE) {
@@ -333,7 +508,7 @@ class OesFrameGrabber {
                 releaseSourceTexture(sourceTextureId)
                 return refuse("hdr oes draw/copy")
             }
-        } else if (!drawOesToFbo(surfaceTexture, width, height)) {
+        } else if (!drawOesToFbo(surfaceTexture, width, height, toneMap)) {
             return refuse("oes draw")
         }
         return try {
@@ -371,8 +546,9 @@ class OesFrameGrabber {
         height: Int,
         timestampUs: Long,
         retainHdrSource: Boolean = false,
+        toneMap: ToneMapRequest? = null,
     ): Boolean {
-        val queued = enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource)
+        val queued = enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource, toneMap)
         if (!queued) {
             // The ring/leases are stuck. Discard everything and try once. The discard is what
             // frees the slots the retry needs - and it also throws decoded frames away, so at
@@ -390,7 +566,7 @@ class OesFrameGrabber {
                         "(each was a decoded frame); ${readbackState()}"
                 )
             }
-            return enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource)
+            return enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource, toneMap)
         }
         return true
     }
@@ -475,9 +651,14 @@ class OesFrameGrabber {
         slot.info = null
     }
 
-    private fun drawOesToFbo(surfaceTexture: SurfaceTexture, width: Int, height: Int): Boolean {
+    private fun drawOesToFbo(
+        surfaceTexture: SurfaceTexture,
+        width: Int,
+        height: Int,
+        toneMap: ToneMapRequest? = null,
+    ): Boolean {
         ensureFbo(width, height)
-        return drawOesToFramebuffer(surfaceTexture, width, height, fbo, fboTex)
+        return drawOesToFramebuffer(surfaceTexture, width, height, fbo, fboTex, toneMap)
     }
 
     private fun drawOesToFramebuffer(
@@ -486,8 +667,14 @@ class OesFrameGrabber {
         height: Int,
         framebuffer: Int,
         targetTexture: Int,
+        toneMap: ToneMapRequest? = null,
     ): Boolean {
         if (!isInitialized || width <= 0 || height <= 0) return false
+        // With a tone-map request the OES draw runs the conversion program instead of the plain
+        // sampler, so the RGBA8 target already holds SDR pixels - the retained-HDR branch above
+        // is never combined with it.
+        val useProgram = if (toneMap != null) toneMapProgram else program
+        if (useProgram == 0) return false
         surfaceTexture.getTransformMatrix(stMatrix)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, framebuffer)
         GLES20.glFramebufferTexture2D(
@@ -495,21 +682,37 @@ class OesFrameGrabber {
             GLES20.GL_TEXTURE_2D, targetTexture, 0,
         )
         GLES20.glViewport(0, 0, width, height)
-        GLES20.glUseProgram(program)
+        GLES20.glUseProgram(useProgram)
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + TEXTURE_UNIT)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
-        GLES20.glUniform1i(uTextureHandle, TEXTURE_UNIT)
-        GLES20.glUniformMatrix4fv(uStMatrixHandle, 1, false, stMatrix, 0)
+        if (toneMap != null) {
+            GLES20.glUniform1i(tmTextureHandle, TEXTURE_UNIT)
+            GLES20.glUniformMatrix4fv(tmStMatrixHandle, 1, false, stMatrix, 0)
+            GLES20.glUniform1i(
+                tmTransferHandle,
+                if (toneMap.transfer == TONEMAP_TRANSFER_HLG) {
+                    TONEMAP_TRANSFER_HLG
+                } else {
+                    TONEMAP_TRANSFER_PQ
+                },
+            )
+            GLES20.glUniform1i(tmBt2020Handle, if (toneMap.bt2020ToBt709) 1 else 0)
+        } else {
+            GLES20.glUniform1i(uTextureHandle, TEXTURE_UNIT)
+            GLES20.glUniformMatrix4fv(uStMatrixHandle, 1, false, stMatrix, 0)
+        }
+        val posHandle = if (toneMap != null) tmPositionHandle else aPositionHandle
+        val texHandle = if (toneMap != null) tmTexCoordHandle else aTextureCoordHandle
         vertexBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aPositionHandle)
-        GLES20.glVertexAttribPointer(aPositionHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
+        GLES20.glEnableVertexAttribArray(posHandle)
+        GLES20.glVertexAttribPointer(posHandle, 3, GLES20.GL_FLOAT, false, 12, vertexBuffer)
         texCoordBuffer.position(0)
-        GLES20.glEnableVertexAttribArray(aTextureCoordHandle)
-        GLES20.glVertexAttribPointer(aTextureCoordHandle, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
+        GLES20.glEnableVertexAttribArray(texHandle)
+        GLES20.glVertexAttribPointer(texHandle, 4, GLES20.GL_FLOAT, false, 16, texCoordBuffer)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
         val error = GLES20.glGetError()
-        GLES20.glDisableVertexAttribArray(aPositionHandle)
-        GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
+        GLES20.glDisableVertexAttribArray(posHandle)
+        GLES20.glDisableVertexAttribArray(texHandle)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
         GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         return error == GLES20.GL_NO_ERROR
@@ -641,12 +844,16 @@ class OesFrameGrabber {
         surfaceTexture: SurfaceTexture,
         targetWidth: Int,
         targetHeight: Int,
-        out: ByteBuffer
+        out: ByteBuffer,
+        toneMap: ToneMapRequest? = null,
     ): Boolean {
         val requiredBytes = targetWidth.toLong() * targetHeight.toLong() * 4L
         if (!isInitialized || targetWidth <= 0 || targetHeight <= 0) {
             return false
         }
+        if (toneMap != null && toneMapProgram == 0) return false
+        var posHandle = -1
+        var texHandle = -1
         if (requiredBytes > Int.MAX_VALUE) {
             Log.w(TAG, "read(${targetWidth}x$targetHeight) overflows Int")
             return false
@@ -667,19 +874,37 @@ class OesFrameGrabber {
 
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, fbo)
             GLES20.glViewport(0, 0, targetWidth, targetHeight)
-            GLES20.glUseProgram(program)
+            val useProgram = if (toneMap != null) toneMapProgram else program
+            GLES20.glUseProgram(useProgram)
 
             // Bind the decoded-frame texture explicitly on every draw: an unbound sampler reads
             // whatever texture unit 0 happens to contain and produces a black/garbage frame.
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0 + TEXTURE_UNIT)
             GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, externalTextureId)
-            GLES20.glUniform1i(uTextureHandle, TEXTURE_UNIT)
-            GLES20.glUniformMatrix4fv(uStMatrixHandle, 1, false, stMatrix, 0)
+
+            posHandle = if (toneMap != null) tmPositionHandle else aPositionHandle
+            texHandle = if (toneMap != null) tmTexCoordHandle else aTextureCoordHandle
+            if (toneMap != null) {
+                GLES20.glUniform1i(tmTextureHandle, TEXTURE_UNIT)
+                GLES20.glUniformMatrix4fv(tmStMatrixHandle, 1, false, stMatrix, 0)
+                GLES20.glUniform1i(
+                    tmTransferHandle,
+                    if (toneMap.transfer == TONEMAP_TRANSFER_HLG) {
+                        TONEMAP_TRANSFER_HLG
+                    } else {
+                        TONEMAP_TRANSFER_PQ
+                    },
+                )
+                GLES20.glUniform1i(tmBt2020Handle, if (toneMap.bt2020ToBt709) 1 else 0)
+            } else {
+                GLES20.glUniform1i(uTextureHandle, TEXTURE_UNIT)
+                GLES20.glUniformMatrix4fv(uStMatrixHandle, 1, false, stMatrix, 0)
+            }
 
             vertexBuffer.position(0)
-            GLES20.glEnableVertexAttribArray(aPositionHandle)
+            GLES20.glEnableVertexAttribArray(posHandle)
             GLES20.glVertexAttribPointer(
-                aPositionHandle,
+                posHandle,
                 3,
                 GLES20.GL_FLOAT,
                 false,
@@ -688,9 +913,9 @@ class OesFrameGrabber {
             )
 
             texCoordBuffer.position(0)
-            GLES20.glEnableVertexAttribArray(aTextureCoordHandle)
+            GLES20.glEnableVertexAttribArray(texHandle)
             GLES20.glVertexAttribPointer(
-                aTextureCoordHandle,
+                texHandle,
                 4,
                 GLES20.GL_FLOAT,
                 false,
@@ -740,9 +965,9 @@ class OesFrameGrabber {
             Log.e(TAG, "External texture readback failed", t)
             false
         } finally {
-            if (program != 0) {
-                GLES20.glDisableVertexAttribArray(aPositionHandle)
-                GLES20.glDisableVertexAttribArray(aTextureCoordHandle)
+            if (posHandle >= 0) GLES20.glDisableVertexAttribArray(posHandle)
+            if (texHandle >= 0) GLES20.glDisableVertexAttribArray(texHandle)
+            if (program != 0 || toneMapProgram != 0) {
                 GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, 0)
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             }
@@ -907,6 +1132,15 @@ class OesFrameGrabber {
         releaseHdrSources()
         if (copyProgram != 0) GLES20.glDeleteProgram(copyProgram)
         copyProgram = 0
+        if (toneMapProgram != 0) GLES20.glDeleteProgram(toneMapProgram)
+        toneMapProgram = 0
+        tmPositionHandle = -1
+        tmTexCoordHandle = -1
+        tmStMatrixHandle = -1
+        tmTextureHandle = -1
+        tmTransferHandle = -1
+        tmBt2020Handle = -1
+        toneMapFailed = false
         releaseFbo()
         if (program != 0) {
             GLES20.glDeleteProgram(program)

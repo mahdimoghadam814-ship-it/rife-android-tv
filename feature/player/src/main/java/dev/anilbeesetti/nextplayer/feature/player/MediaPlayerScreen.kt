@@ -458,6 +458,7 @@ internal fun MediaPlayerContent(
                 )
             },
             onUdpStreamingToggle = { onAction(PlayerAction.ToggleUdpStreaming) },
+            sourceIsHdr = ColorInfo.isTransferHdr(sourceVideoFormat.first),
         )
         if (volumeAndBrightnessGestureState != null && volumeState != null && brightnessState != null) {
             PlayerVerticalGestureIndicators(

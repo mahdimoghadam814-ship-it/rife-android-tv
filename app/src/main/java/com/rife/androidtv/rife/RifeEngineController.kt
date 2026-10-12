@@ -220,11 +220,15 @@ class RifeEngineController(
             if (settings.sceneAdaptive) 1 else 0,
             settings.meScale,
         )
+        // Not a native setting: the tone map is a capture-stage conversion inside the processor,
+        // so it is branched off before the values above reach the search.
+        processor.setHdrToSdrToneMap(settings.hdrToSdrToneMap)
         Log.i(
             TAG_LIFECYCLE,
             "SVPlayer settings: pq=${settings.performanceQuality} " +
                 "mask=${settings.artifactMaskLevel} subpel=${settings.subpel} " +
-                "overlap=${settings.overlap} lambda=${settings.penaltyLambda}"
+                "overlap=${settings.overlap} lambda=${settings.penaltyLambda} " +
+                "meScale=${settings.meScale} tonemap=${settings.hdrToSdrToneMap}"
         )
     }
 

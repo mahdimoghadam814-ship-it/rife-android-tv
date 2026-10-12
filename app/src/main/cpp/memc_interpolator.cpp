@@ -135,6 +135,12 @@ static inline int hpToPx(int hp) {
     return hp >= 0 ? (hp + 1) >> 1 : -(((-hp) + 1) >> 1);
 }
 
+// The motion-search luma downscale: 1 = full resolution (the default, bit-identical path),
+// 2 = half. Values outside {1,2} are treated as 1 so a bad setting degrades to the baseline.
+static inline int meScaleOf(const SvConfig& c) {
+    return c.meScale >= 2 ? 2 : 1;
+}
+
 // Maps a pixel coordinate onto the motion-vector grid, which holds one vector per [pitch] pixels
 // anchored [anchor] pixels into each cell. Returns the two bracketing grid indices and the weight
 // of the second in 1/pitch units. Within one cell of a frame border the weight is clamped instead
@@ -498,19 +504,31 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     const int step = blockStep();
     if (w == work_w_ && h == work_h_ && step == work_step_) return;
 
-    const size_t pixels = static_cast<size_t>(w) * h;
+    // The luma planes hold whatever the search domain is: the full frame at meScale 1, the
+    // half-resolution box average at meScale 2. The motion arrays keep the full-resolution
+    // block grid (step already carries the meScale multiplier), so their sizing is unchanged.
+    const int ms = meScaleOf(sv_config_);
+    const int lw = w / ms;
+    const int lh = h / ms;
+    const size_t pixels = static_cast<size_t>(lw) * lh;
     luma0_.resize(pixels);
     luma1_.resize(pixels);
-    resized0_.resize(pixels * 4);
-    resized1_.resize(pixels * 4);
+    if (ms > 1) {
+        lumaFull_.resize(static_cast<size_t>(w) * h);
+    } else {
+        lumaFull_.clear();
+        lumaFull_.shrink_to_fit();
+    }
+    resized0_.resize(static_cast<size_t>(w) * h * 4);
+    resized1_.resize(static_cast<size_t>(w) * h * 4);
 
-    // pyrN_[0] is never allocated: the full-resolution level aliases the luma plane.
-    int lw = w, lh = h;
+    // pyrN_[0] is never allocated: the search-domain luma plane is aliased by the first level.
+    int cw = lw, ch = lh;
     for (int l = 1; l < kLevels; l++) {
-        lw >>= 1;
-        lh >>= 1;
-        pyr0_[l].resize(static_cast<size_t>(lw) * lh);
-        pyr1_[l].resize(static_cast<size_t>(lw) * lh);
+        cw >>= 1;
+        ch >>= 1;
+        pyr0_[l].resize(static_cast<size_t>(cw) * ch);
+        pyr1_[l].resize(static_cast<size_t>(cw) * ch);
     }
 
     const size_t blocks = static_cast<size_t>((w + step - 1) / step) *
@@ -529,8 +547,8 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     work_w_ = w;
     work_h_ = h;
     work_step_ = step;
-    LOGI_SVP("scratch allocated %dx%d (%zu blocks at %d px, %d threads)",
-              w, h, blocks, step, threads_.load(std::memory_order_relaxed));
+    LOGI_SVP("scratch allocated %dx%d domain %dx%d (%zu blocks at %d px, %d threads)",
+              w, h, lw, lh, blocks, step, threads_.load(std::memory_order_relaxed));
 }
 
 void MemcInterpolator::extractLuma(const uint8_t* rgba, int w, int h, uint8_t* luma) {
@@ -594,15 +612,23 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
     // remainder of a frame whose width is not a multiple of the pitch. The pitch is kBlock
     // with overlap off, and smaller when SVP's overlap is on - the
     // matching window stays kBlock wide regardless, which is what makes it overlap its
-    // neighbours once the pitch drops below that.
+    // neighbours once the pitch drops below that. `w`/`h` are full-resolution: the grid count
+    // and every published vector stay in full-res units even while the search itself runs on
+    // half-resolution luma (meScale 2).
     const int step = blockStep();
+    const int ms = meScaleOf(sv_config_);
+    const int sw = w / ms;
+    const int sh = h / ms;
+    const int dstep = step / ms;
     const int bwx = (w + step - 1) / step;
     const int bwy = (h + step - 1) / step;
     const size_t nblocks = static_cast<size_t>(bwx) * bwy;
 
     std::fill(mvx, mvx + nblocks, 0);
     std::fill(mvy, mvy + nblocks, 0);
-    if (w < kBlock || h < kBlock) return 0;   // no full 16x16 window exists; MVs stay zero
+    // Below one full matching window in the search domain there is no field to build; MVs
+    // stay zero and the blend falls through to a plain crossfade.
+    if (sw < kBlock || sh < kBlock) return 0;
 
     // `subpel` is samples per pixel: 2 asks for a half-pixel search, 1 stays on whole pixels.
     const bool halfPel = sv_config_.subpel == 2;
@@ -615,22 +641,29 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
     const int fineBase = 1 + static_cast<int>(q * 2.0f + 0.5f);
     const int newLambdaBase = static_cast<int>(c.penaltyLambda + 0.5f);
     const int zeroLambdaBase = static_cast<int>(c.penaltyLambda * 0.25f + 0.5f);
-    const int searchDistance = c.searchDistance > 0 ? c.searchDistance : 0;
-    int winW = kBlock;
-    int winH = kBlock;
+    // An explicit distance is a reach in full-resolution pixels; the domain search spends the
+    // same reach in its own pixels, one per meScale full-res pixels.
+    const int searchDistance = c.searchDistance > 0 ? c.searchDistance / ms : 0;
+    int winW = kBlock / ms;
+    int winH = kBlock / ms;
     // Indexed by SvBlockSizeSetting.ordinal: 16x8, 16x16, 32x8, 32x16. 16x16 is SVP's own
     // block size and the rung the app ships; the wider windows are there for noisy sources,
-    // where averaging more of the picture into a match beats matching it precisely.
+    // where averaging more of the picture into a match beats matching it precisely. Scaled
+    // into the search domain, floored at the 8 px the NEON SAD paths require.
+    auto domWin = [ms](int full) {
+        const int d = full / ms;
+        return d < 8 ? 8 : d;
+    };
     switch (c.blockSize) {
-        case 1: winW = 16; winH = 8;   break;
-        case 2: winW = 16; winH = 16;  break;
-        case 3: winW = 32; winH = 8;   break;
-        case 4: winW = 32; winH = 16;  break;
+        case 1: winW = domWin(16); winH = domWin(8);   break;
+        case 2: winW = domWin(16); winH = domWin(16);  break;
+        case 3: winW = domWin(32); winH = domWin(8);   break;
+        case 4: winW = domWin(32); winH = domWin(16);  break;
         default:
             // AUTO: the quality bar picks the rung, so the two controls never fight over it.
-            if (q < 0.4f)       { winW = 16; winH = 8;  }
-            else if (q < 0.75f) { winW = 32; winH = 8;  }
-            else                { winW = 32; winH = 16; }
+            if (q < 0.4f)       { winW = domWin(16); winH = domWin(8);  }
+            else if (q < 0.75f) { winW = domWin(32); winH = domWin(8);  }
+            else                { winW = domWin(32); winH = domWin(16); }
             break;
     }
 
@@ -657,16 +690,16 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
     // finer level starts from a real motion estimate instead of from zero.
     for (int l = kLevels - 1; l >= 0; l--) {
         const int div = 1 << l;
-        const int lw = w >> l;
-        const int lh = h >> l;
+        const int lw = sw >> l;
+        const int lh = sh >> l;
         if (lw < kBlock || lh < kBlock) continue;
         // One level-l block covers a div x div group of full-res blocks. Iterating only
         // over complete groups keeps lr -> frow injective, which is what stops two worker
         // threads from writing the same motion-vector cell.
         const int groupsY = (bwy + div - 1) / div;
         const int groupsX = (bwx + div - 1) / div;
-        const int lrows = std::min((lh + step - 1) / step, groupsY);
-        const int lcols = std::min((lw + step - 1) / step, groupsX);
+        const int lrows = std::min((lh + dstep - 1) / dstep, groupsY);
+        const int lcols = std::min((lw + dstep - 1) / dstep, groupsX);
         const int group = div;                      // full-res blocks per side
 
         int base;
@@ -674,11 +707,14 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
             // An explicit distance is a reach in full-resolution pixels. The pyramid spends it
             // where it can afford it - the coarse level, which is what sets the prediction -
             // and the fine level stays inside its quality budget, so a wide setting widens the
-            // search instead of blowing the frame budget.
-            const int cap = (l == kLevels - 1) ? 16 : fineBase;
-            base = clampi(searchDistance >> l, 0, cap);
+            // search instead of blowing the frame budget. The caps are quoted in full-res
+            // pixels too and converted into this level's domain pixels.
+            const int cap = ((l == kLevels - 1) ? 16 : fineBase) / ms;
+            base = clampi(searchDistance >> l, 0, cap < 1 ? 1 : cap);
         } else {
-            base = (l == kLevels - 1) ? coarseBase : fineBase;
+            const int coarse = coarseBase / ms;
+            base = (l == kLevels - 1) ? (coarse < 1 ? 1 : coarse)
+                                      : (fineBase < 1 ? 1 : fineBase / ms);
         }
 
         // Both penalties are scaled by div so they are charged per full-resolution pixel and
@@ -695,19 +731,20 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         parallelFor(0, lrows, [&](int r0, int r1) {
             long long localSad = 0;
             for (int lr = r0; lr < r1; lr++) {
-                const int by = std::min(lr * step, lh - kBlock);
+                const int by = std::min(lr * dstep, lh - kBlock);
                 for (int lc = 0; lc < lcols; lc++) {
-                    const int bx = std::min(lc * step, lw - kBlock);
+                    const int bx = std::min(lc * dstep, lw - kBlock);
 
                     const int fcol = lc * div;
                     const int frow = lr * div;
                     const int idx = frow * bwx + fcol;
 
-                    // Prediction carried down from the coarser level, in this level's pixels.
-                    // The field is held in half-pel, so the divisor is div * 2; coarser levels
-                    // only ever write whole-pixel (even) vectors, so this is exact.
-                    const int gx = mvx[idx] / (div * 2);
-                    const int gy = mvy[idx] / (div * 2);
+                    // Prediction carried down from the coarser level, in this level's domain
+                    // pixels. The field is held in full-res half-pel, so the divisor is
+                    // meScale * div * 2; coarser levels only ever write whole-pixel vectors,
+                    // so this is exact.
+                    const int gx = mvx[idx] / (ms * div * 2);
+                    const int gy = mvy[idx] / (ms * div * 2);
 
                     const uint8_t* tb = tgt + by * lw + bx;
                     // The matching window for this block, rounded down to a whole 8x8 tile so
@@ -730,7 +767,7 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         range = base / 3 + ((base - base / 3) * hit) / span;
                     }
 
-                    if (predMiss[idx]) range += kBlock >> (l > 0 ? l : 1);
+                    if (predMiss[idx]) range += (kBlock / ms) >> (l > 0 ? l : 1);
 
                     int best = 0x7FFFFFFF;
                     int bestDx = gx, bestDy = gy;
@@ -758,10 +795,11 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         }
                     }
 
-                    // The integer winner, expressed in half-pel. Seeding it from `bestDx` - not
-                    // from the prediction the search started at - is what makes an untouched
-                    // value exactly twice the pixel result, so a whole-pixel backend's output is
-                    // unchanged; the refine below only moves it onto a half pixel.
+                    // The integer winner, expressed in this level's half-pel. Seeding it from
+                    // `bestDx` - not from the prediction the search started at - is what makes
+                    // an untouched value exactly twice the pixel result, so a whole-pixel
+                    // backend's output is unchanged; the refine below only moves it onto a
+                    // half pixel.
                     int bestHx = bestDx * 2, bestHy = bestDy * 2;
 
                     // Sub-pel locate. The integer pass settles the pixel, but the true minimum
@@ -840,12 +878,14 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         }
                     }
 
-                    const int32_t mvFullX = (l == 0)
-                        ? static_cast<int32_t>(bestHx)
-                        : static_cast<int32_t>(bestDx * div * 2);
-                    const int32_t mvFullY = (l == 0)
-                        ? static_cast<int32_t>(bestHy)
-                        : static_cast<int32_t>(bestDy * div * 2);
+                    // The published field's unit is full-resolution half-pel: the finest level
+                    // takes the refine's domain result scaled by meScale, a coarser level's
+                    // whole-pixel domain vector is doubled and scaled the same way. At
+                    // meScale 1, div is 1 and the scale collapses to the old expression.
+                    const int32_t mvFullX = static_cast<int32_t>(
+                        (l == 0) ? bestHx * ms : bestDx * div * 2 * ms);
+                    const int32_t mvFullY = static_cast<int32_t>(
+                        (l == 0) ? bestHy * ms : bestDy * div * 2 * ms);
                     for (int dr = 0; dr < group; dr++) {
                         const int rr = frow + dr;
                         if (rr >= bwy) break;
@@ -878,37 +918,46 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
 void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, int w, int h,
                                        const int32_t* mvx, const int32_t* mvy,
                                        int32_t* outx, int32_t* outy) {
+    // `w`/`h` are full-resolution (they size the block grid); `tgt`/`ref` are the search-domain
+    // luma planes, one pixel per meScale full-res pixels, so every sampling offset converts.
+    const int ms = meScaleOf(sv_config_);
+    const int sw = w / ms;
+    const int sh = h / ms;
     const int step = blockStep();
+    const int dstep = step / ms;
     const int bwx = (w + step - 1) / step;
     const int bwy = (h + step - 1) / step;
-    // Same guard as motionEstimate: below one full block there is no field to regularise.
-    if (w < kBlock || h < kBlock) return;
+    // Same guard as motionEstimate: below one full block in the domain there is no field to
+    // regularise.
+    if (sw < kBlock || sh < kBlock) return;
 
     // Window anchored a quarter block in, so it stays clear of the block's outer edges while
     // still covering the part the warp reads from most heavily. Eight pixels rather than sixteen
     // keeps four candidates at about the cost of one extra full-block evaluation.
-    const int ox = kBlock / 4;
-    const int oy = kBlock / 4;
+    const int ox = (kBlock / 4) / ms;
+    const int oy = (kBlock / 4) / ms;
     static const int kNx[4] = {-1, 1, 0, 0};
     static const int kNy[4] = {0, 0, -1, 1};
 
+    // Full-res half-pel to domain whole pixels.
+    auto hpDom = [ms](int hp) { return hpToPx(hp) / ms; };
     auto inBounds = [&](int bx, int by, int mx, int my) {
-        const int xx = bx + ox + hpToPx(mx);
-        const int yy = by + oy + hpToPx(my);
-        return xx >= 0 && yy >= 0 && xx + 8 <= w && yy + 8 <= h;
+        const int xx = bx + ox + hpDom(mx);
+        const int yy = by + oy + hpDom(my);
+        return xx >= 0 && yy >= 0 && xx + 8 <= sw && yy + 8 <= sh;
     };
     auto score = [&](int bx, int by, int mx, int my) {
-        const uint8_t* a = tgt + static_cast<size_t>(by + oy) * w + (bx + ox);
-        const uint8_t* b = ref + static_cast<size_t>(by + oy + hpToPx(my)) * w +
-                          (bx + ox + hpToPx(mx));
-        return sad8x8(a, b, w);
+        const uint8_t* a = tgt + static_cast<size_t>(by + oy) * sw + (bx + ox);
+        const uint8_t* b = ref + static_cast<size_t>(by + oy + hpDom(my)) * sw +
+                          (bx + ox + hpDom(mx));
+        return sad8x8(a, b, sw);
     };
 
     parallelFor(0, bwy, [&](int r0, int r1) {
         for (int r = r0; r < r1; r++) {
-            const int by = std::min(r * step, h - kBlock);
+            const int by = std::min(r * dstep, sh - kBlock);
             for (int c = 0; c < bwx; c++) {
-                const int bx = std::min(c * step, w - kBlock);
+                const int bx = std::min(c * dstep, sw - kBlock);
                 const size_t idx = static_cast<size_t>(r) * bwx + c;
 
                 const int sx = mvx[idx];
@@ -1115,7 +1164,8 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     // kBlock. Rescaling to that sum costs one integer divide per call, so it is tabled over
     // the step+1 positions the axis can actually take and the pixel loop stays divide-free.
     // At step == kBlock the table is the identity, so the baseline path is bit-identical.
-    int wtab[kBlock + 1];
+    // The table reaches kBlock * 2 because meScale 2 doubles the pitch (up to 32 px).
+    int wtab[kBlock * 2 + 1];
     for (int i = 0; i <= step; i++) wtab[i] = (i * kBlock + step / 2) / step;
 
     // Dense per-pixel warp: every output pixel interpolates its own vector from the four nearest
@@ -1367,19 +1417,38 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
 
     const auto tLuma = std::chrono::steady_clock::now();
     const long long tLumaCpu = threadCpuNs();
-    extractLuma(a, w, h, luma0_.data());
-    extractLuma(b, w, h, luma1_.data());
-    acc_luma_cpu_ns_ += threadCpuNs() - tLumaCpu;
-    acc_luma_ns_ += nsSince(tLuma);
-
+    const int ms = meScaleOf(sv_config_);
     // buildPyramid only fills level 0 (it aliases the luma plane); the coarser levels
     // point at the scratch buffers sized by ensureCapacity().
     uint8_t* pyr0[kLevels] = {luma0_.data(), pyr0_[1].data(), pyr0_[2].data()};
     uint8_t* pyr1[kLevels] = {luma1_.data(), pyr1_[1].data(), pyr1_[2].data()};
-    const auto tPyr = std::chrono::steady_clock::now();
-    buildPyramid(luma0_.data(), w, h, pyr0);
-    buildPyramid(luma1_.data(), w, h, pyr1);
-    acc_pyr_ns_ += nsSince(tPyr);
+    if (ms > 1) {
+        // Half-resolution search: extract full-res luma once per frame, then box-average it
+        // into the domain plane the pyramid and both estimates run on.
+        const int sw = w / ms;
+        const int sh = h / ms;
+        extractLuma(a, w, h, lumaFull_.data());
+        downsample2(lumaFull_.data(), w, h, luma0_.data());
+        extractLuma(b, w, h, lumaFull_.data());
+        downsample2(lumaFull_.data(), w, h, luma1_.data());
+        acc_luma_cpu_ns_ += threadCpuNs() - tLumaCpu;
+        acc_luma_ns_ += nsSince(tLuma);
+
+        const auto tPyr = std::chrono::steady_clock::now();
+        buildPyramid(luma0_.data(), sw, sh, pyr0);
+        buildPyramid(luma1_.data(), sw, sh, pyr1);
+        acc_pyr_ns_ += nsSince(tPyr);
+    } else {
+        extractLuma(a, w, h, luma0_.data());
+        extractLuma(b, w, h, luma1_.data());
+        acc_luma_cpu_ns_ += threadCpuNs() - tLumaCpu;
+        acc_luma_ns_ += nsSince(tLuma);
+
+        const auto tPyr = std::chrono::steady_clock::now();
+        buildPyramid(luma0_.data(), w, h, pyr0);
+        buildPyramid(luma1_.data(), w, h, pyr1);
+        acc_pyr_ns_ += nsSince(tPyr);
+    }
 
     // forward  = where in0's blocks ended up in in1  (ref = in1, tgt = in0)
     // backward = where in1's blocks came from in in0 (ref = in0, tgt = in1)
@@ -1517,19 +1586,21 @@ bool MemcInterpolator::interpolate(const uint8_t* src0, const uint8_t* src1,
 }
 
 int MemcInterpolator::blockStep() const {
+    const int ms = meScaleOf(sv_config_);
     const int overlap = sv_config_.overlap;
-    if (overlap <= 0) return kBlock;
+    if (overlap <= 0) return kBlock * ms;
     // SVP's rungs are 0 = none, 1 = 1/8 of the block, 2 = 1/4, 3 = 1/2, and SVP requires the
     // resulting overlap in pixels to be even so the CPU path can keep its vectors on whole
     // pixels - 2, 4 and 8 for a 16 px block. The window stays kBlock wide, so shrinking the
-    // pitch is what makes neighbouring windows overlap at all.
+    // pitch is what makes neighbouring windows overlap at all. The meScale multiplier goes on
+    // last: the pitch is quoted in full-resolution pixels at every setting.
     int overlapPx = 0;
     if (overlap == 1)      overlapPx = kBlock / 8;
     else if (overlap == 2) overlapPx = kBlock / 4;
     else if (overlap >= 3) overlapPx = kBlock / 2;
-    if (overlapPx <= 0) return kBlock;
-    const int step = kBlock - overlapPx;
-    return step < 8 ? 8 : step;
+    if (overlapPx <= 0) return kBlock * ms;
+    const int step = (kBlock - overlapPx) * ms;
+    return step < 8 * ms ? 8 * ms : step;
 }
 
 int MemcInterpolator::blendMode() const {
@@ -1548,6 +1619,9 @@ size_t MemcInterpolator::motionFieldBytes(int targetWidth, int targetHeight, int
 
 void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwardOnly) {
     const int step = blockStep();
+    const int ms = meScaleOf(sv_config_);
+    const int sw = w / ms;
+    const int sh = h / ms;
     const int bwx = (w + step - 1) / step;
     const int bwy = (h + step - 1) / step;
     const size_t blocks = static_cast<size_t>(bwx) * bwy;
@@ -1555,9 +1629,13 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
     // units, i.e. -64..+63.5 pixels. The widest reach the exposed search options can produce is
     // the adaptive coarse pass at 12 level-2 blocks (48 px) plus the two finer passes (9 px) -
     // 57 px, or 114 units - so it fits with room to spare. Clamp anyway: a hand-edited search
-    // distance must degrade to a saturated vector, never a wrapped one.
-    auto bias = [](int32_t v) {
+    // distance must degrade to a saturated vector, never a wrapped one. The clamp is also
+    // counted: a rising saturation percentage is the field asking for more reach than one byte
+    // can carry, which is the mechanism behind fast pans degrading at higher resolutions.
+    long long saturated = 0;
+    auto bias = [&saturated](int32_t v) {
         const int32_t b = v + 128;
+        if (b < 0 || b > 255) saturated++;
         return static_cast<uint8_t>(b < 0 ? 0 : (b > 255 ? 255 : b));
     };
     uint8_t* outMask = outMv + blocks * 4;
@@ -1569,21 +1647,26 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
     // on top. Serial over a few thousand blocks - two clamped SADs each is tens of microseconds,
     // and the histogram that follows is one 256-bin sweep - so it stays inside packMotionField's
     // existing serial section rather than buying a parallel region for microseconds.
+    // The luma planes are search-domain sized; block centres and vector offsets convert from
+    // full-res pixels into that domain. At meScale 1 every division is by one and the sampling
+    // is unchanged.
     nlmScore_.assign(blocks * 2, 0);
     int hist[256];
     memset(hist, 0, sizeof(hist));
-    if (w >= 8 && h >= 8) {
+    if (sw >= 8 && sh >= 8) {
         for (int r = 0; r < bwy; r++) {
             const size_t row = static_cast<size_t>(r) * bwx;
-            const int cy = r * step + kBlock / 2;
+            const int cyFull = r * step + kBlock / 2;
+            const int cy = cyFull / ms;
             for (int c = 0; c < bwx; c++) {
                 const size_t i = row + c;
-                const int cx = c * step + kBlock / 2;
+                const int cxFull = c * step + kBlock / 2;
+                const int cx = cxFull / ms;
                 // `p - mv` at t = 1, the same position the warp shader samples the partner at.
                 // The field is half-pel, so it goes through hpToPx before it can index luma.
-                const int sadF = sadAt(luma1_.data(), luma0_.data(), w, w, h,
-                                       cx, cy, cx - hpToPx(mvf_x_[i]),
-                                       cy - hpToPx(mvf_y_[i]));
+                const int sadF = sadAt(luma1_.data(), luma0_.data(), sw, sw, sh,
+                                       cx, cy, cx - hpToPx(mvf_x_[i]) / ms,
+                                       cy - hpToPx(mvf_y_[i]) / ms);
                 nlmScore_[i * 2] = static_cast<uint8_t>(clampi(sadF / 64, 0, 255));
                 hist[nlmScore_[i * 2]]++;
                 // The backward residual is only a real residual when the backward field is.
@@ -1592,9 +1675,9 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
                 // percentile that becomes the noise floor up with it, letting the denoiser merge
                 // harder than its own measurement justifies. Only the forward half counts then.
                 if (!forwardOnly) {
-                    const int sadB = sadAt(luma0_.data(), luma1_.data(), w, w, h,
-                                           cx, cy, cx - hpToPx(mvb_x_[i]),
-                                           cy - hpToPx(mvb_y_[i]));
+                    const int sadB = sadAt(luma0_.data(), luma1_.data(), sw, sw, sh,
+                                           cx, cy, cx - hpToPx(mvb_x_[i]) / ms,
+                                           cy - hpToPx(mvb_y_[i]) / ms);
                     const int sb = clampi(sadB / 64, 0, 255);
                     nlmScore_[i * 2 + 1] = static_cast<uint8_t>(sb);
                     hist[sb]++;
@@ -1670,6 +1753,8 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
             m[3] = static_cast<uint8_t>(floorByte);
         }
     }
+    acc_sat_vecs_ += saturated;
+    acc_total_vecs_ += static_cast<long long>(blocks) * 4;
 }
 
 bool MemcInterpolator::motionField(const uint8_t* src0, const uint8_t* src1,
@@ -1738,11 +1823,18 @@ void MemcInterpolator::reportStagesIfDue() {
     const double eff = (runPerFrame > 0.0 && participants > 1)
                            ? 100.0 * workPerFrame / (runPerFrame * participants)
                            : 100.0;
+    // Fraction of packed vectors that hit the +128-bias encoding ceiling over this window.
+    // Zero at the shipped settings on ordinary content; a rising number means the motion the
+    // search found cannot be carried by the packed field (see packMotionField).
+    const double satPct = acc_total_vecs_ > 0
+                              ? 100.0 * static_cast<double>(acc_sat_vecs_) /
+                                    static_cast<double>(acc_total_vecs_)
+                              : 0.0;
 
     LOGI_SVP("STAGES n=%lld frame=%.1f setup=%.2f resize=%.2f luma=%.2f "
-              "lumaCpu=%.2f pyr=%.2f fwd=%.1f bwd=%.1f warp=%.1f ms | pool "
+              "lumaCpu=%.2f pyr=%.2f fwd=%.1f bwd=%.1f warp=%.1f ms sat=%.1f%% | pool "
               "runs/frame=%.1f runWall=%.1f work=%.1f eff=%.0f%% thr=%d",
-              acc_frames_, frame, setup, resize, luma, lumaCpu, pyr, fwd, bwd, warp,
+              acc_frames_, frame, setup, resize, luma, lumaCpu, pyr, fwd, bwd, warp, satPct,
               runsPerFrame, runPerFrame, workPerFrame, eff, participants);
 
     acc_frames_ = 0;
@@ -1755,6 +1847,8 @@ void MemcInterpolator::reportStagesIfDue() {
     acc_bwd_ns_ = 0;
     acc_warp_ns_ = 0;
     acc_total_ns_ = 0;
+    acc_sat_vecs_ = 0;
+    acc_total_vecs_ = 0;
 }
 
 }  // namespace rife

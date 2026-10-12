@@ -65,6 +65,7 @@ fun BoxScope.ProcessingSettingsView(
     onMemcLevelSelected: (MemcLevelSetting) -> Unit,
     onDenoiseLevelSelected: (DenoiseLevelSetting) -> Unit,
     onSvSettingsChanged: (SvPlayerSettings) -> Unit,
+    sourceIsHdr: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     OverlayView(
@@ -86,6 +87,25 @@ fun BoxScope.ProcessingSettingsView(
                 description = playerPreferences.interpolationAlgorithm.interpolationDescription(),
                 checked = playerPreferences.rifeEnabled,
                 onToggle = onToggleInterpolation,
+            )
+            val svSettings = playerPreferences.svPlayerSettings
+            ToggleRow(
+                title = stringResource(R.string.sv_hdr_to_sdr_tone_map),
+                // The summary follows the effective state: the toggle only converts an HDR
+                // source, so an SDR stream says so instead of implying a conversion is running.
+                description = stringResource(
+                    when {
+                        !svSettings.hdrToSdrToneMap -> R.string.sv_hdr_to_sdr_tone_map_inactive
+                        sourceIsHdr -> R.string.sv_hdr_to_sdr_tone_map_active
+                        else -> R.string.sv_hdr_to_sdr_tone_map_inactive_sdr
+                    },
+                ),
+                checked = svSettings.hdrToSdrToneMap,
+                onToggle = {
+                    onSvSettingsChanged(
+                        svSettings.copy(hdrToSdrToneMap = !svSettings.hdrToSdrToneMap),
+                    )
+                },
             )
             OptionGroup(
                 title = stringResource(R.string.processing_resolution),
@@ -110,7 +130,7 @@ fun BoxScope.ProcessingSettingsView(
             )
             if (playerPreferences.interpolationAlgorithm == InterpolationAlgorithmSetting.SVPLAYER) {
                 SvSettingsSection(
-                    settings = playerPreferences.svPlayerSettings,
+                    settings = svSettings,
                     onSettingsChanged = onSvSettingsChanged,
                 )
             }

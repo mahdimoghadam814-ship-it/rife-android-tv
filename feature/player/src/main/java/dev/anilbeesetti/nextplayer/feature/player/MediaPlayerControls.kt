@@ -62,6 +62,7 @@ internal fun MediaPlayerControls(
     onPictureInPictureClick: () -> Unit,
     engineStatusOverlay: @Composable () -> Unit = {},
     onUdpStreamingToggle: () -> Unit = {},
+    sourceIsHdr: Boolean = false,
     modifier: Modifier = Modifier,
 ) {
     val playerPreferences = state.playerPreferences
@@ -208,6 +209,7 @@ internal fun MediaPlayerControls(
                 onMemcLevelSelected = { onAction(PlayerAction.SetMemcLevel(it)) },
                 onDenoiseLevelSelected = { onAction(PlayerAction.SetDenoiseLevel(it)) },
                 onSvSettingsChanged = { onAction(PlayerAction.SetSvPlayerSettings(it)) },
+                sourceIsHdr = sourceIsHdr,
             )
         }
     }

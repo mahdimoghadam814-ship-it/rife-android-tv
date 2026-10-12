@@ -566,6 +566,11 @@
     <string name="sv_me_scale">Search Resolution</string>
     <string name="sv_me_scale_1">Full</string>
     <string name="sv_me_scale_2">Half</string>
+    <string name="sv_hdr_to_sdr_tone_map">HDR to SDR tone map</string>
+    <string name="sv_hdr_to_sdr_tone_map_description">Converts HDR (PQ/HLG) sources to SDR inside the pipeline, so the picture no longer depends on the display honoring HDR metadata</string>
+    <string name="sv_hdr_to_sdr_tone_map_active">Active: this HDR source is converted to SDR in the pipeline</string>
+    <string name="sv_hdr_to_sdr_tone_map_inactive_sdr">No effect: the current source is SDR</string>
+    <string name="sv_hdr_to_sdr_tone_map_inactive">Off: HDR sources stay HDR end to end</string>
     <string name="sv_block_auto">Auto</string>
     <string name="sv_block_16x8">16 x 8</string>
     <string name="sv_block_16x16">16 x 16</string>

@@ -38,7 +38,11 @@ struct SvConfig {
     // 0 = forward/backward average, 1 = plus per-pixel median, 2 = plus cover/uncover.
     int blendAlgorithm = 2;
     int sceneAdaptive = 1;
-    // Luma downscale the search runs at: 1 full, 2 half.
+    // Luma downscale the search runs at: 1 full, 2 half. At 2 the motion search, its pyramid
+    // and the masks all run on half-resolution luma while the packed field keeps the same
+    // full-resolution grid pitch (blockStep() doubles) and the same full-resolution reach, so
+    // the cost drops by roughly 4x and the field's precision floors at one full-res pixel.
+    // The default of 1 keeps the search bit-identical to the full-resolution path.
     int meScale = 1;
 };
 
@@ -150,6 +154,10 @@ public:
     // 1 an eighth of a block, 2 a quarter - so the shipped overlap of 2 searches a 16 px window
     // at a 12 px pitch, which is exactly what makes the neighbouring windows overlap by 4 px and
     // the grid carry 1.77x as many vectors.
+    //
+    // The whole pitch is then multiplied by `meScale`: a half-resolution search covers the same
+    // full-resolution ground with one vector per doubled pitch, so the packed grid a caller
+    // sizes from this value always agrees with the grid the shader samples.
     //
     // It is public because the packed field is sized and then read back by the GL side, which
     // has to agree with this to the pixel: gridW is ceil(width / blockStep()), not ceil(/16).
@@ -307,6 +315,12 @@ private:
     long long acc_bwd_ns_ = 0;
     long long acc_warp_ns_ = 0;
     long long acc_total_ns_ = 0;
+    // Motion vectors that hit the packed field's +128-bias encoding ceiling (|v| >= 128 half-pel
+    // units, i.e. 64 full-res px), and the total counted, over the same STAGES window as the
+    // timings above. A rising percentage is the field asking for more reach than one byte can
+    // carry - the mechanism behind fast pans degrading at higher resolutions.
+    long long acc_sat_vecs_ = 0;
+    long long acc_total_vecs_ = 0;
 
     // Last reported MemcPool snapshot, so each report covers only its own window.
     long long last_pool_run_ = 0;
@@ -333,6 +347,9 @@ private:
 
     // Scratch, allocated once per resolution instead of per frame.
     std::vector<uint8_t> luma0_, luma1_;
+    // Full-resolution luma staging, used only while meScale == 2: the search runs on the
+    // half-resolution planes in luma0_/luma1_, which are produced by box-downsampling this.
+    std::vector<uint8_t> lumaFull_;
     std::vector<uint8_t> pyr0_[kLevels];
     std::vector<uint8_t> pyr1_[kLevels];
     std::vector<uint8_t> resized0_, resized1_;

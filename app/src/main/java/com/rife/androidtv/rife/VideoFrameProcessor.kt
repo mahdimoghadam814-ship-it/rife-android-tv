@@ -13,6 +13,7 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
+import androidx.media3.common.C
 import androidx.media3.common.ColorInfo
 import androidx.media3.common.Effect
 import androidx.media3.common.Format
@@ -205,6 +206,17 @@ class VideoFrameProcessor(
             val intervalUs = realGapUs.coerceIn(MIN_PAIR_INTERVAL_US, MAX_PAIR_INTERVAL_US)
             return PairCadence(intervalUs, realGapUs != intervalUs)
         }
+
+        /**
+         * Whether the user's HDR to SDR tone-map toggle applies to the current source. The
+         * conversion only ever runs on a positively identified PQ or HLG transfer - the same
+         * metadata gate [ColorInfo.isTransferHdr] enforces - so an SDR source, an unknown
+         * transfer or a disabled toggle all leave the HDR path exactly as it was. Extracted as a
+         * pure decision so the gate can be tested without a pipeline.
+         */
+        internal fun toneMapWanted(enabled: Boolean, colorTransfer: Int?): Boolean =
+            enabled && (colorTransfer == C.COLOR_TRANSFER_ST2084 ||
+                colorTransfer == C.COLOR_TRANSFER_HLG)
 
         /** The supported interpolation ratios, matching the clamp in setMemcLevel(). */
         private const val MIN_INTERPOLATION_RATIO = 2.0
@@ -658,6 +670,19 @@ class VideoFrameProcessor(
     private var hdrCaptureUnavailableLogged = false
 
     /**
+     * The user's HDR to SDR tone-map preference. The effective decision ([toneMapEffective])
+     * additionally requires an HDR source and a tone-map shader that compiled; when it holds,
+     * capture converts the OES frame to sRGB SDR pixels, [retainHdrSource] stays false, the
+     * present runs in SDR mode and the output window carries no HDR tag.
+     */
+    @Volatile private var hdrToSdrToneMap: Boolean = false
+    /** Set on the worker once the grabber has answered whether its tone-map shader compiled. */
+    @Volatile private var toneMapAvailable: Boolean = false
+    private var toneMapUnavailableLogged = false
+    /** Sticky request for the next capture, rebuilt from the volatiles on every cycle. */
+    private var toneMapRequest: OesFrameGrabber.ToneMapRequest? = null
+
+    /**
      * Dataspace MediaCodec stamped on its own output window, read back through
      * [NativeEngine.getOutputDataSpace]. While a stage is running the decoder writes into our
      * input surface instead of the display, so this is the only place the value the bypass path
@@ -835,6 +860,40 @@ class VideoFrameProcessor(
             // must present untagged or the display would read sRGB pixels as PQ.
             applyOutputDataSpace()
         }
+    }
+
+    /**
+     * Applies the user's HDR to SDR tone-map toggle. The switch changes which encoding the
+     * captured frames carry, so frames already queued under the old encoding must not be paired
+     * with frames captured under the new one: the pipeline is reset and the capture decision is
+     * rebuilt from scratch on the next cycle.
+     */
+    fun setHdrToSdrToneMap(enabled: Boolean) {
+        if (hdrToSdrToneMap == enabled) return
+        hdrToSdrToneMap = enabled
+        runOnWorker("setHdrToSdrToneMap") {
+            toneMapUnavailableLogged = false
+            resetPipelineOnWorker("tonemap_toggled")
+            applyOutputDataSpace()
+            logToneMapState("user=${if (enabled) "on" else "off"}")
+        }
+    }
+
+    /**
+     * True while the tone-map conversion should run for the current source: the toggle is on,
+     * the source positively reports PQ or HLG, and the capture shader compiled. Read on the
+     * worker only; [toneMapAvailable] is answered by the first capture that needs it.
+     */
+    private fun toneMapEffective(): Boolean =
+        hdrToSdrToneMap && toneMapWanted(true, sourceColorInfo?.colorTransfer) && toneMapAvailable
+
+    private fun logToneMapState(detail: String) {
+        val mode = if (toneMapEffective()) {
+            "active transfer=${sourceColorInfo?.colorTransfer}"
+        } else {
+            "inactive hdr10=$hdr10Enabled available=$toneMapAvailable"
+        }
+        Log.i(TAG, "[TONEMAP] $mode ($detail)")
     }
 
     /**
@@ -1258,6 +1317,7 @@ class VideoFrameProcessor(
             hdrProbeLogged = false
             hdrRepresentationProbe?.reset()
             Log.i(TAG, "[HDR] inputColor=${colorInfo ?: "unknown"} outputDataSpace=$outputDataSpace")
+            logToneMapState("source changed")
         }
     }
 
@@ -1285,9 +1345,11 @@ class VideoFrameProcessor(
      * The output encoding the present must use for the current source, from [hdr10Enabled]:
      * SDR sources always pass through; an HDR source is presented as PQ for HDR 10, or as
      * 8-bit sRGB SDR (clip tone-map, no HDR dataspace tag) when the HDR 8 mode is selected.
+     * An effective tone-map makes the source SDR at capture, so the present passes through
+     * exactly as it would for an SDR source.
      */
     private fun hdrOutputMode(): Int = when {
-        !isHdrSource() -> GlOutputRenderer.HDR_OUTPUT_SDR
+        !isHdrSource() || toneMapEffective() -> GlOutputRenderer.HDR_OUTPUT_SDR
         hdr10Enabled -> GlOutputRenderer.HDR_OUTPUT_PQ
         else -> GlOutputRenderer.HDR_OUTPUT_SDR8
     }
@@ -1376,11 +1438,13 @@ class VideoFrameProcessor(
     /**
      * The value the output window should carry: the decoder's own whenever it is willing to say,
      * so the processed path is displayed exactly like the bypass path, and the colour-metadata
-     * value otherwise. SDR stays at `0` either way.
+     * value otherwise. SDR stays at `0` either way, and so does an effective tone-map - the
+     * pixels are sRGB by then, and an HDR tag would make the display decode them as PQ.
      */
     private fun effectiveOutputDataSpace(): Int = when {
-        // HDR 8 mode: the pixels are sRGB-encoded, so the window must carry no HDR tag.
-        !hdr10Enabled -> 0
+        // HDR 8 mode and the tone map: the pixels are sRGB-encoded, so the window must carry
+        // no HDR tag.
+        !hdr10Enabled || toneMapEffective() -> 0
         outputDataSpace != 0 && codecDataSpace != 0 -> codecDataSpace
         else -> outputDataSpace
     }
@@ -2274,7 +2338,31 @@ class VideoFrameProcessor(
         }
         val tCaptureStart = timingStartNs
         val timestampUs = texture.timestamp / 1000L
-        val retainHdrSource = isHdrSource()
+        // HDR to SDR conversion, decided per frame: the shader is compiled on first use, and a
+        // failed compile falls back to the retained-HDR path (with a single log) rather than
+        // presenting PQ code values as SDR.
+        var toneMapReq: OesFrameGrabber.ToneMapRequest? = null
+        if (hdrToSdrToneMap && isHdrSource() && toneMapWanted(true, sourceColorInfo?.colorTransfer)) {
+            if (!toneMapAvailable && !grabber.ensureToneMap()) {
+                if (!toneMapUnavailableLogged) {
+                    toneMapUnavailableLogged = true
+                    Log.e(TAG, "[TONEMAP] capture shader unavailable; keeping the HDR path")
+                }
+            } else {
+                val wasAvailable = toneMapAvailable
+                toneMapAvailable = true
+                toneMapReq = OesFrameGrabber.ToneMapRequest(
+                    transfer = if (sourceColorInfo?.colorTransfer == C.COLOR_TRANSFER_HLG) {
+                        OesFrameGrabber.TONEMAP_TRANSFER_HLG
+                    } else {
+                        OesFrameGrabber.TONEMAP_TRANSFER_PQ
+                    },
+                    bt2020ToBt709 = sourceColorInfo?.colorSpace == C.COLOR_SPACE_BT2020,
+                )
+                if (!wasAvailable) logToneMapState("shader ready")
+            }
+        }
+        val retainHdrSource = isHdrSource() && toneMapReq == null
         if (retainHdrSource && !grabber.isHdrSourceSupported) {
             if (!hdrCaptureUnavailableLogged) {
                 hdrCaptureUnavailableLogged = true
@@ -2291,6 +2379,7 @@ class VideoFrameProcessor(
                 captureHeight,
                 timestampUs,
                 retainHdrSource,
+                toneMapReq,
             )
             var completed = 0
             // Only poll ONCE per frame to avoid blocking the worker. If no PBO is ready,
@@ -2327,7 +2416,7 @@ class VideoFrameProcessor(
 
         val pixels = obtainFrameBuffer(captureWidth, captureHeight)
         val readOk = pixels.capacity() > 0 &&
-            grabber.read(texture, captureWidth, captureHeight, pixels)
+            grabber.read(texture, captureWidth, captureHeight, pixels, toneMapReq)
         nsReadback += System.nanoTime() - tCaptureStart
         if (!readOk) {
             releaseFrameBuffer(pixels)
