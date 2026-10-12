@@ -190,6 +190,22 @@ class VideoFrameProcessor(
         private const val MIN_PAIR_INTERVAL_US = 1_000L
         private const val MAX_PAIR_INTERVAL_US = 1_000_000L
 
+        /** The cadence window's verdict on one source pair; see [cadenceInterval]. */
+        internal data class PairCadence(val intervalUs: Long, val discontinuity: Boolean)
+
+        /**
+         * Clamps one pair's source span into [MIN_PAIR_INTERVAL_US, MAX_PAIR_INTERVAL_US] and
+         * reports whether clamping was needed. A clamped gap is a discontinuity (stall, backwards
+         * timestamp or jump) rather than a frame pair: the cadence restarts from the far side of
+         * it instead of replaying the whole gap as a burst. Extracted as a pure decision so the
+         * clamp and its classification can be tested without a pipeline.
+         */
+        internal fun cadenceInterval(prevUs: Long, nextUs: Long): PairCadence {
+            val realGapUs = nextUs - prevUs
+            val intervalUs = realGapUs.coerceIn(MIN_PAIR_INTERVAL_US, MAX_PAIR_INTERVAL_US)
+            return PairCadence(intervalUs, realGapUs != intervalUs)
+        }
+
         /** The supported interpolation ratios, matching the clamp in setMemcLevel(). */
         private const val MIN_INTERPOLATION_RATIO = 2.0
         private const val MAX_INTERPOLATION_RATIO = 4.0
@@ -436,7 +452,6 @@ class VideoFrameProcessor(
         val next: FrameData,
         val prepared: PreparedMotion,
         val generation: Long,
-        val timestamps: LongArray,
     )
 
     /** Queue of work items whose motion is done, waiting for worker to render. */
@@ -451,6 +466,23 @@ class VideoFrameProcessor(
     private var droppedFrameCount = 0L
     private var droppedOutputFrameCount = 0L
     private var submittedOutputFrameCount = 0L
+    // Present-path attribution, cumulative like pairGateDeferredCount/tsRegress. Each counter
+    // advances by the number of output frames that path put on the surface, one counter per
+    // present, so the [PIPELINE] path= field reads as the run's renderer distribution directly.
+    // They answer which renderer actually carried a test run - the retained HDR-texture warp,
+    // the denoised-pair warp, the 8-bit upload warp, the CPU fallback, the HDR retained-source
+    // fallback, or a plain single present - which is the first question any judder/attribution
+    // investigation has to settle.
+    private var presentWarpTexCount = 0L
+    private var presentWarpDenCount = 0L
+    private var presentWarp8Count = 0L
+    private var presentCpuCount = 0L
+    private var presentHdrFallbackCount = 0L
+    private var presentPlainCount = 0L
+    // Pairs whose source span had to be clamped by outputTimesFor: a stall, a backwards
+    // timestamp or a jump between two anchors. Steady content keeps this flat; a stream whose
+    // cadence is the judder source (casting PTS jitter, variable-frame-rate content) drives it.
+    private var cadenceDiscontinuityCount = 0L
     private var surfaceRecoveryRequested = false
     private var lastCaptureContentLogNs = 0L
     private var lastRenderContentLogNs = 0L
@@ -2440,7 +2472,7 @@ class VideoFrameProcessor(
             }
             val posted = handler.post {
                 // Motion done. Enqueue for rendering. Leases are kept until after render completes.
-                val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
+                val work = InFlightWork(prev, nextFrame, prepared, generation)
                 pendingRenderQueue.addLast(work)
 
                 // Try to render from queue (this will also submit next motion if available)
@@ -2543,7 +2575,7 @@ class VideoFrameProcessor(
                 return@execute
             }
             val posted = handler.post {
-                val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
+                val work = InFlightWork(prev, nextFrame, prepared, generation)
                 pendingRenderQueue.addLast(work)
                 // Render it. The render that submitted this motion has long finished by now - its
                 // end-of-render repost only fires when the queue was already non-empty, which it
@@ -2594,21 +2626,6 @@ class VideoFrameProcessor(
         } catch (t: Throwable) {
             Log.e(TAG, "Asynchronous motion estimation failed", t)
             PreparedMotion(null, false, System.nanoTime() - started)
-        }
-    }
-
-    private fun generateTimestamps(prev: FrameData, next: FrameData): LongArray {
-        val pairSpanUs = next.timestampUs - prev.timestampUs
-        val exactThreeTimes = memcLevelMultiplier == 3f &&
-            pairSpanUs in MIN_PAIR_INTERVAL_US..MAX_PAIR_INTERVAL_US
-        val count = (memcLevelMultiplier).toInt()
-        return LongArray(count) { i ->
-            if (exactThreeTimes && i < 2) {
-                prev.timestampUs * 1000L + (pairSpanUs * 1000L * (i + 1)) / 3L
-            } else {
-                prev.timestampUs * 1000L +
-                    ((i + 1).toDouble() / (count + 1).toDouble() * pairSpanUs * 1000.0).toLong()
-            }
         }
     }
 
@@ -2794,7 +2811,10 @@ class VideoFrameProcessor(
                             outputRenderer?.presentDenoised(
                                 rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
                             ) == true
-                        if (presented) noteOutputTimestamp(nextFrame.timestampUs * 1000L)
+                        if (presented) {
+                            noteOutputTimestamp(nextFrame.timestampUs * 1000L)
+                            presentPlainCount++
+                        }
                         nsRender += System.nanoTime() - tRenderStart
                     }
                 }
@@ -3072,7 +3092,7 @@ class VideoFrameProcessor(
                 // supplies the cleaned current frame - which for that first cycle is the raw frame
                 // anyway, so the two halves of the output still agree.
                 presented = if (denoiseReady && outputRenderer?.hasDenoisePair == true) {
-                    outputRenderer?.renderWarpFromDen(
+                    val ok = outputRenderer?.renderWarpFromDen(
                         motionBuf,
                         rifeInputW,
                         rifeInputH,
@@ -3081,6 +3101,8 @@ class VideoFrameProcessor(
                         intermediate,
                         timestamps
                     ) == true
+                    if (ok) presentWarpDenCount += intermediate.size
+                    ok
                 } else if (hdrComposition) {
                     // The warp presents straight from the retained textures, so the probe - whose
                     // verdict decides whether the shader decodes before tone-mapping - has to run
@@ -3098,11 +3120,13 @@ class VideoFrameProcessor(
                             "color=${sourceColorInfo ?: "unknown"}"
                     )
                     outputRenderer?.let { applyPresentState(it) }
-                    outputRenderer?.renderWarpTextures(
+                    val ok = outputRenderer?.renderWarpTextures(
                         hdrFrame0, hdrFrame1, motionBuf,
                         rifeInputW, rifeInputH, rifeOutputW, rifeOutputH,
                         intermediate, timestamps
                     ) == true
+                    if (ok) presentWarpTexCount += intermediate.size
+                    ok
                 } else {
                     // Residency tokens identify the uploaded frames across consecutive pairs so
                     // the renderer can keep the shared frame resident instead of re-uploading
@@ -3110,13 +3134,15 @@ class VideoFrameProcessor(
                     // passed only when the buffer really is the immutable captured frame: a
                     // denoise scratch buffer is rewritten in place before the next pair, so
                     // claiming a capture timestamp for its contents would be false.
-                    outputRenderer?.renderWarp(
+                    val ok = outputRenderer?.renderWarp(
                         src0Buf, src1Buf, motionBuf,
                         rifeInputW, rifeInputH, rifeOutputW, rifeOutputH,
                         intermediate, timestamps,
                         frame0Token = if (src0Buf === prev.pixels) prev.timestampUs else 0L,
                         frame1Token = if (src1Buf === nextFrame.pixels) nextFrame.timestampUs else 0L
                     ) == true
+                    if (ok) presentWarp8Count += intermediate.size
+                    ok
                 }
                 if (presented) {
                     warpPresentedPoints = intermediate.size
@@ -3134,6 +3160,7 @@ class VideoFrameProcessor(
                     // intermediate frames and present the retained HDR source at the pair time.
                     Log.w(TAG, "HDR GPU composition failed; presenting retained source frame")
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
+                    presentHdrFallbackCount++
                     presented = true
                 }
             }
@@ -3193,6 +3220,7 @@ class VideoFrameProcessor(
 
                     renderBufferToOutput(outBuf, rifeOutputW, rifeOutputH, timestamps[i])
                     renderedPoints++
+                    presentCpuCount++
                 }
                 if (renderedPoints == 0) {
                     // On this path the loop is the stage's only caller, so nothing else can
@@ -3200,6 +3228,7 @@ class VideoFrameProcessor(
                     // rather than whatever the output buffer happened to hold.
                     reportError("Frame interpolation failed: the native interpolator refused the pair")
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
+                    presentPlainCount++
                 }
             }
 
@@ -3214,8 +3243,10 @@ class VideoFrameProcessor(
                 ) {
                     // already on the surface
                     noteOutputTimestamp(nextFrame.timestampUs * 1000L)
+                    presentPlainCount++
                 } else {
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
+                    presentPlainCount++
                 }
             }
             nsRender += System.nanoTime() - tRenderStart
@@ -3224,6 +3255,7 @@ class VideoFrameProcessor(
             reportError("Frame interpolation failed: the native interpolator refused the pair")
             val tRenderStart = System.nanoTime()
             renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
+            presentPlainCount++
             nsRender += System.nanoTime() - tRenderStart
             frameCountOutput++
         }
@@ -3256,13 +3288,14 @@ class VideoFrameProcessor(
      * sequence never repeats a frame.
      */
     private fun outputTimesFor(prevUs: Long, nextUs: Long): FloatArray {
-        val realGapUs = nextUs - prevUs
-        val intervalUs = realGapUs.coerceIn(MIN_PAIR_INTERVAL_US, MAX_PAIR_INTERVAL_US)
         // A gap that had to be clamped is a discontinuity rather than a frame pair: a stall, a
         // backwards timestamp or a jump. Replaying the whole gap would fire a burst of frames in
         // one go, so the cadence restarts from the end of it and the window is measured from
         // there instead of from the frame on the far side of the jump.
-        val discontinuity = realGapUs != intervalUs
+        val cadence = cadenceInterval(prevUs, nextUs)
+        val intervalUs = cadence.intervalUs
+        val discontinuity = cadence.discontinuity
+        if (discontinuity) cadenceDiscontinuityCount++
         val baseUs = if (discontinuity) nextUs - intervalUs else prevUs
         val ratio = memcLevelMultiplier.toDouble().coerceIn(MIN_INTERPOLATION_RATIO, MAX_INTERPOLATION_RATIO)
         val stepUs = maxOf(1L, (intervalUs / ratio).toLong())
@@ -3373,7 +3406,7 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"}${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"} path=tex:$presentWarpTexCount den:$presentWarpDenCount w8:$presentWarp8Count cpu:$presentCpuCount hfb:$presentHdrFallbackCount plain:$presentPlainCount cadDisc=$cadenceDiscontinuityCount${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
         // Scheduling evidence rather than stage cost: how long the worker actually went quiet
         // between callbacks, how regularly the decoder delivered, and how much wall clock each
         // output frame was entitled to. A stage time that fits its budget with room to spare
