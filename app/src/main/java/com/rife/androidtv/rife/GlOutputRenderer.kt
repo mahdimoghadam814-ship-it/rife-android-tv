@@ -496,6 +496,19 @@ private const val WARP_FRAGMENT_SHADER = """
     // Renderer drawWarp() should blend with, read from the same accessor the CPU warp uses.
     private var warpBlendMode = 2
     private var warpDrawCalls = 0L
+    // Identity of the frame currently resident in each warp texture: its source buffer instance
+    // plus its capture timestamp (the call site passes the source timestampUs). The pairing
+    // pipeline hands consecutive pairs (A,B) then (B,C), so the next pair's frame0 is already
+    // resident as this pair's frame1 and one of the two full-resolution uploads can be skipped
+    // by rotating the textures - at 4K that transfer alone is ~33 MB per pair. The timestamp is
+    // what makes the check safe: the buffer pool recycles ByteBuffer instances for later,
+    // different frames, and only the timestamp tells a reused instance apart from its old
+    // content. A zero token means "no identity", which disables the shortcut for callers that
+    // do not pass one.
+    private var warpTex0Buf: ByteBuffer? = null
+    private var warpTex1Buf: ByteBuffer? = null
+    private var warpTex0Token = 0L
+    private var warpTex1Token = 0L
 
     // ---- Temporal denoiser (see DENOISE_FRAGMENT_SHADER) ----
     private var denoiseProgram = 0
@@ -860,6 +873,17 @@ private const val WARP_FRAGMENT_SHADER = """
         warpTex1 = createWarpTexture()
         warpMotionTex = createWarpTexture()
         warpMaskTex = createWarpTexture()
+        // Fresh textures hold no storage yet, so every size and residency claim about them is
+        // false until the first upload gives uploadRgba() a reason to take the glTexImage2D
+        // branch (glTexSubImage2D on a storage-less texture is GL_INVALID_OPERATION).
+        warpTex0W = 0
+        warpTex0H = 0
+        warpTex1W = 0
+        warpTex1H = 0
+        warpTex0Buf = null
+        warpTex1Buf = null
+        warpTex0Token = 0L
+        warpTex1Token = 0L
         Log.i(TAG, "warp program ready")
 
         initDenoise()
@@ -1677,20 +1701,28 @@ private const val WARP_FRAGMENT_SHADER = """
         targetWidth: Int,
         targetHeight: Int,
         timestep: Float,
-        timestampNs: Long = 0L
+        timestampNs: Long = 0L,
+        frame0Token: Long = 0L,
+        frame1Token: Long = 0L
     ): Boolean = renderWarp(
         frame0, frame1, motion, srcWidth, srcHeight, targetWidth, targetHeight,
-        floatArrayOf(timestep), longArrayOf(timestampNs)
+        floatArrayOf(timestep), longArrayOf(timestampNs), frame0Token, frame1Token
     )
 
     /**
      * Presents every timestep in [timesteps] in order from a single upload of the pair. A level
      * above 2x needs several interpolations of the same two frames, and re-uploading them per
      * timestep would pay the readback-sized transfer again for data that has not changed; only
-     * the draw - one uniform and one swap per timestep - is repeated.
+     * the draw - one uniform and one swap per timestep - is repeated. The same holds across
+     * consecutive pairs: pair (A,B) is followed by (B,C), so [frame0Token]/[frame1Token] let the
+     * call keep B resident instead of re-uploading it.
      *
-     * [timestamps] is parallel to [timesteps]: the presentation time each interpolated frame
-     * must carry, in nanoseconds. See [outputTimestampNs].
+     * [timestamps] is parallel to [timesteps]: the presentation time each interpolated frame must
+     * carry, in nanoseconds. See [outputTimestampNs].
+     *
+     * [frame0Token] and [frame1Token] are the source frames' capture timestamps (any unique
+     * per-frame value works). Zero disables the cross-pair residency shortcut, which stays
+     * correct but pays both uploads.
      */
     fun renderWarp(
         frame0: ByteBuffer,
@@ -1701,7 +1733,9 @@ private const val WARP_FRAGMENT_SHADER = """
         targetWidth: Int,
         targetHeight: Int,
         timesteps: FloatArray,
-        timestamps: LongArray = LongArray(0)
+        timestamps: LongArray = LongArray(0),
+        frame0Token: Long = 0L,
+        frame1Token: Long = 0L
     ): Boolean {
         if (timesteps.isEmpty()) {
             Log.w(TAG, "renderWarp: empty timesteps array")
@@ -1733,9 +1767,67 @@ private const val WARP_FRAGMENT_SHADER = """
         nsCurrent += System.nanoTime() - tPhase
 
         tPhase = System.nanoTime()
-        if (!uploadRgba(warpTex0, frame0, srcWidth, srcHeight, warpTex0W, warpTex0H) ||
-            !uploadRgba(warpTex1, frame1, srcWidth, srcHeight, warpTex1W, warpTex1H) ||
-            !uploadRgba(warpMotionTex, motion, gridW, gridH, warpGridW, warpGridH) ||
+        // Consecutive pairs share a frame: pair (A,B) is followed by (B,C), so B is already
+        // resident in one of the two textures. Rotating the pair keeps that full-resolution
+        // transfer off the worker path; the timestamp plus buffer identity is what proves the
+        // resident texture still holds this frame (the pool recycles buffer instances).
+        var tex0 = warpTex0
+        var tex1 = warpTex1
+        var tex0W = warpTex0W
+        var tex0H = warpTex0H
+        var tex1W = warpTex1W
+        var tex1H = warpTex1H
+        var tex0Buf = warpTex0Buf
+        var tex1Buf = warpTex1Buf
+        var tex0Token = warpTex0Token
+        var tex1Token = warpTex1Token
+        val frame0Resident = warpPairFrameResident(
+            frameToken = frame0Token,
+            sameBufferAsResident = frame0 === tex1Buf,
+            residentToken = tex1Token,
+            residentWidth = tex1W,
+            residentHeight = tex1H,
+            srcWidth = srcWidth,
+            srcHeight = srcHeight
+        )
+        if (frame0Resident) {
+            // This pair's frame0 is this pair's previous frame1: hand that texture over as
+            // frame0 and upload only the new frame1 into the freed slot.
+            var tmpInt = tex0; tex0 = tex1; tex1 = tmpInt
+            tmpInt = tex0W; tex0W = tex1W; tex1W = tmpInt
+            tmpInt = tex0H; tex0H = tex1H; tex1H = tmpInt
+            var tmpBuf = tex0Buf; tex0Buf = tex1Buf; tex1Buf = tmpBuf
+            var tmpToken = tex0Token; tex0Token = tex1Token; tex1Token = tmpToken
+            val frame1Resident = warpPairFrameResident(
+                frameToken = frame1Token,
+                sameBufferAsResident = frame1 === tex0Buf,
+                residentToken = tex0Token,
+                residentWidth = tex0W,
+                residentHeight = tex0H,
+                srcWidth = srcWidth,
+                srcHeight = srcHeight
+            )
+            if (!frame1Resident &&
+                !uploadRgba(tex1, frame1, srcWidth, srcHeight, tex1W, tex1H)
+            ) {
+                Log.w(TAG, "renderWarp: texture upload failed")
+                return false
+            }
+            tex1Buf = frame1
+            tex1Token = frame1Token
+        } else {
+            if (!uploadRgba(tex0, frame0, srcWidth, srcHeight, tex0W, tex0H) ||
+                !uploadRgba(tex1, frame1, srcWidth, srcHeight, tex1W, tex1H)
+            ) {
+                Log.w(TAG, "renderWarp: texture upload failed")
+                return false
+            }
+            tex0Buf = frame0
+            tex0Token = frame0Token
+            tex1Buf = frame1
+            tex1Token = frame1Token
+        }
+        if (!uploadRgba(warpMotionTex, motion, gridW, gridH, warpGridW, warpGridH) ||
             !uploadRgba(
                 warpMaskTex, motion, gridW, gridH, warpGridW, warpGridH,
                 gridW * gridH * 4
@@ -1744,10 +1836,16 @@ private const val WARP_FRAGMENT_SHADER = """
             Log.w(TAG, "renderWarp: texture upload failed")
             return false
         }
+        warpTex0 = tex0
+        warpTex1 = tex1
         warpTex0W = srcWidth
         warpTex0H = srcHeight
         warpTex1W = srcWidth
         warpTex1H = srcHeight
+        warpTex0Buf = tex0Buf
+        warpTex1Buf = tex1Buf
+        warpTex0Token = tex0Token
+        warpTex1Token = tex1Token
         warpGridW = gridW
         warpGridH = gridH
         warpGridStep = gridStep
@@ -1788,6 +1886,20 @@ private const val WARP_FRAGMENT_SHADER = """
         denHistoryTex = 0
         denPair0 = 0
         denPair1 = 0
+    }
+
+    /**
+     * Forgets which frames the warp textures hold. Pipeline resets (seek, stream change) need
+     * this: the next stream can carry the same presentation timestamps as the old one, so a
+     * texture resident from before the cut could otherwise pass the cross-pair identity check
+     * and present stale pixels under a matching timestamp. The next pair simply pays both
+     * uploads again.
+     */
+    fun resetWarpResidency() {
+        warpTex0Buf = null
+        warpTex1Buf = null
+        warpTex0Token = 0L
+        warpTex1Token = 0L
     }
 
     /**
@@ -2557,6 +2669,10 @@ private const val WARP_FRAGMENT_SHADER = """
             warpTex0H = 0
             warpTex1W = 0
             warpTex1H = 0
+            warpTex0Buf = null
+            warpTex1Buf = null
+            warpTex0Token = 0L
+            warpTex1Token = 0L
             warpGridW = 0
             warpGridH = 0
             warpGridStep = 16
@@ -2652,3 +2768,27 @@ private const val WARP_FRAGMENT_SHADER = """
         return shader
     }
 }
+
+/**
+ * Pure decision behind the cross-pair upload shortcut in [GlOutputRenderer.renderWarp]: may the
+ * frame this call is about to upload be skipped because a warp texture already holds it?
+ *
+ * True only when every identity agrees - a real token (zero means "unknown", never a match), the
+ * same token as the resident slot, the very same buffer instance, and the resident texture's
+ * dimensions still equal to the upload's. Buffer identity alone is not enough because the pool
+ * recycles instances for later frames, and token equality alone is not enough because a seek can
+ * replay timestamps; the caller pairs both, and resets the residency on pipeline boundaries.
+ */
+internal fun warpPairFrameResident(
+    frameToken: Long,
+    sameBufferAsResident: Boolean,
+    residentToken: Long,
+    residentWidth: Int,
+    residentHeight: Int,
+    srcWidth: Int,
+    srcHeight: Int
+): Boolean = frameToken != 0L &&
+    frameToken == residentToken &&
+    sameBufferAsResident &&
+    residentWidth == srcWidth &&
+    residentHeight == srcHeight

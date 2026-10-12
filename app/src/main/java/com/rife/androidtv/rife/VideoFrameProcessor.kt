@@ -1570,6 +1570,9 @@ class VideoFrameProcessor(
         // ...and neither may the motion-aligned denoiser's: the frame after a seek is not adjacent
         // to anything it has merged, so continuing the recursion would smear across the cut.
         outputRenderer?.resetDenoise()
+        // Nor may the warp textures' residency claim: a new stream can reuse the timestamps of
+        // the old one, which is exactly the identity the cross-pair upload shortcut trusts.
+        outputRenderer?.resetWarpResidency()
         denoiseUnavailableLogged = false
 
         cachedIn0Buf = null
@@ -3101,10 +3104,18 @@ class VideoFrameProcessor(
                         intermediate, timestamps
                     ) == true
                 } else {
+                    // Residency tokens identify the uploaded frames across consecutive pairs so
+                    // the renderer can keep the shared frame resident instead of re-uploading
+                    // it (the saving is a full-resolution transfer per pair at 4K). They are
+                    // passed only when the buffer really is the immutable captured frame: a
+                    // denoise scratch buffer is rewritten in place before the next pair, so
+                    // claiming a capture timestamp for its contents would be false.
                     outputRenderer?.renderWarp(
                         src0Buf, src1Buf, motionBuf,
                         rifeInputW, rifeInputH, rifeOutputW, rifeOutputH,
-                        intermediate, timestamps
+                        intermediate, timestamps,
+                        frame0Token = if (src0Buf === prev.pixels) prev.timestampUs else 0L,
+                        frame1Token = if (src1Buf === nextFrame.pixels) nextFrame.timestampUs else 0L
                     ) == true
                 }
                 if (presented) {
@@ -3362,7 +3373,7 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()}${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"}${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
         // Scheduling evidence rather than stage cost: how long the worker actually went quiet
         // between callbacks, how regularly the decoder delivered, and how much wall clock each
         // output frame was entitled to. A stage time that fits its budget with room to spare

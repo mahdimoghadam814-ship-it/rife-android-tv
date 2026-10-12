@@ -79,6 +79,7 @@ class OesFrameGrabber {
     private var copyTexCoord = -1
     private var copyTexture = -1
     private var lastRefusalLogNs = 0L
+    private var lastRecoveryLogNs = 0L
     val isAsyncReadbackSupported: Boolean get() = pboSupported
     val isHdrSourceSupported: Boolean get() = hdrSourceSupported
     val pendingPboCount: Int get() = pendingPbos.size
@@ -112,6 +113,9 @@ class OesFrameGrabber {
          * references the pipeline constants it tracks.
          */
         internal const val HDR_SOURCE_SLOTS = 8
+
+        /** One [RECOVER] line per second: enough to see a discard storm, cheap enough to keep. */
+        private const val RECOVERY_LOG_INTERVAL_NS = 1_000_000_000L
 
         /**
          * Per-frame capture diagnostics. Costs a whole-buffer pass inside the timed readback, so
@@ -370,8 +374,22 @@ class OesFrameGrabber {
     ): Boolean {
         val queued = enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource)
         if (!queued) {
-            // The ring/leases are stuck. Discard everything and try once more.
+            // The ring/leases are stuck. Discard everything and try once. The discard is what
+            // frees the slots the retry needs - and it also throws decoded frames away, so at
+            // the resolutions where the ring fills fastest (4K, where both the GPU readback and
+            // the pair render are longest) it is a frame-loss mechanism and has to be visible
+            // in the log rather than hiding behind the refusal that preceded it.
+            val discarded = pendingPbos.size
             discardPendingReadbacks()
+            val nowNs = System.nanoTime()
+            if (nowNs - lastRecoveryLogNs >= RECOVERY_LOG_INTERVAL_NS) {
+                lastRecoveryLogNs = nowNs
+                Log.w(
+                    TAG,
+                    "[RECOVER] readback stuck; discarded $discarded pending readbacks to retry " +
+                        "(each was a decoded frame); ${readbackState()}"
+                )
+            }
             return enqueueReadback(surfaceTexture, width, height, timestampUs, retainHdrSource)
         }
         return true
