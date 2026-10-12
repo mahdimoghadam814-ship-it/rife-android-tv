@@ -346,13 +346,7 @@ class HdrRepresentationProbe {
         // The magnitude test, stated in the log so the line carries the conclusion and not only
         // the evidence. The verdict is published on [representation], which the present path reads
         // to select the shader conversion - measured, not guessed.
-        // LINEAR threshold tightened: require a slightly higher p99 ceiling and a non-trivial
-        // max intensity to avoid misclassifying dark/fade-to-black scenes as linear light.
-        representation = when {
-            mean >= 0.10 || p50 >= 0.10 -> Representation.ENCODED
-            mean <= 0.02 && p99 <= 0.15 && maxIntensity > 0.05 -> Representation.LINEAR
-            else -> Representation.INDETERMINATE
-        }
+        representation = classify(mean, p50, p99, maxIntensity)
         val verdict = when (representation) {
             Representation.ENCODED ->
                 "ENCODED (PQ/HLG-like code values) - decode before tone-mapping, do not re-encode"
@@ -421,6 +415,28 @@ class HdrRepresentationProbe {
 
     companion object {
         private const val TAG = "HdrRepresentationProbe"
+
+        /**
+         * The magnitude test that separates the two populations: PQ/HLG code values for real
+         * video sit well up their range, while light linearised over 0..10000 nits puts a
+         * 100-nit diffuse white near 0.01. Pure arithmetic, so the verdict the present path
+         * selects the shader conversion with is unit-testable without a GL context.
+         *
+         * The LINEAR ceiling requires a non-trivial max intensity as well, so a dark or
+         * fade-to-black scene - whose mean and p99 are small for reasons that have nothing to do
+         * with encoding - is reported INDETERMINATE (and therefore treated as ENCODED) instead of
+         * flipping the conversion off measured blackness.
+         */
+        internal fun classify(
+            mean: Double,
+            p50: Float,
+            p99: Float,
+            maxIntensity: Float
+        ): Representation = when {
+            mean >= 0.10 || p50 >= 0.10 -> Representation.ENCODED
+            mean <= 0.02 && p99 <= 0.15 && maxIntensity > 0.05 -> Representation.LINEAR
+            else -> Representation.INDETERMINATE
+        }
 
         /** Side of one sampled square; nine of them together cannot stall a frame. */
         private const val TILE_SIZE = 48

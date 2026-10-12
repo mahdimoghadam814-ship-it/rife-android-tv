@@ -226,6 +226,13 @@ class VideoFrameProcessor(
          */
         private const val MIN_QUEUE_LATENCY_MS = 250L
 
+        /**
+         * Minimum spacing between repeated pairing/output-timestamp diagnostics. The counters
+         * they describe are cumulative and reported with every timing window, so the log line
+         * itself only has to prove the mechanism is firing - not to carry every occurrence.
+         */
+        private const val DIAGNOSTIC_LOG_INTERVAL_NS = 5_000_000_000L
+
         /** Dataspace the source probe could not read: API below 33, or the getter threw. */
         private const val DATA_SPACE_NOT_QUERIED = -2
         private const val DATA_SPACE_UNKNOWN = -1
@@ -370,14 +377,48 @@ class VideoFrameProcessor(
     private val motionExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "SvpMotionWorker").apply { isDaemon = true }
     }
-    private var cachedOffThreadMotionBuf: ByteBuffer? = null
+
+    /**
+     * Two motion-field buffers, alternating per submitted motion. The pipeline deliberately runs
+     * the next pair's motion while the worker renders the current pair, so a single cached buffer
+     * would be written by the motion thread while `processFramePair()` is still reading it - a
+     * torn field that warps the rendered pair with a different pair's motion. With
+     * [pairProcessing] holding at most one motion in flight, two slots are exactly enough: the
+     * render of pair N reads slot N%2 while motion N+1 writes slot (N+1)%2, and slot N%2 is free
+     * again by the time motion N+2 selects it. Only the motion thread advances the index.
+     */
+    private val offThreadMotionBufs = arrayOfNulls<ByteBuffer>(2)
+    private var offThreadMotionBufIndex = 0
 
     /** CPU denoise (FastDVDnet) runs on a separate executor to keep the worker free for capture/render. */
     private val denoiseExecutor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "DenoiseWorker").apply { isDaemon = true }
     }
 
+    /**
+     * True while a pair is submitted for motion/rendering and has not been rendered yet.
+     *
+     * Guarding `processNextFramePair()` with this is what keeps pairing consecutive: `previousFrame`
+     * is only advanced by `processFramePair()`, so while a pair is in flight a newly captured frame
+     * would otherwise be paired against that stale `previousFrame` - a pair that skips a frame
+     * (wrong motion magnitude) whose output timestamps overlap the pair already presented
+     * (duplicate/backwards PTS, which reads as stutter). The capture stays in [frameQueue] and the
+     * render that finishes the in-flight pair picks it up through `trySubmitNextMotion()`.
+     *
+     * Set at both motion submit sites, cleared when that work is dequeued for rendering (or when
+     * its submit failed), and cleared by `resetPipelineOnWorker()`.
+     */
     private var pairProcessing = false
+
+    // Pairing/output diagnostics, reported once per timing window and logged at most once per
+    // DIAGNOSTIC_LOG_INTERVAL_NS so a bad stream cannot turn the log into a bottleneck.
+    private var pairGateDeferredCount = 0L
+    private var pairGapCount = 0L
+    private var pairGapLastLogNs = 0L
+    private var outputTsRegressionLastLogNs = 0L
+
+    /** Ordering rule for every present; pure state machine so the rule itself is unit-testable. */
+    private val outputTimeline = OutputTimelineGuard()
 
     /** Snapshotted on the worker but compared from the motion thread, so it must be visible. */
     @Volatile
@@ -1508,6 +1549,10 @@ class VideoFrameProcessor(
         // and in the lease table below; there is no separate "in-flight pair" reservation to
         // drop, so the previous frame is released outright.
         pairProcessing = false
+        // The output timeline restarts with the pipeline: after a seek the first present carries
+        // no relation to the last one before it, so the regression check has to re-arm rather
+        // than report the cut as a defect.
+        outputTimeline.rearm()
         previousFrame?.let {
             releaseFrameBuffer(it.pixels)
             discarded++
@@ -2320,6 +2365,16 @@ class VideoFrameProcessor(
 
     private fun processNextFramePair() {
         if (released) return
+        // A pair is already submitted for motion/rendering, so `previousFrame` has not been
+        // advanced to this capture's predecessor yet. Pairing now would reuse the stale
+        // previousFrame: the pair would skip a frame (motion magnitude doubled, real frame never
+        // used as an anchor) and its output timestamps would overlap the pair already presented.
+        // Leave the capture in the queue - the render that finishes the in-flight pair calls
+        // trySubmitNextMotion(), which picks the head up with the correct predecessor.
+        if (pairProcessing) {
+            pairGateDeferredCount++
+            return
+        }
         
         // Discard stale frames that have been in queue too long (latency control). The bound is
         // two source frame intervals rather than a fixed 16 ms: CPU SVP pair processing grows
@@ -2364,6 +2419,7 @@ class VideoFrameProcessor(
         val generation = streamGeneration
         leaseForMotion(prev.pixels)
         leaseForMotion(nextFrame.pixels)
+        pairProcessing = true
         motionExecutor.execute {
             val prepared = computeMotionFieldOffThread(prev, nextFrame)
             val handler = workerHandler
@@ -2372,6 +2428,7 @@ class VideoFrameProcessor(
                 // releaseStateOnWorker() and drained the pipeline, so there is no worker left to
                 // race and no pool worth returning to: drop the lease without recycling, and do
                 // not touch worker-owned buffers from this thread.
+                pairProcessing = false
                 dropMotionLeases(prev, nextFrame, recycle = false)
                 if (generation == streamGeneration) {
                     runOnWorker("async_motion_fallback") { processFramePair(prev, nextFrame, prepared) }
@@ -2389,6 +2446,7 @@ class VideoFrameProcessor(
             if (!posted) {
                 // The looper only stops quitting after releaseStateOnWorker() drained the
                 // pipeline, so this is teardown: drop the lease without recycling.
+                pairProcessing = false
                 dropMotionLeases(prev, nextFrame, recycle = false)
             }
         }
@@ -2408,6 +2466,11 @@ class VideoFrameProcessor(
             // Stream changed since the motion task was submitted; clean up this work. Counted
             // here as well as in the reset itself because a reset only counts what it drained -
             // this item was queued after the drain.
+            //
+            // The gate is deliberately NOT cleared here: a generation only ever moves inside
+            // resetPipelineOnWorker(), which already cleared the gate this work owned. Any gate
+            // set after that reset belongs to a newer pair still in flight, and clearing it would
+            // reopen exactly the stale-previousFrame pairing this gate exists to prevent.
             droppedFrameCount++
             Log.d(TAG, "Dropping work computed against an older stream generation")
             dropMotionLeases(work.prev, work.next, recycle = false)
@@ -2421,6 +2484,11 @@ class VideoFrameProcessor(
         val prev = work.prev
         val next = work.next
         val prepared = work.prepared
+
+        // This work is now being rendered, so it no longer holds the in-flight gate. It is
+        // cleared BEFORE trySubmitNextMotion() on purpose: the next submission takes the gate
+        // again, and clearing after it would immediately open the window the gate closes.
+        pairProcessing = false
 
         // Submit motion for NEXT pair BEFORE rendering current pair.
         // This keeps motion executor busy continuously.
@@ -2458,11 +2526,13 @@ class VideoFrameProcessor(
         val generation = streamGeneration
         leaseForMotion(prev.pixels)
         leaseForMotion(nextFrame.pixels)
+        pairProcessing = true
         motionExecutor.execute {
             val prepared = computeMotionFieldOffThread(prev, nextFrame)
             val handler = workerHandler
             if (handler == null) {
                 // See the sibling submit site: teardown, so drop without recycling.
+                pairProcessing = false
                 dropMotionLeases(prev, nextFrame, recycle = false)
                 if (generation == streamGeneration) {
                     runOnWorker("async_motion_fallback") { processFramePair(prev, nextFrame, prepared) }
@@ -2472,11 +2542,15 @@ class VideoFrameProcessor(
             val posted = handler.post {
                 val work = InFlightWork(prev, nextFrame, prepared, generation, generateTimestamps(prev, nextFrame))
                 pendingRenderQueue.addLast(work)
-                // Note: we do NOT call renderPendingQueue() here to avoid re-entrancy.
-                // The current render will call it when it finishes.
+                // Render it. The render that submitted this motion has long finished by now - its
+                // end-of-render repost only fires when the queue was already non-empty, which it
+                // could not be while this motion was still running - so waiting for a "current
+                // render" would leave the work stranded in the queue.
+                renderPendingQueue()
             }
             if (!posted) {
                 // See the sibling submit site: teardown, so drop without recycling.
+                pairProcessing = false
                 dropMotionLeases(prev, nextFrame, recycle = false)
             }
         }
@@ -2494,10 +2568,15 @@ class VideoFrameProcessor(
             if (bytes <= 0L || bytes > Int.MAX_VALUE) {
                 PreparedMotion(null, false, System.nanoTime() - started)
             } else {
-                var field = cachedOffThreadMotionBuf
+                // Alternate slots so the motion that runs while the worker renders the previous
+                // pair never writes the buffer that render is reading (see offThreadMotionBufs).
+                // This runs only on the single motion thread, so the index needs no sync.
+                val slot = offThreadMotionBufIndex
+                offThreadMotionBufIndex = (offThreadMotionBufIndex + 1) and 1
+                var field = offThreadMotionBufs[slot]
                 if (field == null || field.capacity() < bytes) {
                     field = ByteBuffer.allocateDirect(bytes.toInt())
-                    cachedOffThreadMotionBuf = field
+                    offThreadMotionBufs[slot] = field
                 }
                 field.clear()
                 val ready = NativeEngine.computeMotionField(
@@ -2566,7 +2645,29 @@ class VideoFrameProcessor(
         // Rejected outside [1ms, 1s] so a seek cannot set a nonsense one.
         val srcIntervalUs = nextFrame.timestampUs - prev.timestampUs
         if (srcIntervalUs in 1_000L..1_000_000L) {
+            val previousIntervalUs = lastPairIntervalUs
             lastPairIntervalUs = srcIntervalUs
+            // Pairing evidence. Consecutive pairs of a steady stream span the same source
+            // interval, so a span that jumps well past the previous one means an anchor frame was
+            // skipped between two pairs (the in-flight-pair defect) - which reads as stutter even
+            // when the output rate itself looks correct. A genuine cadence change logs exactly
+            // once, and the log line itself is rate-limited regardless.
+            if (previousIntervalUs in 1_000L..1_000_000L &&
+                (srcIntervalUs > previousIntervalUs * 3 / 2 ||
+                    srcIntervalUs * 3 / 2 < previousIntervalUs)
+            ) {
+                pairGapCount++
+                val gapLogNs = System.nanoTime()
+                if (gapLogNs - pairGapLastLogNs >= DIAGNOSTIC_LOG_INTERVAL_NS) {
+                    pairGapLastLogNs = gapLogNs
+                    Log.w(
+                        TAG,
+                        "[PAIRGAP] pair spans ${srcIntervalUs / 1000.0} ms but the previous " +
+                            "pair span ${previousIntervalUs / 1000.0} ms - skipped or " +
+                            "duplicated anchor frame in pairing, or a source cadence change"
+                    )
+                }
+            }
         }
 
         val rifeInputW = nextFrame.width
@@ -2690,6 +2791,7 @@ class VideoFrameProcessor(
                             outputRenderer?.presentDenoised(
                                 rifeInputW, rifeInputH, nextFrame.timestampUs * 1000L
                             ) == true
+                        if (presented) noteOutputTimestamp(nextFrame.timestampUs * 1000L)
                         nsRender += System.nanoTime() - tRenderStart
                     }
                 }
@@ -2979,14 +3081,17 @@ class VideoFrameProcessor(
                 } else if (hdrComposition) {
                     // The warp presents straight from the retained textures, so the probe - whose
                     // verdict decides whether the shader decodes before tone-mapping - has to run
-                    // here too, not only in renderFrameToOutput. The context key is built from
-                    // the same fields as that call's key: a mismatched key would read as a
-                    // "changed" source and force a re-probe every time the two present paths
-                    // alternate, turning a once-per-stream measurement into a per-frame stall.
-                    // Rate-limited inside; writes nothing; same thread that owns the context.
+                    // here too, not only in renderFrameToOutput. The context key must be the same
+                    // at both call sites: a key that differs between them would read as "changed"
+                    // on every alternating present and re-probe each time. It must also NOT carry
+                    // the retained texture's ID - those rotate through hdrSourceSlots every frame,
+                    // which made the key "changed" on nearly every present and defeated the probe's
+                    // own 10 s rate limit, i.e. ten synchronous glReadPixels and a full pipeline
+                    // flush per frame. Rate-limited inside; writes nothing; same thread that owns
+                    // the context.
                     hdrRepresentationProbe?.probe(
                         hdrFrame0, rifeInputW, rifeInputH,
-                        "tex=$hdrFrame0 ${rifeInputW}x${rifeInputH} out=$outputDataSpace " +
+                        "${rifeInputW}x$rifeInputH out=$outputDataSpace " +
                             "color=${sourceColorInfo ?: "unknown"}"
                     )
                     outputRenderer?.let { applyPresentState(it) }
@@ -3002,7 +3107,14 @@ class VideoFrameProcessor(
                         intermediate, timestamps
                     ) == true
                 }
-                if (presented) warpPresentedPoints = intermediate.size
+                if (presented) {
+                    warpPresentedPoints = intermediate.size
+                    // The warp presents these timestamps itself, so the timeline check has to
+                    // happen here. On a failed warp the CPU fallback below presents the same
+                    // values through renderBufferToOutput, which checks them there instead -
+                    // checking both would count one regression twice.
+                    for (presentedTs in timestamps) noteOutputTimestamp(presentedTs)
+                }
             }
             submittedOutputFrameCount += warpPresentedPoints
             if (!presented) {
@@ -3090,6 +3202,7 @@ class VideoFrameProcessor(
                     ) == true
                 ) {
                     // already on the surface
+                    noteOutputTimestamp(nextFrame.timestampUs * 1000L)
                 } else {
                     renderFrameToOutput(nextFrame, nextFrame.timestampUs * 1000L)
                 }
@@ -3249,7 +3362,7 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} rendererCalls=${renderCalls.toInt()}${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()}${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
         // Scheduling evidence rather than stage cost: how long the worker actually went quiet
         // between callbacks, how regularly the decoder delivered, and how much wall clock each
         // output frame was entitled to. A stage time that fits its budget with room to spare
@@ -3632,16 +3745,43 @@ class VideoFrameProcessor(
         )
     }
 
+    /**
+     * Guards the output timeline. Every present must carry a timestamp later than the previous
+     * one: a non-increasing timestamp means two pairs overlapped on the timeline, which is what
+     * pairing against a stale [previousFrame] produces. The encoder and the BufferQueue both
+     * punish that with dropped or repeated frames - stutter at a first glance even though the
+     * output rate itself looks correct. Counts every occurrence, logs at most once per
+     * [DIAGNOSTIC_LOG_INTERVAL_NS]. A jump forward is always accepted (seek, cadence change).
+     */
+    private fun noteOutputTimestamp(timestampNs: Long) {
+        if (outputTimeline.note(timestampNs)) return
+        val nowNs = System.nanoTime()
+        if (nowNs - outputTsRegressionLastLogNs >= DIAGNOSTIC_LOG_INTERVAL_NS) {
+            outputTsRegressionLastLogNs = nowNs
+            Log.w(
+                TAG,
+                "[TSREGR] output timestamp did not advance: ${timestampNs / 1_000_000.0} ms " +
+                    "after ${outputTimeline.lastTimestampNs / 1_000_000.0} ms - two presents " +
+                    "carried the same span (stale-previousFrame pairing, or a duplicate present " +
+                    "on a fallback path); regressions=${outputTimeline.regressions}"
+            )
+        }
+    }
+
     private fun renderFrameToOutput(frame: FrameData, timestampNs: Long = 0L) {
         val hdrTexture = hdrTextureByAnalysisBuffer[frame.pixels] ?: 0
         if (hdrTexture != 0) {
             // Measured here rather than at capture because this is the exact texture the present
             // samples; it is rate-limited inside and writes nothing, so the frame is unaffected.
+            // The key deliberately excludes the texture ID (which rotates through
+            // hdrSourceSlots every frame and would defeat that rate limit) and must stay identical
+            // to the key used at the warp present site, so alternating between the two paths cannot
+            // read as a changed source either.
             hdrRepresentationProbe?.probe(
                 hdrTexture,
                 frame.width,
                 frame.height,
-                "tex=$hdrTexture ${frame.width}x${frame.height} out=$outputDataSpace " +
+                "${frame.width}x${frame.height} out=$outputDataSpace " +
                     "color=${sourceColorInfo ?: "unknown"}"
             )
             // Single present path for both modes: the retained source texture is always worth
@@ -3651,6 +3791,10 @@ class VideoFrameProcessor(
                 ?.renderTexture(hdrTexture, frame.width, frame.height, timestampNs) == true
             if (presented) {
                 submittedOutputFrameCount++
+                // Checked only on an actual present; a dropped frame never defined the timeline.
+                // The non-HDR half of this function reaches renderBufferToOutput, which checks
+                // there - checking here as well would judge the same timestamp twice.
+                noteOutputTimestamp(timestampNs)
             } else {
                 droppedOutputFrameCount++
                 Log.e(TAG, "HDR source texture presentation failed")
@@ -3756,6 +3900,11 @@ class VideoFrameProcessor(
             if (success) {
                 submittedOutputFrameCount++
                 surfaceRecoveryRequested = false
+                // Every CPU-side present funnels through here, so this is the single place the
+                // output timeline can be checked without counting one timestamp twice (the
+                // warp path checks its own array before it presents; failed frames never
+                // defined the timeline and are therefore not judged).
+                noteOutputTimestamp(timestampNs)
             } else {
                 droppedOutputFrameCount++
                 Log.w(TAG, "renderBufferToOutput: renderer.render returned false; frame dropped")
