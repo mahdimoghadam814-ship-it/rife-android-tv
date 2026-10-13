@@ -229,10 +229,14 @@ class OesFrameGrabber {
          * PQ scale (measured by HdrRepresentationProbe), so the transfer decode is skipped and
          * the values scale directly to 100-nit-relative units - applying an EOTF to already-
          * linear light is what produces the washed-out overexposure this branch guards against.
-         * The optional BT.2020 to BT.709 matrix runs on that linear light, then a Hable
-         * luminance roll-off (reference white preserved just below SDR full, highlights up to a
-         * 1000-nit white point compressed into range) scales RGB by the luma ratio so hue is
-         * kept, and the sRGB OETF produces the untagged 8-bit values the rest of the pipeline
+         * The optional BT.2020 to BT.709 matrix runs on that linear light; out-of-gamut
+         * negatives are folded toward the luminance axis (luminance preserved, hue kept) rather
+         * than clipped per channel, which is what collapsed saturated colors onto the 709
+         * primaries and read as excessive saturation. The display-referred roll-off then passes
+         * everything at or below the knee (50 nits) through unchanged - the previous global
+         * Hable curve crushed this range and was the dark picture - and folds highlights above
+         * the knee into SDR full with an extended-Reinhard shape normalized so 1000 nits maps
+         * to 1.0. The sRGB OETF produces the untagged 8-bit values the rest of the pipeline
          * already treats as SDR.
          */
         private const val TONEMAP_FRAGMENT_SHADER = """
@@ -281,15 +285,35 @@ class OesFrameGrabber {
                 );
             }
 
-            // Hable filmic curve, used as a scalar luminance roll-off normalized by hable(W).
-            float hable(float x) {
-                const float A = 0.22;
-                const float B = 0.30;
-                const float C = 0.10;
-                const float D = 0.20;
-                const float E = 0.01;
-                const float F = 0.30;
-                return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F;
+            // Luminance-preserving fold of out-of-gamut negatives toward the neutral axis.
+            // Per-channel clipping of the matrix's negative channels is a hue collapse onto
+            // the target primaries - the oversaturated look. Scaling chroma by
+            // Y/(Y-min) lands the most negative channel exactly at zero while keeping Y and
+            // the r:g:b chroma ratios, i.e. the same color with just enough less saturation
+            // to fit the gamut. In-gamut colors (min >= 0) and neutrals are untouched.
+            vec3 foldOutOfGamut(vec3 lin) {
+                float y = dot(lin, vec3(0.2126, 0.7152, 0.0722));
+                float minc = min(min(lin.r, lin.g), lin.b);
+                if (minc >= 0.0 || y <= 1e-5) {
+                    return max(lin, vec3(0.0));
+                }
+                float s = y / (y - minc);
+                return max(vec3(y) + (lin - vec3(y)) * s, vec3(0.0));
+            }
+
+            // Display-referred highlight roll-off: identity at or below the knee, then an
+            // extended-Reinhard fold of the span (knee, peak] into (knee, 1]. m(W) == 1
+            // exactly, so the assumed peak lands on SDR full; beyond it the value clamps.
+            float rollOff(float y) {
+                const float knee = 0.5;   // 50 nits: SDR shadows/midtones pass through
+                const float peak = 10.0;  // 1000 nits: assumed source peak
+                if (y <= knee) {
+                    return max(y, 0.0);
+                }
+                float h = y - knee;
+                float w = peak - knee;
+                float m = h * (1.0 + h / (w * w)) / (1.0 + h);
+                return knee + (1.0 - knee) * clamp(m, 0.0, 1.0);
             }
 
             void main() {
@@ -306,12 +330,12 @@ class OesFrameGrabber {
                     lin100 = pqToLinear(code) * 100.0;
                 }
                 if (uBt2020ToBt709 == 1) {
-                    lin100 = bt2020To709Matrix() * lin100;
+                    lin100 = foldOutOfGamut(bt2020To709Matrix() * lin100);
                 }
                 lin100 = max(lin100, vec3(0.0));
-                const float W = 10.0;
+                // Scalar luminance roll-off scaled back over RGB keeps hue and neutrals.
                 float Y = dot(lin100, vec3(0.2126, 0.7152, 0.0722));
-                float mappedY = hable(Y) / hable(W);
+                float mappedY = rollOff(Y);
                 float scale = Y > 1e-5 ? mappedY / Y : 0.0;
                 vec3 sdr = clamp(lin100 * scale, 0.0, 1.0);
                 vec3 lo = sdr * 12.92;

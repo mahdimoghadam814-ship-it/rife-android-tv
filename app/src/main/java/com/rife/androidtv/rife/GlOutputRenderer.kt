@@ -2290,16 +2290,18 @@ private const val WARP_FRAGMENT_SHADER = """
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
 
-            val error = GLES20.glGetError()
-            if (error != GLES20.GL_NO_ERROR) {
-                Log.e(TAG, "Warp blit failed with GL error 0x${error.toString(16)}")
-            }
-
             if (swapBuffers(eglDisplay, eglSurface, "warp")) {
                 presented = true
             }
             renderCalls++
             warpDrawCalls++
+        }
+
+        // GL errors are sticky, so one drain after the loop still reports the first failed
+        // blit; a glGetError per timestep costs a driver round-trip on every presented frame.
+        val error = GLES20.glGetError()
+        if (error != GLES20.GL_NO_ERROR) {
+            Log.e(TAG, "Warp blit failed with GL error 0x${error.toString(16)}")
         }
 
         GLES20.glDisableVertexAttribArray(warpAPosition)

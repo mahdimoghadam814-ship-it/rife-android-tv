@@ -1785,6 +1785,9 @@ class VideoFrameProcessor(
         resetPipelineOnWorker("release")
         hdrRepresentationProbe?.release()
         hdrRepresentationProbe = null
+        // Grabber GL state is released below; the flag must not outlive it (see the
+        // capture-path note: a stale true freezes every subsequent HDR-to-SDR session).
+        toneMapAvailable = false
         outputRenderer?.release()
         outputRenderer = null
 
@@ -1950,6 +1953,9 @@ class VideoFrameProcessor(
             val grabber = OesFrameGrabber()
             grabber.init(textureId)
             frameGrabber = grabber
+            // The new grabber starts with no tone-map program; the old flag described the
+            // released grabber and would claim shader readiness this one does not have.
+            toneMapAvailable = false
 
             // The GL output blitter shares this EGL context, so it is created here on the worker
             // thread while the context is current. A renderer still bound to a superseded
@@ -2404,18 +2410,26 @@ class VideoFrameProcessor(
         // any transfer decode runs - applying an EOTF to unmeasured samples is what produced
         // the washed-out overexposure this gate exists to prevent.
         var toneMapReq: OesFrameGrabber.ToneMapRequest? = null
+        // Always ask the live grabber, never a cached flag: the flag survived a grabber
+        // recreation (release deletes the compiled program; a new OesFrameGrabber starts at
+        // toneMapProgram==0) and its stale true short-circuited this call, so the new grabber
+        // never compiled, every ToneMap frame was refused at enqueue ("tonemap requested but
+        // unavailable"), and the scene froze - the first-launch-only failure. ensureToneMap()
+        // is O(1) once compiled and O(1) again once failed, so the cache bought nothing.
+        val toneMapWanted = hdrToSdrToneMap && isHdrSource()
+        val shaderCompiled = toneMapWanted && grabber.ensureToneMap()
+        if (shaderCompiled != toneMapAvailable) {
+            toneMapAvailable = shaderCompiled
+            logToneMapState("shader ${if (shaderCompiled) "ready" else "unavailable"}")
+        }
         val decision = toneMapDecision(
-            enabled = hdrToSdrToneMap && isHdrSource(),
+            enabled = toneMapWanted,
             colorTransfer = sourceColorInfo?.colorTransfer,
-            shaderCompiled = toneMapAvailable || grabber.ensureToneMap(),
+            shaderCompiled = shaderCompiled,
             representation = hdrRepresentationProbe?.representation,
         )
         when (decision) {
             is VideoFrameProcessor.Companion.ToneMapDecision.ToneMap -> {
-                if (!toneMapAvailable) {
-                    toneMapAvailable = true
-                    logToneMapState("shader ready")
-                }
                 toneMapReq = OesFrameGrabber.ToneMapRequest(
                     transfer = if (sourceColorInfo?.colorTransfer == C.COLOR_TRANSFER_HLG) {
                         OesFrameGrabber.TONEMAP_TRANSFER_HLG
