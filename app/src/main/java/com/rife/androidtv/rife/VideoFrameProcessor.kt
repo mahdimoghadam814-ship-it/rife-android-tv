@@ -516,6 +516,22 @@ class VideoFrameProcessor(
     private var droppedFrameCount = 0L
     private var droppedOutputFrameCount = 0L
     private var submittedOutputFrameCount = 0L
+    // Drop attribution: the stale-latency policy and the capacity-4 backpressure path both
+    // advance droppedFrameCount, but only the stale path logs per event. Splitting them turns
+    // the [PACING] windowed deltas into the discriminator between "processing paced the queue
+    // over its latency bound" and "a decoder burst overflowed the queue".
+    private var staleDiscardCount = 0L
+    private var backpressureDropCount = 0L
+    // Windowed interval distributions behind the smoothness-pulse investigation. Averages hide
+    // a recurring dip; each closes once per [PIPELINE] window into p50/p95/max plus samples
+    // above twice the median. All samples are nanoseconds; the [PACING] line formats per field.
+    private val arrivalIntervals = WindowedDistribution()
+    private val pairIntervals = WindowedDistribution()
+    private val pairDurations = WindowedDistribution()
+    private val queueAges = WindowedDistribution()
+    private val submitIntervals = WindowedDistribution()
+    private var pacingStaleAtWindowStart = 0L
+    private var pacingBackpressureAtWindowStart = 0L
     // Present-path attribution, cumulative like pairGateDeferredCount/tsRegress. Each counter
     // advances by the number of output frames that path put on the surface, one counter per
     // present, so the [PIPELINE] path= field reads as the run's renderer distribution directly.
@@ -1975,6 +1991,8 @@ class VideoFrameProcessor(
             // present HDR, and turning this into a user-facing error made every HDR video look
             // broken while playback continued correctly underneath.
             renderer.onHdrOutputInvariant = null
+            renderer.submitPacing = submitIntervals
+            submitIntervals.reset()
             outputRenderer = renderer
             hdrRepresentationProbe = HdrRepresentationProbe()
 
@@ -2106,6 +2124,7 @@ class VideoFrameProcessor(
             nsDecodeInterval += interval
             decodeIntervalCount++
             if (interval > maxDecodeIntervalNs) maxDecodeIntervalNs = interval
+            arrivalIntervals.record(interval)
         }
         lastArrivalNs = entryNs
         if (released) {
@@ -2549,9 +2568,11 @@ class VideoFrameProcessor(
         // Bounded queue with explicit backpressure: drop the oldest frame rather than growing.
         if (!frameQueue.offer(frame)) {
             droppedFrameCount++
+            backpressureDropCount++
             frameQueue.poll()?.let { releaseFrameBuffer(it.pixels) }
             if (!frameQueue.offer(frame)) {
                 droppedFrameCount++
+                backpressureDropCount++
                 releaseFrameBuffer(frame.pixels)
                 return
             }
@@ -2605,6 +2626,7 @@ class VideoFrameProcessor(
                 Log.w(TAG, "Discarding stale frame: queueLatencyMs=${ageNs / 1_000_000L} > ${maxQueueLatencyMs}ms")
                 releaseFrameBuffer(it.pixels)
                 droppedFrameCount++
+                staleDiscardCount++
             }
         }
 
@@ -2613,6 +2635,7 @@ class VideoFrameProcessor(
         val queueLatencyMs = (nowNs - nextFrame.enqueuedNs) / 1_000_000L
         nsQueueLatency += queueLatencyMs
         queueLatencySamples++
+        queueAges.record(nowNs - nextFrame.enqueuedNs)
         
         val prev = previousFrame
 
@@ -2843,6 +2866,7 @@ class VideoFrameProcessor(
         if (srcIntervalUs in 1_000L..1_000_000L) {
             val previousIntervalUs = lastPairIntervalUs
             lastPairIntervalUs = srcIntervalUs
+            pairIntervals.record(srcIntervalUs * 1_000L)
             // Pairing evidence. Consecutive pairs of a steady stream span the same source
             // interval, so a span that jumps well past the previous one means an anchor frame was
             // skipped between two pairs (the in-flight-pair defect) - which reads as stutter even
@@ -3531,7 +3555,9 @@ class VideoFrameProcessor(
         if (timingStartNs == 0L) {
             return
         }
-        nsPair += System.nanoTime() - timingStartNs
+        val pairElapsedNs = System.nanoTime() - timingStartNs
+        nsPair += pairElapsedNs
+        pairDurations.record(pairElapsedNs)
         timingStartNs = 0L
         timingCycles++
         if (timingCycles < TIMING_WINDOW_FRAMES) {
@@ -3583,6 +3609,28 @@ class VideoFrameProcessor(
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
         Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"} path=tex:$presentWarpTexCount den:$presentWarpDenCount w8:$presentWarp8Count cpu:$presentCpuCount hfb:$presentHdrFallbackCount plain:$presentPlainCount cadDisc=$cadenceDiscontinuityCount${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
+        // Windowed distributions behind the pulse investigation: the averages above hide a
+        // recurring dip, so each metric closes with p50/p95/max/outliers where outliers are
+        // samples above twice the window's median - a 2x pair interval is a skipped pair, a
+        // 2x queue age is the latency policy approaching a discard. submitUs is the interval
+        // between successful primary swaps (submission cadence, NOT verified display pacing;
+        // that needs Perfetto FrameTimeline on the device). Field suffixes carry the unit.
+        val usToken = { s: WindowedDistribution.Summary? ->
+            s?.let { "${it.p50 / 1_000}/${it.p95 / 1_000}/${it.max / 1_000}/${it.outliers}" } ?: "-"
+        }
+        val msToken = { s: WindowedDistribution.Summary? ->
+            s?.let { "${it.p50 / 1_000_000}/${it.p95 / 1_000_000}/${it.max / 1_000_000}/${it.outliers}" } ?: "-"
+        }
+        Log.i(
+            TAG,
+            "[PACING] arrUs=${usToken(arrivalIntervals.closeWindow())} " +
+                "pairUs=${usToken(pairIntervals.closeWindow())} " +
+                "pairMs=${msToken(pairDurations.closeWindow())} " +
+                "queueMs=${msToken(queueAges.closeWindow())} " +
+                "submitUs=${usToken(submitIntervals.closeWindow())} " +
+                "stale=${staleDiscardCount - pacingStaleAtWindowStart} " +
+                "backpressure=${backpressureDropCount - pacingBackpressureAtWindowStart}"
+        )
         // Scheduling evidence rather than stage cost: how long the worker actually went quiet
         // between callbacks, how regularly the decoder delivered, and how much wall clock each
         // output frame was entitled to. A stage time that fits its budget with room to spare
@@ -3652,6 +3700,8 @@ class VideoFrameProcessor(
         outputAtWindowStart = frameCountOutput
         arrivalAtWindowStart = frameCountArrival
         droppedAtWindowStart = droppedFrameCount
+        pacingStaleAtWindowStart = staleDiscardCount
+        pacingBackpressureAtWindowStart = backpressureDropCount
 
         // Periodic safety net: a wipe between two resets would otherwise go unnoticed until the
         // next surface change, and the decoder's answer is only available once frames are flowing.

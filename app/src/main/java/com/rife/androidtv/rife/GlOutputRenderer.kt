@@ -573,6 +573,15 @@ private const val WARP_FRAGMENT_SHADER = """
     @Volatile
     var onHdrOutputInvariant: ((String) -> Unit)? = null
 
+    /**
+     * Written by the pipeline that owns this renderer: one sample per successful primary
+     * swap, so submission-cadence irregularity is visible as a distribution instead of a
+     * rate. Null outside the interpolation pipeline (local previews, tests). Set when the
+     * renderer is created on the worker, and only the worker's swap path samples it.
+     */
+    @Volatile
+    internal var submitPacing: WindowedDistribution? = null
+
     /** Bits per channel the active config actually has; 0 before a surface exists. */
     @Volatile
     var outputColorBits = 0
@@ -1377,7 +1386,10 @@ private const val WARP_FRAGMENT_SHADER = """
                 if (nextRemotePresentationNs == Long.MIN_VALUE) nextRemotePresentationNs = outputTimestampNs + interval
                 else while (nextRemotePresentationNs <= outputTimestampNs) nextRemotePresentationNs += interval
             }
-            if (primarySuccess) primarySwapCount++
+            if (primarySuccess) {
+                primarySwapCount++
+                submitPacing?.recordDelta(System.nanoTime())
+            }
         }
 
         // Always update the mirror (phone preview) regardless of remote frame rate cap.

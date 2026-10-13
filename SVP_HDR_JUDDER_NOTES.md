@@ -187,3 +187,99 @@ termux clang++ -O2. Modes: `quick` / `full` (quality sweep, CSV), `debug`
 absolute dx to the pack limit, and one resolution-relative displacement per
 resolution; sd 60 vs 48, meScale 1 and 2; output kept as `scale_sweep.csv`).
 NEON-only, cannot compile on x86 CI; lives outside the repo deliberately.
+
+## Problem G (mi-moPrompt0180) - 1080p SDR recurring smoothness pulse
+
+Device observation: 480p SDR extremely smooth; 1080p SDR output FPS recovered to
+target but motion "gently" waxes/wanes in a recurring pattern (not harsh stutter).
+Investigated offline; no behavioural fix claimed yet.
+
+Refuted by evidence:
+
+- Output-timestamp phase accumulator (outputTimesFor): exact-Kotlin replica sim
+  (steady/alternating/jittered 24fps, ratios 2.0/2.5/3.0). At the default 2.0:
+  outputs/pair {2: 399/400}; stamped-interval stdev <=0.6 ms even with +-1.5 ms
+  arrival jitter. Sub-millisecond, imperceptible.
+- Steady-state present-path alternation: SDR pairs take one path (den warp after
+  the first post-reset cycle, else the 8-bit upload warp). No steady-state
+  den/w8 oscillation; [PIPELINE] path= counters rule it in/out on device.
+
+Best-supported mechanism (needs on-device confirmation): the stale-discard
+limit cycle. maxQueueLatencyMs = 2x source interval (~83 ms at 24fps). A
+discrete-event sim of the real queue (capacity 4, pairProcessing gate, stale
+bound 2I, drop-oldest overflow) shows: pair time P well under I (480p ~15 ms,
+1080p ~30 ms) -> zero drops, even spans, outFps 48.0. P approaching I with
+content noise (1080p-like 40 ms +- 8 ms) -> ~4 stale discards per minute, each
+forcing the next pair to span 2I (doubled motion for that stretch - a "less
+smooth" beat) WHILE output FPS stays ~48. P=44 ms+ -> continuous drops (83/min)
+and FPS falls to 45.3. The "FPS at target + recurring pulse" signature lives in
+the narrow band just below/at P~=I, which only 1080p can be in (480p has ~3x
+headroom). Capacity-4 backpressure overflow does not fire at FPS-at-target
+(needs P>I sustained) - it stays a separate, now separately counted, path.
+
+Still open, discriminated by the on-device evidence below: presentation-cadence
+(e.g. 24fps x2 = 48fps on a 60Hz panel -> vsync beat), and content-dependent
+interpolation/denoise quality ("softer" wording; path= counters answer the
+path-mixing part).
+
+Change (diagnostics only, per prompt section 6 - no safe behavioural fix was
+evidenced): windowed distribution statistics, reusing the existing [PIPELINE]
+window cadence.
+
+- New WindowedDistribution: 96-sample ring; closeWindow -> p50/p95/max/n plus
+  outliers (samples above 2x the window median - a 2x pair interval is a skipped
+  pair, a 2x queue age is the latency policy approaching a discard). recordDelta
+  skips its first call and filters non-positive deltas and >5 s lifecycle gaps.
+- Recorded: decoder arrival interval, source pair interval, pair duration, queue
+  age at poll, and submission interval per successful primary swap
+  (GlOutputRenderer.submitPacing - submission cadence, NOT verified display
+  pacing; that needs Perfetto FrameTimeline).
+- Sub-counters split out of droppedFrameCount: staleDiscardCount (the already
+  logged "Discarding stale frame" path) and backpressureDropCount (the silent
+  drop-oldest path).
+- Emission: one [PACING] line per [PIPELINE] window. Tokens are
+  p50/p95/max/outliers; field suffix carries the unit (arrUs, pairUs, pairMs,
+  queueMs, submitUs), plus stale=/backpressure= window deltas. Overhead: one
+  nanoTime + array write per event, sort of <=96 longs per window.
+
+## Problem H (mi-moPrompt0180) - HDR-to-SDR throughput at 1080p/4K
+
+Code-level invariants confirmed (no defect found, design preserved):
+
+- Tone-map runs once, at capture (grabber with toneMapReq); tone-mapped frames
+  keep retainHdrSource=false, so hdrTextureByAnalysisBuffer stays empty and
+  downstream takes the plain SDR path - no redundant second conversion.
+- With toneMapEffective(): hdrOutputMode()=HDR_OUTPUT_SDR and hdrDataSpace()=0
+  (VideoFrameProcessor, output-mode/dataSpace selectors) - SDR output carries no
+  PQ dataspace tag.
+- Mode transitions go through pipeline reset; ensureToneMap is O(1) after first
+  compile (mi-moPrompt0170). No per-frame shader churn.
+
+Structural extra cost vs pure SDR: one fullscreen tone-map fragment pass per
+captured frame, inside the capture stage (it lands in readbackMs). Versus the
+HDR-retain path the SDR pipeline uploads full-res RGBA8 per new frame (residency
+keeps the shared one), where the HDR path uploads nothing - but its readback is
+half the bytes (SDR8 vs RGBA16F). Attribution must come from real-device
+stage timings: compare pairMs/readbackMs/motionMs/renderMs on the same clip
+across 1080p SDR, 1080p HDR-to-SDR, 4K HDR-to-SDR. Offline harness scaling
+(4K ~4x pixels) is NOT device evidence.
+
+## On-device evidence needed (both problems)
+
+Install the CI APK, play the same 1080p SDR segment ~2-3 min at 2x, capture
+logcat, grep `[PACING]`, `Discarding stale frame`, `[PAIRGAP]`, `[STAGE]`,
+`[PIPELINE]`:
+
+- stale=1..20 per [PACING] window + queueMs p95 near ~80 ms + pairMs p95 near
+  the source interval -> stale-limit-cycle confirmed; next iteration targets the
+  processing-cost stage chosen from that window's motionMs/renderMs/readbackMs.
+- stale=0 and tight arrUs/pairUs/submitUs while the pulse persists ->
+  presentation-side or content-dependent: repeat with a 30fps clip (2x = 60fps,
+  even on a 60Hz panel) and a constant-pan synthetic; Perfetto FrameTimeline for
+  actual display pacing.
+- backpressure>0 recurring -> decoder bursts overflow the queue (separate
+  mechanism, same attribution path).
+- path= counts mixing den/w8 during steady playback -> present-path oscillation.
+
+HDR-to-SDR: same clip segment with tone-map toggled on; diff the same fields
+across modes; the stage that grew names the bottleneck.
