@@ -1626,12 +1626,13 @@ void MemcInterpolator::packMotionField(int w, int h, uint8_t* outMv, bool forwar
     const int bwy = (h + step - 1) / step;
     const size_t blocks = static_cast<size_t>(bwx) * bwy;
     // The field is packed in half-pel, and the +128 byte bias leaves room for -128..+127
-    // units, i.e. -64..+63.5 pixels. The widest reach the exposed search options can produce is
-    // the adaptive coarse pass at 12 level-2 blocks (48 px) plus the two finer passes (9 px) -
-    // 57 px, or 114 units - so it fits with room to spare. Clamp anyway: a hand-edited search
-    // distance must degrade to a saturated vector, never a wrapped one. The clamp is also
-    // counted: a rising saturation percentage is the field asking for more reach than one byte
-    // can carry, which is the mechanism behind fast pans degrading at higher resolutions.
+    // units, i.e. -64..+63.5 pixels. The default search distance produces 60 px of coarse
+    // reach plus the two finer passes (9 px) - 69 px, past the 63.5 px pack ceiling. Motion
+    // up to the ceiling fits; past it the vector clamps to the ceiling (half a pixel at a
+    // 64 px shift) rather than wrapping, and the saturation percentage below reports it,
+    // which is the mechanism behind fast pans degrading at higher resolutions - motion is
+    // measured in pixels, so the same pan that is a few pixels per frame at 480p is tens of
+    // pixels at 4K.
     long long saturated = 0;
     auto bias = [&saturated](int32_t v) {
         const int32_t b = v + 128;

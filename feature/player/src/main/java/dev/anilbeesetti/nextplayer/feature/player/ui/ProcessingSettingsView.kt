@@ -372,7 +372,7 @@ private fun SvSettingsSection(
         )
         OptionGroup(
             title = stringResource(R.string.sv_search_distance),
-            options = listOf(0, 8, 16, 32, 48),
+            options = listOf(0, 8, 16, 32, 48, 60),
             selected = settings.searchDistance,
             label = {
                 if (it == 0) {

@@ -74,14 +74,18 @@ data class SvPlayerSettings(
     /**
      * Search radius in pixels; 0 derives it from local contrast the way SVP's negative range does.
      *
-     * 48 is the ceiling rather than a preference: the motion field packs each vector into a byte
-     * biased by +128 and decoded as `(v * 255 - 128) * 0.5`, so a vector can only ever reach
-     * 63.5 px. 48 px of coarse search plus the two finer passes is 57 px, which fits with room to
-     * spare, and anything past that saturates instead of helping. The value matters more than it
-     * looks: at 16 px, camera motion stops resolving somewhere around a 16 px frame-to-frame shift
-     * (36 dB there, 27 dB at 24 px), while 48 px holds 43 and 39 dB over the same content.
+     * The motion field packs each vector into a byte biased by +128 in half-pel units, so a
+     * vector can only ever reach 63.5 px. 60 px of coarse search plus the two finer passes is
+     * 69 px of reach: motion up to the pack ceiling fits, motion past it clamps to the ceiling
+     * (half a pixel at a 64 px shift) and the saturation counter reports it. The value matters
+     * because camera motion is measured in pixels, so the same pan that resolves easily at 480p
+     * approaches the ceiling at 1080p and 4K. Measured offline at 1080p on a non-periodic test
+     * texture: with the previous 48 px default a 64 px shift collapsed to crossfade quality
+     * (28.6 dB, 2.6% of blocks resolving), while 60 px holds 48.9 dB at 95.6% resolving; a
+     * 56 px shift improves from 45.0 to 53.4 dB; shifts at or below 48 px are unchanged, for
+     * a ~10% motion-stage cost that falls inside end-to-end interpolate timing variance.
      */
-    val searchDistance: Int = 48,
+    val searchDistance: Int = 60,
     /** Samples per pixel: 1 is whole-pixel, 2 is half-pixel. */
     val subpel: Int = 2,
     /**

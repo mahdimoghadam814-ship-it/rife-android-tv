@@ -24,12 +24,16 @@ struct SvConfig {
     // and the one this struct ships with - is 16x16.
     int blockSize = 2;
     // Pixels; 0 derives it from local contrast, which is SVP's negative search distance.
-    // 48 is the widest reach the half-pel field can carry without saturating its +128 bias
-    // (48 px of coarse search plus the two finer passes is 114 units of the 127 available), and
-    // below it camera motion is mis-estimated from roughly 16 px per frame upward: measured on
-    // a non-periodic test texture, 16 px scored 36.3 dB at a 16 px shift and 27.5 dB at 24 px,
-    // where 48 px scores 43.1 and 39.3 - the search simply could not reach the true match.
-    int searchDistance = 48;
+    // 60 px of coarse search plus the two finer passes is 69 px of reach against the +128
+    // pack bias's 63.5 px ceiling: motion up to the ceiling fits, motion past it clamps to
+    // the ceiling (half a pixel at a 64 px shift) and the saturation counter reports it.
+    // The reach matters because camera motion scales with resolution - measured offline at
+    // 1080p, a 48 px default collapses a 64 px shift to crossfade quality (28.6 dB, 2.6%
+    // of blocks resolving), where 60 px holds 48.9 dB at 95.6%; a 56 px shift improves
+    // from 45.0 to 53.4 dB; shifts at or below 48 px are unchanged, for a ~10% motion-stage
+    // cost (34.7->37.8 ms at 1080p, 131.7->145.6 ms at 4K, 4 threads) that falls inside
+    // end-to-end interpolate timing variance.
+    int searchDistance = 60;
     // 1 = whole pixel, 2 = half pixel.
     int subpel = 2;
     // Quarter-blocks of overlap between neighbours: 0, 1 or 2.

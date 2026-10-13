@@ -72,7 +72,7 @@ class GlOutputRenderer {
 
             // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
             vec3 linearToPQ(vec3 linear) {
-                const float m1 = 2610.0 / 4096.0;
+                const float m1 = 2610.0 / 4096.0 / 4.0;
                 const float m2 = 2523.0 / 4096.0 * 128.0;
                 const float c1 = 3424.0 / 4096.0;
                 const float c2 = 2413.0 / 4096.0 * 32.0;
@@ -87,7 +87,7 @@ class GlOutputRenderer {
             // same 0..1 = 0..10000 nits scale linearToPQ() consumes. The measured source is
             // display-encoded (PQ code values), so this is what runs before any tone-map.
             vec3 pqToLinear(vec3 pq) {
-                const float m1 = 2610.0 / 4096.0;
+                const float m1 = 2610.0 / 4096.0 / 4.0;
                 const float m2 = 2523.0 / 4096.0 * 128.0;
                 const float c1 = 3424.0 / 4096.0;
                 const float c2 = 2413.0 / 4096.0 * 32.0;
@@ -205,7 +205,7 @@ private const val WARP_FRAGMENT_SHADER = """
 
             // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
             vec3 linearToPQ(vec3 linear) {
-                const float m1 = 2610.0 / 4096.0;
+                const float m1 = 2610.0 / 4096.0 / 4.0;
                 const float m2 = 2523.0 / 4096.0 * 128.0;
                 const float c1 = 3424.0 / 4096.0;
                 const float c2 = 2413.0 / 4096.0 * 32.0;
@@ -219,7 +219,7 @@ private const val WARP_FRAGMENT_SHADER = """
             // SMPTE ST 2084 (PQ) EOTF - the measured source is display-encoded, so this is what
             // decodes it back to linear before any tone-map. Same 0..1 = 0..10000 nits scale.
             vec3 pqToLinear(vec3 pq) {
-                const float m1 = 2610.0 / 4096.0;
+                const float m1 = 2610.0 / 4096.0 / 4.0;
                 const float m2 = 2523.0 / 4096.0 * 128.0;
                 const float c1 = 3424.0 / 4096.0;
                 const float c2 = 2413.0 / 4096.0 * 32.0;
@@ -346,7 +346,7 @@ private const val WARP_FRAGMENT_SHADER = """
 
             // SMPTE ST 2084 (PQ) EOTF inverse - converts linear light to PQ code values
             vec3 linearToPQ(vec3 linear) {
-                const float m1 = 2610.0 / 4096.0;
+                const float m1 = 2610.0 / 4096.0 / 4.0;
                 const float m2 = 2523.0 / 4096.0 * 128.0;
                 const float c1 = 3424.0 / 4096.0;
                 const float c2 = 2413.0 / 4096.0 * 32.0;
@@ -360,7 +360,7 @@ private const val WARP_FRAGMENT_SHADER = """
             // SMPTE ST 2084 (PQ) EOTF - the measured source is display-encoded, so this is what
             // decodes it back to linear before any tone-map. Same 0..1 = 0..10000 nits scale.
             vec3 pqToLinear(vec3 pq) {
-                const float m1 = 2610.0 / 4096.0;
+                const float m1 = 2610.0 / 4096.0 / 4.0;
                 const float m2 = 2523.0 / 4096.0 * 128.0;
                 const float c1 = 3424.0 / 4096.0;
                 const float c2 = 2413.0 / 4096.0 * 32.0;
