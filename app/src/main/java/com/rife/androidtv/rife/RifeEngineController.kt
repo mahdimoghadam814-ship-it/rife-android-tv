@@ -1,10 +1,12 @@
 package com.rife.androidtv.rife
 
 import android.content.Context
+import android.hardware.display.DisplayManager
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.net.Uri
 import android.util.Log
+import android.view.Display
 import androidx.media3.common.SurfaceInfo
 import androidx.media3.common.ColorInfo
 import androidx.media3.common.C
@@ -130,6 +132,10 @@ class RifeEngineController(
      */
     override fun start() {
         processor.start()
+        // Presentation diagnostic input: the processor has no Context, so the display's
+        // refresh rate is pushed here once per session - enough for a TV box, whose panel
+        // mode does not change under playback. 0 (unknown) just suppresses the [CADENCE] line.
+        processor.setDisplayRefreshRate(defaultDisplayRefreshRate())
         // Observe HDR 10/HDR 8 preference changes while the player screen owns us. A fresh scope
         // per start: a scope cancelled by stop() could never be launched in again, and a second
         // start without a stop must not leak the first collector.
@@ -144,6 +150,15 @@ class RifeEngineController(
                     hdr10Enabled = enabled
                 }
         }
+    }
+
+    /**
+     * Refresh rate of the default display for the [CADENCE] diagnostic, or 0 when it cannot
+     * be read. TV boxes keep a fixed panel mode, so one read per session is enough.
+     */
+    private fun defaultDisplayRefreshRate(): Float {
+        val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        return displayManager?.getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 0f
     }
 
     /**

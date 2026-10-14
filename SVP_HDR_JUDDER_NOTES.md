@@ -283,3 +283,94 @@ logcat, grep `[PACING]`, `Discarding stale frame`, `[PAIRGAP]`, `[STAGE]`,
 
 HDR-to-SDR: same clip segment with tone-map toggled on; diff the same fields
 across modes; the stage that grew names the bottleneck.
+
+## Problem I (mi-moPrompt0190) - remaining judder mechanisms and the [CADENCE] gap
+
+Base: 1788b3d. Device symptoms unchanged (480p smooth; 1080p SDR/HDR FPS at
+target with a gentle recurring speed-up/slow-down of motion; 4K FPS short).
+NO device logs were supplied or found in the repo: every device-side claim
+below stays unverified, and no behavioural pipeline change was made.
+
+Control-flow answers (current line numbers at this commit's working tree):
+
+1. Stale/backpressure removal creates temporal gaps between adjacent pairs'
+   frames. The stale loop (VideoFrameProcessor.kt:2635-2648, bound = 2x
+   interval via maxQueueLatencyMs():2608) and the capacity-4 drop-oldest
+   overflow (queueCapturedFrame:2585-2593) both remove a queued frame while
+   previousFrame stays put; the next pair is (previousFrame, later frame).
+2. Yes: the next pair spans ~2 source intervals and its stamps stay monotonic.
+   outputTimesFor (3506) derives step from THAT pair's span, carries the phase
+   (nextOutputUs) so ordering is preserved, and re-anchors when the phase has
+   left the pair (cadDisc). noteOutputTimestamp (4075)/OutputTimelineGuard
+   counts regressions (tsRegress). Cost: one missing output slot (double-length
+   stamp gap) plus doubled motion displacement for that pair's warps - visible
+   as [PAIRGAP] (2865+) and pairUs outliers/stale=/backpressure= in [PACING].
+3. The pairProcessing gate (2622) and pendingRenderQueue (2712) shift pair
+   START wall-times with processing duration; previousFrame advances only when
+   a pair is finally consumed (2862/2874/2925/3041/3082/3480). Stamped output
+   times, however, come only from source timestamps + accumulator phase
+   (computed once per pair before the engine call), so scheduling jitter moves
+   submissions (submitUs spread), not the stamp grid.
+4. Yes - submission regularity is not presentation regularity. Every primary
+   swap stamps eglPresentationTimeANDROID then swaps (GlOutputRenderer
+   swapBuffers; submitPacing records at 1389-1391), but SurfaceFlinger latches
+   per vsync: (a) a stamp rate that does not divide the refresh evenly holds or
+   skips frames at a fixed beat; (b) mid-pair frames exist only after motion
+   completes, so they are inherently ~pairMs past-due at submit; when pairMs
+   drifts across a vsync boundary the latch slot shifts; (c) a submit after the
+   vsync deadline holds to the next one. None of this is visible app-side;
+   display pacing needs Perfetto FrameTimeline.
+5. Yes for the stale mechanism: the bound is resolution-independent but pair
+   time is not (offline queue sim: limit cycle only when pairMs ~ interval;
+   480p ~15ms never, 1080p ~35-45ms borderline). The hold-beat of (4a) is
+   resolution-independent in origin but its amplitude scales with displacement,
+   which fits "480p fine, 1080p visible" on the same content.
+
+Three candidate mechanisms, none confirmed on device:
+
+- A. 48fps-on-60Hz hold beat (24fps source x selectable 2x on a 60Hz panel):
+  deterministic 1,1,1,2 hold pattern, 12Hz wobble - matches "gentle recurring
+  speed-up/slow-down" exactly. 3x (the only other option; MemcLevelSetting is
+  TWO_X/THREE_X only - no 2.5x exists) gives 72fps: 1-in-6 frames SKIPPED at
+  the same 12Hz beat but with smaller amplitude and +50% warp cost. The
+  arithmetically even choice for 24fps/60Hz is x2.5=60fps, which the settings
+  enum does not offer; adding it is a product decision, not made here.
+- B. Past-due mid-pair submits (see 4b): stochastic wobble as pairMs drifts
+  relative to the vsync grid.
+- C. Stale-limit-cycle hiccups (see 1/2/5): a few per minute, each one skipped
+  output slot.
+
+Change (diagnostic only, fills the specific [PACING] gap: submissions are
+measured, the display is unknown):
+
+- New OutputCadence (pure, unit-tested): simulate ceil-latch slots for 48
+  frames of srcFps x multiplier on refreshHz; report even/uneven, the
+  per-frame hold/skip summary ("1x36,2x12"; a 0 count = frames never shown)
+  and the beat Hz. Float-robust (1e-9 latch epsilon: i/60*60 can land an ulp
+  above i and fake a 0/2 hold pair on an exactly-even cadence).
+- RifeEngineController.start() pushes the default display's refresh rate into
+  the processor (VFP has no Context; 0 suppresses the line).
+- reportStageTiming logs [CADENCE] once per (srcFps, multiplier, refresh)
+  change with holds/even/beatHz and, when uneven, the ideal even multiplier.
+
+4K attribution decision table (no code changed; meScale/search/quality
+defaults untouched per task rules; offline Problem F numbers remain harness
+evidence only): read one [PIPELINE]+[PACING] window per mode and pick the row.
+
+- motionMs dominant and scales with pixels -> full-res motion search at
+  meScale=1 is the bottleneck; the documented lever is the explicit meScale=2
+  user setting (~2x less motion time, quality trade-off in Problem F), not a
+  silent default change.
+- readbackMs dominant -> 4K RGBA8 PBO traffic (~33MB/frame); consider PBO ring
+  depth/driver, measure first.
+- interpMs/renderMs dominant -> output warp/upload; check renderSplit up=/dr=.
+- pairMs p95 > source interval with stale>0 -> pipeline is processing-paced;
+  output FPS will sit under target regardless of the counter's average.
+- submitUs tight but judder -> presentation-side; see mechanisms A/B.
+
+Unverified / next evidence (device): [CADENCE] line for each mode (names A
+directly); stale=/backpressure=/queueMs/pairMs in [PACING] (names C/B);
+[PIPELINE] stage split per mode (names the 4K bottleneck); Perfetto
+FrameTimeline for actual display pacing. Behavioural fix for A, if confirmed,
+is a user-side multiplier choice now and possibly an explicit 2.5x setting
+later - never a silent default change.

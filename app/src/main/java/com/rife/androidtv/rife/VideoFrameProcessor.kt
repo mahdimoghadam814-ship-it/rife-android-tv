@@ -532,6 +532,10 @@ class VideoFrameProcessor(
     private val submitIntervals = WindowedDistribution()
     private var pacingStaleAtWindowStart = 0L
     private var pacingBackpressureAtWindowStart = 0L
+    // Worker-only key of the last [CADENCE] tuple (srcFps|multiplier|refresh): the line logs
+    // once per change instead of once per window, so a 30-minute session adds a handful of
+    // lines while still catching a multiplier switch or a source-cadence change.
+    private var lastCadenceKey: String = ""
     // Present-path attribution, cumulative like pairGateDeferredCount/tsRegress. Each counter
     // advances by the number of output frames that path put on the surface, one counter per
     // present, so the [PIPELINE] path= field reads as the run's renderer distribution directly.
@@ -1454,6 +1458,18 @@ class VideoFrameProcessor(
             nextOutputUs = Long.MIN_VALUE
         }
         Log.i(TAG, "Interpolation level: ${clamped}x")
+    }
+
+    /**
+     * Display refresh rate for the [CADENCE] presentation diagnostic. The processor has no
+     * Context, so the owner pushes it; 0 means unknown and the line stays suppressed. Plain
+     * volatile store - the worker only reads it when a diagnostics window closes.
+     */
+    @Volatile
+    private var displayRefreshRateHz: Float = 0f
+
+    fun setDisplayRefreshRate(hz: Float) {
+        displayRefreshRateHz = hz
     }
 
     /**
@@ -3631,6 +3647,39 @@ class VideoFrameProcessor(
                 "stale=${staleDiscardCount - pacingStaleAtWindowStart} " +
                 "backpressure=${backpressureDropCount - pacingBackpressureAtWindowStart}"
         )
+        // Presentation-side arithmetic, logged once per (srcFps, multiplier, refresh) change:
+        // a stamp rate that does not divide the display refresh evenly holds or skips frames
+        // at a fixed beat - motion "speeds up and slows down" while every FPS counter looks
+        // healthy. This predicts the pattern; actual on-screen pacing still needs platform
+        // tools (Perfetto FrameTimeline), which the app cannot read.
+        val cadence = OutputCadence.analyze(
+            sourceFps,
+            memcLevelMultiplier,
+            displayRefreshRateHz.toDouble()
+        )
+        if (cadence != null) {
+            val key = String.format(
+                java.util.Locale.US, "%.1f|%.2f|%.2f", sourceFps, memcLevelMultiplier, cadence.refreshHz
+            )
+            if (key != lastCadenceKey) {
+                lastCadenceKey = key
+                val ideal = OutputCadence.idealEvenMultiplier(sourceFps, cadence.refreshHz)
+                Log.i(
+                    TAG,
+                    "[CADENCE] srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} " +
+                        "x${memcLevelMultiplier} -> outFps=${String.format(java.util.Locale.US, "%.3f", cadence.outFps)} " +
+                        "refreshHz=${String.format(java.util.Locale.US, "%.1f", cadence.refreshHz)} " +
+                        "holds=${cadence.holdsSummary} even=${cadence.even} " +
+                        "beatHz=${String.format(java.util.Locale.US, "%.1f", cadence.beatHz)}" +
+                        if (!cadence.even && ideal != null) {
+                            " | uneven on this display: extra hold/skip ${String.format(java.util.Locale.US, "%.1f", cadence.beatHz)} times/s; " +
+                                "even presentation needs outFps=refresh (multiplier x${String.format(java.util.Locale.US, "%.2f", ideal)})"
+                        } else {
+                            ""
+                        }
+                )
+            }
+        }
         // Scheduling evidence rather than stage cost: how long the worker actually went quiet
         // between callbacks, how regularly the decoder delivered, and how much wall clock each
         // output frame was entitled to. A stage time that fits its budget with room to spare
