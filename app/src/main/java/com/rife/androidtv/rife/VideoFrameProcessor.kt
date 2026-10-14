@@ -532,6 +532,13 @@ class VideoFrameProcessor(
     private val submitIntervals = WindowedDistribution()
     private var pacingStaleAtWindowStart = 0L
     private var pacingBackpressureAtWindowStart = 0L
+    // Overrun pacing: while the motion search costs more than the source pair interval the
+    // lease bucket declines pairs on a fixed period, so the output stays on a regular grid
+    // instead of the capacity-4 overflow race dropping inputs at random positions. Worker-only
+    // (pair submit/complete); reset with the pipeline.
+    private val pairPacing = PairPacing()
+    private var pairSkipCount = 0L
+    private var pacingSkipAtWindowStart = 0L
     // Worker-only key of the last [CADENCE] tuple (srcFps|multiplier|refresh): the line logs
     // once per change instead of once per window, so a 30-minute session adds a handful of
     // lines while still catching a multiplier switch or a source-cadence change.
@@ -1746,6 +1753,7 @@ class VideoFrameProcessor(
             discarded++
         }
         previousFrame = null
+        pairPacing.reset()
 
         while (true) {
             val frame = frameQueue.poll() ?: break
@@ -2611,6 +2619,20 @@ class VideoFrameProcessor(
         return (intervalUs / 500L).coerceAtLeast(MIN_QUEUE_LATENCY_MS)
     }
 
+    /**
+     * Overrun pacing gate, applied before a pair is committed. A declined pair releases the
+     * anchor, advances it to the next frame without synthesis and never reaches motion, so
+     * every processed pair keeps the original one-interval span and the output grid stays
+     * regular. Worker-only.
+     */
+    private fun declinePairForPacing(prev: FrameData, next: FrameData): Boolean {
+        if (!pairPacing.shouldDeclinePair(lastPairIntervalUs)) return false
+        releaseFrameBuffer(prev.pixels)
+        previousFrame = next
+        pairSkipCount++
+        return true
+    }
+
     private fun processNextFramePair() {
         if (released) return
         // A pair is already submitted for motion/rendering, so `previousFrame` has not been
@@ -2654,6 +2676,10 @@ class VideoFrameProcessor(
         queueAges.record(nowNs - nextFrame.enqueuedNs)
         
         val prev = previousFrame
+
+        if (prev != null && declinePairForPacing(prev, nextFrame)) {
+            return
+        }
 
         val canPrepareMotionOffThread = prev != null &&
             isRifeEnabled &&
@@ -2766,6 +2792,13 @@ class VideoFrameProcessor(
         if (released) return
         val nextFrame = frameQueue.peek() ?: return
         val prev = prevForNextPair
+
+        // Same overrun gate as the capture-side submit: the peeked frame is consumed here
+        // because it becomes the anchor rather than the second half of a processed pair.
+        if (declinePairForPacing(prev, nextFrame)) {
+            frameQueue.poll()
+            return
+        }
 
         val canPrepareMotionOffThread = isRifeEnabled &&
             !fastDvdNetEngine.isEnabled &&
@@ -3198,6 +3231,7 @@ class VideoFrameProcessor(
             val motionNs = System.nanoTime() - tMotionStart
             nsMotion += motionNs
             nsJni += motionNs
+            pairPacing.noteMotionCost(motionNs / 1_000L)
         }
         // The search may already have run on another thread while this pair waited, so its cost
         // is real even though this thread did not spend it. Folding it into the motion total is
@@ -3205,6 +3239,7 @@ class VideoFrameProcessor(
         preparedMotion?.elapsedNs?.let { elapsed ->
             nsMotion += elapsed
             nsJni += elapsed
+            pairPacing.noteMotionCost(elapsed / 1_000L)
         }
         val tInterpStart = System.nanoTime()
         val success = when {
@@ -3645,7 +3680,8 @@ class VideoFrameProcessor(
                 "queueMs=${msToken(queueAges.closeWindow())} " +
                 "submitUs=${usToken(submitIntervals.closeWindow())} " +
                 "stale=${staleDiscardCount - pacingStaleAtWindowStart} " +
-                "backpressure=${backpressureDropCount - pacingBackpressureAtWindowStart}"
+                "backpressure=${backpressureDropCount - pacingBackpressureAtWindowStart} " +
+                "pairSkip=${pairSkipCount - pacingSkipAtWindowStart}"
         )
         // Presentation-side arithmetic, logged once per (srcFps, multiplier, refresh) change:
         // a stamp rate that does not divide the display refresh evenly holds or skips frames
@@ -3751,6 +3787,7 @@ class VideoFrameProcessor(
         droppedAtWindowStart = droppedFrameCount
         pacingStaleAtWindowStart = staleDiscardCount
         pacingBackpressureAtWindowStart = backpressureDropCount
+        pacingSkipAtWindowStart = pairSkipCount
 
         // Periodic safety net: a wipe between two resets would otherwise go unnoticed until the
         // next surface change, and the decoder's answer is only available once frames are flowing.

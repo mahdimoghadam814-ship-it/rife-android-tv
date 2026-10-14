@@ -374,3 +374,162 @@ directly); stale=/backpressure=/queueMs/pairMs in [PACING] (names C/B);
 FrameTimeline for actual display pacing. Behavioural fix for A, if confirmed,
 is a user-side multiplier choice now and possibly an explicit 2.5x setting
 later - never a silent default change.
+
+Problem J - device evidence, 3x capture 2026-10-14 (194k-line logcat,
+svp_3x_4k.log, [CADENCE]/[PACING]/[PIPELINE] from commit 586ed03)
+
+Setup: display reports refreshHz=120.0 (not 60); multiplier THREE_X; sessions
+20:45:23-20:48:04 src=1920x960 (the "1080p" clip is 2:1 1920x960), 4K session
+20:48:12-20:49:59 src=3840x2076, then two further sessions the user called
+"480p SDR"/"480p HDR-to-SDR" whose [PIPELINE] src= was actually 1920x960 and
+3840x2076 - not 480p inputs (unresolved label/content mismatch; ask user).
+
+Mechanism A - device-confirmed arithmetically, refresh-mode independent:
+- 24fps x3 = 72fps on 120Hz: holds=1x16,2x32 (two-thirds of frames held
+  2 vsyncs, one-third 1), beatHz=24.0, even=false. The recurring 24Hz
+  micro-speed-up the user feels is exactly this hold-length alternation.
+- The same clip showed srcFps=20.018 windows with holds=2x48 even=true
+  (20x3=60 divides 120) and srcFps=8.007 even=true - content/decoder-cadence
+  windows where presentation is perfectly even; these are the stretches that
+  feel smooth. (Some 12.011/8.007 readings are skip-pair artifacts: pairs
+  spanning 2I inflate lastPairIntervalUs; see pairUs outliers below.)
+- User retested with the panel forced to 60Hz: same perceived issues. That
+  matches the model: at 60Hz, 72fps cannot be held (hold<1) so presentation
+  becomes 12 dropped frames/s - the beat stays at a 24Hz irregularity, only
+  its flavor changes (holds vs skips). For 24fps content NEITHER 2x NOR 3x
+  is even on ANY mode: even requires outFps | refresh, i.e. 2.5x (=60) on
+  120Hz or 60Hz, or 5x (=120) on 120Hz. Both are product decisions (new
+  MemcLevelSetting entries), deliberately not taken here.
+
+Mechanism B - processing pace, device-confirmed at 4K:
+- 1920x960 x3 (~160s): outFps med 64.8 vs target 72.1; backpressure=450
+  (~2.8 input drops/s); pairUs p50=41.6ms p95=83.3ms (2I-span pairs in 129
+  windows); stale=0; motionMs med 46.0, readbackMs med 2.8, pairMs med 27.9
+  p95 45.0; submitUs p50=2.1ms p95=45.2ms.
+- 3840x2076 x3 (~108s): outFps med 39.7 vs target 72.1 (recover windows hit
+  72.7); backpressure=1129 (~10.5 drops/s); pairUs p50=83.3ms = half pair
+  rate = 12 pairs/s = the 36-40fps output; stale=0; motionMs med 73.9
+  (dominant), readbackMs med 15.2 (5x the 1080p value - matches the RGBA8 PBO
+  traffic row), pairMs med 30.2 p95 50.0. Even at 2x the pair budget would be
+  41.7ms vs ~80ms effective pair time - 4K cannot reach target FPS without
+  ~2x motion-path speedup; documented lever is the explicit user meScale=2
+  setting (Problem F trade-off), to be tested on device, not defaulted.
+
+Mechanism C - stale-limit-cycle, REFUTED on device: stale=0 in all four
+sessions; backpressure drop-oldest fires first and the stale deadline never
+reaches. The offline Problem G threshold band does not engage on this device
+at either resolution.
+
+Open follow-ups: interpMs reads 0.00 in every window (w8 path counts high,
+den:0) - verify what the stage timer measures on this path; forced-60Hz
+capture for the refresh-agnostic claim in numbers; meScale=2 4K capture;
+clarify the "480p" session resolutions; structural options for A remain
+(a) new 2.5x MemcLevelSetting entry (product decision), or (b) outFps locked
+to refresh with time-scaled warps (feature-sized).
+
+Problem J addendum - "480p processing engine" sessions resolve the attribution
+(user clarification: S3/S4 ran the SAME 1920x960 and 3840x2076 files with the
+motion-search engine at 480p; the earlier label mismatch is resolved)
+
+Per-session medians (same log, same x3 multiplier, same 120Hz panel):
+
+- S1 1080p full engine: outFps 64.3 (target 72.1), backpressure ~3.7/window
+  (~3 drops/s), motionMs 46.7, readbackMs 2.7, pairUs p95=83.3ms (2I spans).
+  User feels the subtle recurring pulse.
+- S2 4K full engine: outFps 37.9, backpressure ~26/window (~10.5 drops/s),
+  motionMs 76.6, readbackMs 16.1, pairs at half rate. User feels judder +
+  insufficient FPS.
+- S3 1080p + 480p engine: outFps 72.0, backpressure ~1/window, motionMs 13.7.
+  User feels no judder.
+- S4 4K + 480p engine: outFps 72.0, backpressure ~0.1/window, motionMs 15.0,
+  readbackMs 3.5. User feels no judder.
+
+Decisive result: [CADENCE] beat=24.0 even=false was present in ALL FOUR
+sessions - including S3/S4 where the user perceives zero judder. Mechanism A
+(the clean 24Hz hold-wobble of 72fps on 120Hz) is below this user's
+perception threshold when the incoming cadence is regular. What is felt as
+pulse/judder is the IRREGULARITY B layers on top of it: backpressure
+drop-oldest skipping input frames, pairer spanning 2I (srcFps briefly reads
+12.011), warps emitted in irregular bursts, holds fed an irregular cadence.
+
+Causal chain, fully device-measured: full-res motion search (46.7ms at
+1080p, 76.6ms at 4K vs the 27.8ms pair budget at x3) -> pair processing over
+budget -> input overflow -> drop-oldest -> pair-skip -> outFps under target
+(64.3/37.9) -> irregular presentation -> perceived judder. At 480p engine
+motion collapses to 13.7-15.0ms, backpressure ~0, outFps pinned at 72.0 at
+BOTH content resolutions, and only the imperceptible clean beat remains.
+
+Consequences: the 1080p pulse and the 4K judder/FPS shortfall share one root
+cause (full-res motion-path throughput); resolution only scales severity.
+Stale cycle (C) stays refuted. Mechanism A is demoted from villain to
+invisible background noise for this user. The practical fix is the existing
+user-facing processing-engine/meScale lever (device-proven here); full-res
+path optimization (motion search, the 4K readback's 16.1ms PBO traffic) and
+a 2.5x MemcLevelSetting entry remain optional, larger directions.
+
+Problem J correction - what the "480p engine" actually costs, and the
+quality-preserving lever
+
+Two errors in the previous addendum, corrected:
+
+1. Budget framing. The pair period at a 24fps source is 41.7ms regardless of
+   multiplier (one pair per source interval; x2/x3 only change how many
+   outputs each pair packs), not 27.8ms. The measured law outFps ~
+   72 x 41.7/motionMs fits both sessions (1080p: 72x41.7/46.7=64.4 vs 64.3
+   measured; 4K: 72x41.7/76.6=39.3 vs 37.9). motionMs against the 41.7ms
+   pair period is the operative ratio; backpressure drops are the overflow
+   symptom of the same overrun. Multiplier does not change the pair budget.
+
+2. Resolution cost. RifeResolutionSetting.RES_480P downscales the capture,
+   and the capture IS the whole pipeline: captureFrameFromInputSurface
+   reads back at resolveCaptureDimensions() size, so motion search, blend,
+   denoise and the frame the output renderer draws are all at 854-class
+   resolution, upscaled to the surface at present. Watching "480p engine"
+   is genuinely watching upscaled 480p - the user correctly refused it.
+   It was never a fix for full-quality viewing, only proof of attribution.
+
+Quality-preserving lever: meScale (SvPlayerSettings.meScale, "luma downscale
+the SEARCH runs at", 1=full 2=half) reduces motion-search cost while blend
+and output stay at capture resolution - full-resolution picture. Device
+untested. Predictions against the 41.7ms period: 1080p ORIGINAL + meScale=2
+should land under budget and remove the pulse at full picture quality; 4K
+ORIGINAL + meScale=2 is borderline (readback 16.1ms and the non-search share
+remain); fallback for 4K is RES_1080P (1080p-class picture upscaled to 4K,
+far above 480p) or a code-side motion-path optimization (feature-sized).
+Next evidence: 1080p x3 meScale=2 capture (expect motionMs ~25-30, outFps
+72.0, backpressure ~0), then the same at 4K.
+
+Problem K - the fix: lease-bucket pair pacing under sustained motion overrun
+
+Device attribution (Problem J) showed the felt judder is not the display's
+hold arithmetic but the capacity-4 overflow race: when motion search costs
+more than the 41.7ms pair period (46.7ms at 1080p, 76.6ms at 4K full
+engine), drop-oldest fires at random frame positions, pair spans jump to
+2I, and warps are emitted in bursts - the irregularity the user feels. The
+clean 24Hz beat of an even 72-on-120 stream was proven imperceptible by the
+user's own 480p-engine A/B (S3/S4).
+
+Fix (Kotlin pipeline control only; no frame math, shader or native change):
+PairPacing, a lease bucket on the pair submit path. It accrues one source
+interval per candidate pair and charges the EWMA'd motion cost of every
+processed pair; a pair is declined while the credit sits below the motion
+cost, which makes declines land on a fixed period (~1 per 8 pairs at 1080p,
+~1 per 2 at 4K) instead of wherever the overflow race fires. A declined
+pair releases the anchor, advances it to the next frame without synthesis
+and never reaches motion, so every processed pair keeps the original
+one-interval span - no PAIRGAPs, no 2I pair readings, no srcFps=12.011
+pollution. While motion fits the interval the estimator is inert: a healthy
+pipeline never declines. Pipeline resets clear the estimator; [PACING] grew
+a pairSkip= window delta.
+
+Expected effect: 1080p full engine keeps its full-resolution picture and
+presents ~63 regular fps (one missed grid slot per ~333ms - the
+imperceptible class) instead of 64.3 irregular fps with burst clumping; 4K
+full engine presents ~36 regular fps instead of 37.9 bursty - the
+burst-judder component goes, the FPS shortfall does not, because 76.6ms of
+motion per pair is a compute limit no pacing policy can erase. Full-quality
+4K x3 at 72fps remains: meScale=2 (user setting, full-res output, untested
+on device), or a motion-path optimization (separate, larger work).
+
+Verified: PairPacingTest 9/9 (deficit-rate decline, bounded period,
+cost-collapse release, reset), full gradle suite green.
