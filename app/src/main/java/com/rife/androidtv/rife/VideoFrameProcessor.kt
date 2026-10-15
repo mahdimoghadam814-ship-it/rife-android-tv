@@ -812,8 +812,18 @@ class VideoFrameProcessor(
     // nsJni alone could not say which half of the native work was expensive, so the two native
     // stages are timed separately: the motion search (which may have run on another thread and is
     // folded in through its own elapsed time) and the interpolator/warp called on this thread.
+    // nsInterp is the CPU interpolate() call ONLY: on the GPU-warp path (the shipped default)
+    // the per-pixel resample is a shader, so this stage legitimately reads ~0 and the GPU work
+    // shows up in nsWarp below. Reading interpMs=0 as "no interpolation happened" is the
+    // misattribution this split exists to prevent.
     private var nsMotion = 0L
     private var nsInterp = 0L
+    // GPU warp present time: the wall time of the shader present block (upload-warp, retained-
+    // HDR-texture warp, or denoised warp) inside the render window. A subset of nsRender, not an
+    // addition - renderMs still owns uploads, swaps, the mirror preview and the CPU fallback.
+    // This is the number that answers "did the GPU resample cost anything" on the warp path,
+    // where interpMs reports the (empty) CPU dispatch by design.
+    private var nsWarp = 0L
     // Time inside the readback-completion step only: fence check, PBO map and copy. Distinct from
     // nsReadback, which also covers submitting the next capture, so a stall here is a GPU/CPU
     // synchronisation cost and a stall there is a capture cost.
@@ -3377,6 +3387,7 @@ class VideoFrameProcessor(
             val hdrFrame0 = hdrTextureByAnalysisBuffer[prev.pixels] ?: 0
             val hdrFrame1 = hdrTextureByAnalysisBuffer[nextFrame.pixels] ?: 0
             val hdrComposition = hdrFrame0 != 0 && hdrFrame1 != 0
+            val tWarpStart = System.nanoTime()
             if (!presented && motionReady && motionBuf != null) {
                 // From the denoised pair when there is one. The first cycle after a reset has no
                 // denoised history to warp from, so it blends the raw pair, and the present below
@@ -3444,6 +3455,7 @@ class VideoFrameProcessor(
                     for (presentedTs in timestamps) noteOutputTimestamp(presentedTs)
                 }
             }
+            nsWarp += System.nanoTime() - tWarpStart
             submittedOutputFrameCount += warpPresentedPoints
             if (!presented) {
                 if (hdrComposition) {
@@ -3677,6 +3689,7 @@ class VideoFrameProcessor(
                 "jni=${fmtMs(nsJni / n)} " +
                 "motion=${fmtMs(nsMotion / n)} interp=${fmtMs(nsInterp / n)} " +
                 "render=${fmtMs(nsRender / n)} " +
+                "warp=${fmtMs(nsWarp / n)} " +
                 "total=${fmtMs(nsPair / n)} ms/cycle | " +
                 "renderSplit calls=$renderCalls cur=${fmtMs(nsRenderCurrent / n)} " +
                 "st=${fmtMs(nsRenderSetup / n)} up=${fmtMs(nsRenderUpload / n)} " +
@@ -3699,7 +3712,7 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"} motionLeases=${motionLeasedBuffers.size} deferred=${motionDeferredReleases.size} pool=${frameBufferPool.size} path=tex:$presentWarpTexCount den:$presentWarpDenCount w8:$presentWarp8Count cpu:$presentCpuCount hfb:$presentHdrFallbackCount plain:$presentPlainCount cadDisc=$cadenceDiscontinuityCount${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} warpMs=${fmtMs(nsWarp / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"} motionLeases=${motionLeasedBuffers.size} deferred=${motionDeferredReleases.size} pool=${frameBufferPool.size} path=tex:$presentWarpTexCount den:$presentWarpDenCount w8:$presentWarp8Count cpu:$presentCpuCount hfb:$presentHdrFallbackCount plain:$presentPlainCount cadDisc=$cadenceDiscontinuityCount${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
         // Windowed distributions behind the pulse investigation: the averages above hide a
         // recurring dip, so each metric closes with p50/p95/max/outliers where outliers are
         // samples above twice the window's median - a 2x pair interval is a skipped pair, a
@@ -3805,6 +3818,7 @@ class VideoFrameProcessor(
         nsMotion = 0
         nsInterp = 0
         nsRender = 0
+        nsWarp = 0
         nsRenderCurrent = 0
         nsRenderSetup = 0
         nsRenderUpload = 0
@@ -4109,8 +4123,12 @@ class VideoFrameProcessor(
         buffer.position(0)
         val pixelCount = width * height
         var sum: Long = 0
-        // Sample every 16th pixel to keep it fast
-        val step = 16
+        // Fixed ~4096 samples regardless of resolution. The only consumer is the 1 Hz
+        // black-vs-content discriminator ([CONTENT] and the VERBOSE traces): a black frame sums
+        // to zero at any sampling rate, so the old every-16th-pixel walk (520K samples at 4K,
+        // several ms of worker time per second) bought no discrimination. A constant sample
+        // count keeps the signal and removes the resolution-scaled cost.
+        val step = (pixelCount / 4096).coerceAtLeast(1)
         for (i in 0 until pixelCount step step) {
             val offset = i * 4
             if (offset + 3 < buffer.capacity()) {

@@ -1347,31 +1347,42 @@ private const val WARP_FRAGMENT_SHADER = """
         if (submitPrimary) {
             if (outputTimestampNs != 0L) EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, outputTimestampNs)
 
-            val nowNs = System.nanoTime()
-            if (nowNs - lastGpuProbeNs >= 1_000_000_000L) {
-                lastGpuProbeNs = nowNs
-                val w = surfaceWidth.coerceAtLeast(1)
-                val h = surfaceHeight.coerceAtLeast(1)
-                val px = ByteBuffer.allocateDirect(64).order(ByteOrder.nativeOrder()).asIntBuffer()
-                GLES20.glReadPixels(w / 2 - 2, h / 2 - 2, 4, 4, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, px)
-                px.position(0)
-                var sumR = 0
-                var sumG = 0
-                var sumB = 0
-                for (i in 0 until 16) {
-                    val rgba = px.get(i)
-                    sumR += rgba and 0xFF
-                    sumG += (rgba shr 8) and 0xFF
-                    sumB += (rgba shr 16) and 0xFF
+            // The centre-patch probe answers "is the surface black while the pipeline looks
+            // healthy", but glReadPixels is a synchronous pipeline flush: the calling thread
+            // blocks until every previously issued draw has completed, which at 4K warp
+            // resolution is a frame's worth of GPU time - a periodic visible hitch when it ran
+            // once per second on the user's playback path. It is therefore part of the
+            // per-frame VERBOSE_DIAGNOSTICS set now (off in shipped builds); the capture-side
+            // [CONTENT] checksum plus previewFps/swap counters keep the black-discrimination
+            // observable at negligible cost. Re-enable by flipping VERBOSE_DIAGNOSTICS when
+            // debugging a black-surface case.
+            if (VERBOSE_DIAGNOSTICS) {
+                val nowNs = System.nanoTime()
+                if (nowNs - lastGpuProbeNs >= 1_000_000_000L) {
+                    lastGpuProbeNs = nowNs
+                    val w = surfaceWidth.coerceAtLeast(1)
+                    val h = surfaceHeight.coerceAtLeast(1)
+                    val px = ByteBuffer.allocateDirect(64).order(ByteOrder.nativeOrder()).asIntBuffer()
+                    GLES20.glReadPixels(w / 2 - 2, h / 2 - 2, 4, 4, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, px)
+                    px.position(0)
+                    var sumR = 0
+                    var sumG = 0
+                    var sumB = 0
+                    for (i in 0 until 16) {
+                        val rgba = px.get(i)
+                        sumR += rgba and 0xFF
+                        sumG += (rgba shr 8) and 0xFF
+                        sumB += (rgba shr 16) and 0xFF
+                    }
+                    val avgR = sumR / 16
+                    val avgG = sumG / 16
+                    val avgB = sumB / 16
+                    val vp = IntArray(4)
+                    GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, vp, 0)
+                    val fb = IntArray(1)
+                    GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, fb, 0)
+                    Log.i(TAG, "[GPU PROBE] surface=${surfaceWidth}x${surfaceHeight} contentScale=(${String.format("%.4f", contentScaleX)},${String.format("%.4f", contentScaleY)}) viewport=${vp.contentToString()} boundFbo=${fb[0]} avgRGB=($avgR,$avgG,$avgB)")
                 }
-                val avgR = sumR / 16
-                val avgG = sumG / 16
-                val avgB = sumB / 16
-                val vp = IntArray(4)
-                GLES20.glGetIntegerv(GLES20.GL_VIEWPORT, vp, 0)
-                val fb = IntArray(1)
-                GLES20.glGetIntegerv(GLES20.GL_FRAMEBUFFER_BINDING, fb, 0)
-                Log.i(TAG, "[GPU PROBE] surface=${surfaceWidth}x${surfaceHeight} contentScale=(${String.format("%.4f", contentScaleX)},${String.format("%.4f", contentScaleY)}) viewport=${vp.contentToString()} boundFbo=${fb[0]} avgRGB=($avgR,$avgG,$avgB)")
             }
 
             val swapResult = EGL14.eglSwapBuffers(eglDisplay, eglSurface)

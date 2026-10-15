@@ -768,3 +768,78 @@ with hfb= or [RECOVER] lines, not with the warp path; (h3) HDR lifetime errors,
 if seen, will show as motionLeases/deferred gauges never returning to 0 across a
 seek - if so, the reset sequence is the first place to look, and these gauges
 now make that observable.
+
+===========================================================================
+PROBLEM N - REAL-TIME LAG + 4K THROUGHPUT (mi-moPrompt01300.md, bacadbf)
+===========================================================================
+SCOPE: user reports the latest installed APK still shows (1) playback lag /
+momentary slowdown while interpolation runs and (2) a persistent 4K
+full-resolution throughput deficit. Baseline commit bacadbf (instrumentation
+gauges only; chain-decline + ME optimisation already shipped in 797c9bb and
+4020a8a). adb available but NO DEVICE ATTACHED this session - every device
+claim below is either quoted from Problem J's pre-optimisation capture or
+labelled as a code/measurement finding; the installed-APK run number
+(38741199459 vs 38753508692) cannot be verified from here.
+
+STAGE A - TIMER AUDIT (acceptance: resolve interpMs ~ 0.00 misattribution):
+ - Root cause confirmed in code: on the GPU-warp path the interpolate dispatch
+   returns true with no CPU work, so nsInterp legitimately reads ~0; the real
+   per-pixel resample runs as a shader inside the render window and was only
+   visible inside renderMs. That is why Problem J's every-window interpMs was
+   0.00 - not a broken pipeline.
+ - Added nsWarp / warpMs= / warp=: wall time of the shader present block
+   (upload-warp 3428 / retained-HDR-texture 3412 / denoised 3388 region),
+   strictly a SUBSET of renderMs (no double counting; CPU fallback still
+   owned by renderMs and its JNI cost still lands in interpMs by design).
+   Field + reset + [PIPELINE] + PIPELINE TIMING lines updated together.
+ - All other stage timers re-checked against their windows (readback, poll,
+   copy, jni, motion, render splits, queue latency, worker gap, decode
+   interval): no other hidden-work or misattributed-wait found.
+
+HITCH CANDIDATES FOUND IN THE PRESENT PATH (both unconditional, both 1 Hz):
+ 1. GlOutputRenderer.swapBuffers centre-patch probe: glReadPixels is a
+    synchronous full-pipeline flush - up to a frame of GPU time on the caller
+    - and it ran once per second on the live playback path. Gated behind
+    VERBOSE_DIAGNOSTICS (false in shipped builds) with the reason at the site;
+    black-discrimination stays observable via [CONTENT] + preview/swap
+    counters. This is the strongest code-level explanation for periodic
+    "momentary slowdown" at exactly 1 Hz cadence that survived the earlier
+    audits (they checked correctness, not flush cost).
+ 2. [CONTENT] calculateChecksum walked every 16th pixel (~520K samples,
+    ~2-6 ms of worker time) once per second; density buys nothing - a black
+    frame sums to 0 at any rate. Now fixed ~4096 samples regardless of
+    resolution. Constant cost, same discriminator.
+ Static scan of remaining GL syncs: only zero-timeout fence polls (already
+ audited), sticky glGetError queries, and the gated probe - nothing else.
+
+THREAD COUNT - NOT CHANGED (refutes the naive fix):
+ - RifeEngineController:202 hardcodes setInterpolationThreadCount(4), but the
+   site comment records a measured optimum: 8 threads was ~2x SLOWER than 4 on
+   an 8-core big.LITTLE device because ME/MC loops are memory-bound. An
+   availableProcessors() bump would be a regression; left at 4.
+
+4K BUDGET QUANTIFICATION (acceptance: measured+improved or quantified):
+ - Problem J pre-M device: 4K (3840x2076) motionMs 76.6 / outFps 37.9 vs the
+   41.7 ms pair budget (72 fps target); host harness post-M: -34..-38%.
+   Extrapolated device post-M motion ~47-50 ms - still over budget, so
+   PairPacing should now skip roughly every 7th pair (~62-63 outFps), a large
+   gain over 37.9 but short of 72 until ME drops under 41.7 ms.
+ - meScale=2 measured ~20 ms in-harness and audited search-ONLY (meScaleOf
+   touches the luma search domain; motion grid, blend and output stay
+   full-res; verify mode 16/16 PASS includes ms2 cases) - the concrete lever
+   to full 72 fps at 4K if the post-M capture still shows motionMs > 41.7.
+ - Next device capture must log: [PIPELINE] warpMs/motionMs/renderMs,
+   [PACING] pboW8/pairSkip/backpressure, encoderFps/previewFps, at 1080p and
+   4K, meScale 1 and 2 - warpMs>0 with interpMs~0 confirms the split is
+   reporting the shader; warpMs~0 with renderMs high indicts upload/swap.
+
+OPEN HYPOTHESIS (encode path): while an encode runs, every frame also does a
+full-surface glCopyTexImage2D into the mirror plus a second eglSwapBuffers
+for the phone preview - GPU work proportional to the PRIMARY surface size.
+If the next capture's lag windows correlate with encoderFps>0, that copy is
+the next measured candidate; left unchanged (pre-existing, device-specific).
+
+VERIFICATION: :app:compileDebugKotlin :app:ktlintCheck :app:testDebugUnitTest
+--offline --no-daemon BUILD SUCCESSFUL (227 tasks; PairPacing/Windowed/
+Quality/decoder suites green). No native file touched - clang++ not applicable;
+offline harness untouched, previous verify 16/16 still stands.
