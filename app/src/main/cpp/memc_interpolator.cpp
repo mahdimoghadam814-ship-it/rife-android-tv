@@ -182,8 +182,19 @@ static inline int hpToPx(int hp) {
 
 // The motion-search luma downscale: 1 = full resolution (the default, bit-identical path),
 // 2 = half. Values outside {1,2} are treated as 1 so a bad setting degrades to the baseline.
+// The search-domain downscale, as a power of two. 1 searches the full luma; 2/4/8 run the
+// search on 1/4, 1/16 and 1/64 of it while the published field stays on the full-resolution
+// grid - blockStep() grows with the scale, so the vector count falls with its square and the
+// dense per-pixel warp interpolates the coarse field back up to full resolution. This is
+// SVP's own cost lever and the mechanism behind "480p processing is smooth": motion is
+// estimated on a ~480-540p-class luma no matter the source resolution, and only the search
+// gets that cheap - the output stays at the original resolution.
 static inline int meScaleOf(const SvConfig& c) {
-    return c.meScale >= 2 ? 2 : 1;
+    const int ms = c.meScale;
+    if (ms >= 8) return 8;
+    if (ms >= 4) return 4;
+    if (ms >= 2) return 2;
+    return 1;
 }
 
 // Maps a pixel coordinate onto the motion-vector grid, which holds one vector per [pitch] pixels
@@ -550,8 +561,9 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     if (w == work_w_ && h == work_h_ && step == work_step_) return;
 
     // The luma planes hold whatever the search domain is: the full frame at meScale 1, the
-    // half-resolution box average at meScale 2. The motion arrays keep the full-resolution
-    // block grid (step already carries the meScale multiplier), so their sizing is unchanged.
+    // box-downscaled luma at meScale 2/4/8. The motion arrays keep the full-resolution grid
+    // (step already carries the meScale multiplier and grows with it), so their sizing only
+    // changes through blockStep().
     const int ms = meScaleOf(sv_config_);
     const int lw = w / ms;
     const int lh = h / ms;
@@ -592,8 +604,8 @@ void MemcInterpolator::ensureCapacity(int w, int h) {
     work_w_ = w;
     work_h_ = h;
     work_step_ = step;
-    LOGI_SVP("scratch allocated %dx%d domain %dx%d (%zu blocks at %d px, %d threads)",
-              w, h, lw, lh, blocks, step, threads_.load(std::memory_order_relaxed));
+    LOGI_SVP("scratch allocated %dx%d domain %dx%d ms=%d (%zu blocks at %d px, %d threads)",
+              w, h, lw, lh, ms, blocks, step, threads_.load(std::memory_order_relaxed));
 }
 
 void MemcInterpolator::extractLuma(const uint8_t* rgba, int w, int h, uint8_t* luma) {
@@ -632,6 +644,32 @@ void MemcInterpolator::downsample2(const uint8_t* src, int sw, int sh, uint8_t* 
             for (int x = 0; x < dw; x++) {
                 const int i = x * 2;
                 o[x] = static_cast<uint8_t>((r0[i] + r0[i + 1] + r1[i] + r1[i + 1]) >> 2);
+            }
+        }
+    });
+}
+
+// Factor x factor box average, for meScale 4 and 8. Chaining downsample2 would need
+// intermediate planes (the destination is 1/ms of the source, not 1/2), and one pass is
+// both simpler and a touch more accurate - no mid-chain truncation. The trailing partial
+// row/column past the last whole factor block is dropped, exactly as downsample2 drops an
+// odd row/column. `shift` is log2 of the sample count: 16 samples >> 4, 64 >> 6.
+void MemcInterpolator::downsampleBox(const uint8_t* src, int sw, int sh,
+                                     uint8_t* dst, int factor) {
+    const int dw = sw / factor;
+    const int dh = sh / factor;
+    const int shift = (factor == 4) ? 4 : 6;
+    parallelFor(0, dh, [&](int y0, int y1) {
+        for (int y = y0; y < y1; y++) {
+            const uint8_t* rowBase = src + static_cast<size_t>(y) * factor * sw;
+            uint8_t* o = dst + static_cast<size_t>(y) * dw;
+            for (int x = 0; x < dw; x++) {
+                int sum = 0;
+                const uint8_t* p = rowBase + x * factor;
+                for (int dy = 0; dy < factor; dy++, p += sw) {
+                    for (int dx = 0; dx < factor; dx++) sum += p[dx];
+                }
+                o[x] = static_cast<uint8_t>(sum >> shift);
             }
         }
     });
@@ -1038,9 +1076,11 @@ void MemcInterpolator::regulariseField(const uint8_t* tgt, const uint8_t* ref, i
 
     // Window anchored a quarter block in, so it stays clear of the block's outer edges while
     // still covering the part the warp reads from most heavily. Eight pixels rather than sixteen
-    // keeps four candidates at about the cost of one extra full-block evaluation.
-    const int ox = (kBlock / 4) / ms;
-    const int oy = (kBlock / 4) / ms;
+    // keeps four candidates at about the cost of one extra full-block evaluation. Floored at
+    // one domain pixel: at meScale 8 a quarter block rounds to zero, and an anchor of zero
+    // would read across the block's own left/top edge.
+    const int ox = std::max(1, (kBlock / 4) / ms);
+    const int oy = std::max(1, (kBlock / 4) / ms);
     static const int kNx[4] = {-1, 1, 0, 0};
     static const int kNy[4] = {0, 0, -1, 1};
 
@@ -1269,8 +1309,11 @@ void MemcInterpolator::motionCompensate(const uint8_t* in0, const uint8_t* in1,
     // kBlock. Rescaling to that sum costs one integer divide per call, so it is tabled over
     // the step+1 positions the axis can actually take and the pixel loop stays divide-free.
     // At step == kBlock the table is the identity, so the baseline path is bit-identical.
-    // The table reaches kBlock * 2 because meScale 2 doubles the pitch (up to 32 px).
-    int wtab[kBlock * 2 + 1];
+    // The table reaches kBlock * 8 because the pitch is (kBlock - overlap) * meScale and the
+    // axis weight spans the whole step - up to kBlock * 8 at meScale 8 (128 px). Indexing
+    // past the old kBlock * 2 bound would have been a stack overflow the moment meScale 4
+    // was selected, which is why the clamp at meScaleOf and this bound move together.
+    int wtab[kBlock * 8 + 1];
     for (int i = 0; i <= step; i++) wtab[i] = (i * kBlock + step / 2) / step;
 
     // Dense per-pixel warp: every output pixel interpolates its own vector from the four nearest
@@ -1528,14 +1571,18 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     uint8_t* pyr0[kLevels] = {luma0_.data(), pyr0_[1].data(), pyr0_[2].data()};
     uint8_t* pyr1[kLevels] = {luma1_.data(), pyr1_[1].data(), pyr1_[2].data()};
     if (ms > 1) {
-        // Half-resolution search: extract full-res luma once per frame, then box-average it
-        // into the domain plane the pyramid and both estimates run on.
+        // Coarse search: extract full-res luma once per frame, then box-average it into the
+        // domain plane the pyramid and both estimates run on. meScale 2 reuses the exact
+        // downsample2 the shipped half-resolution path has always used (bit-identical);
+        // meScale 4 and 8 average the wider box in one pass.
         const int sw = w / ms;
         const int sh = h / ms;
         extractLuma(a, w, h, lumaFull_.data());
-        downsample2(lumaFull_.data(), w, h, luma0_.data());
+        if (ms == 2) downsample2(lumaFull_.data(), w, h, luma0_.data());
+        else         downsampleBox(lumaFull_.data(), w, h, luma0_.data(), ms);
         extractLuma(b, w, h, lumaFull_.data());
-        downsample2(lumaFull_.data(), w, h, luma1_.data());
+        if (ms == 2) downsample2(lumaFull_.data(), w, h, luma1_.data());
+        else         downsampleBox(lumaFull_.data(), w, h, luma1_.data(), ms);
         acc_luma_cpu_ns_ += threadCpuNs() - tLumaCpu;
         acc_luma_ns_ += nsSince(tLuma);
 

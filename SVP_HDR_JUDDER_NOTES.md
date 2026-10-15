@@ -843,3 +843,65 @@ VERIFICATION: :app:compileDebugKotlin :app:ktlintCheck :app:testDebugUnitTest
 --offline --no-daemon BUILD SUCCESSFUL (227 tasks; PairPacing/Windowed/
 Quality/decoder suites green). No native file touched - clang++ not applicable;
 offline harness untouched, previous verify 16/16 still stands.
+
+===========================================================================
+PROBLEM O - 480p-CLASS SMOOTHNESS AT FULL RESOLUTION (meScale 4/8)
+===========================================================================
+USER DEMAND: the 480P processing-resolution mode plays smoothly; ORIGINAL
+at 1080p/4K does not. They want the SAME smoothness at the exact original
+resolution - i.e. the SVP model: estimate motion on a ~480p-class luma,
+motion-compensate at full resolution.
+
+DIAGNOSIS:
+ - RifeResolution 480P is smooth because capture, readback, ME AND the
+   warp are all tiny; ORIGINAL at 4K died on ME alone (Problem J device:
+   motionMs 76.6 vs the 41.7 ms pair budget at 72 fps).
+ - The engine already contained every piece of the SVP architecture:
+   blockStep() = (kBlock - overlapPx) * meScale (full-res pitch grows
+   with the scale, so the vector count falls with its square); the warp
+   is dense per-pixel with a 4-tap bilinear read of the field (block
+   seams removed by construction); pack units, search distance, refine
+   publish and nlm residuals all convert through ms generically.
+ - THREE things blocked the coarse ladder:
+   1. meScaleOf clamped at 2 (`>= 2 ? 2 : 1`);
+   2. the ms>1 luma build hardwired ONE downsample2 (correct only for
+      ms=2 - a ms=4 build would have searched half-res luma in
+      quarter-res buffers);
+   3. the warp's mvGridAxis weight table was kBlock*2+1 (33) while the
+      step reaches kBlock*8 (128) at ms8 - a stack overflow waiting for
+      the clamp to open.
+
+CHANGES (commit below):
+ - Native: meScaleOf 1/2/4/8; downsampleBox (one-pass factor-4/8 box
+   average; ms2 keeps the exact downsample2, bit-identical); wtab
+   kBlock*8+1; regulariseField anchor floor 1 domain px (was 0 at ms8);
+   scratch LOGI prints ms=; header docs.
+ - Kotlin: RifeEngineController derives effective meScale at runtime -
+   user's Search Resolution setting is a FLOOR, auto raises until the
+   search domain is <=900 px tall, both held to a >=240 px domain floor
+   (below that the coarse pyramid levels vanish and the wide coarse pass
+   disappears). Applied on setSvPlayerSettings, setResolution and
+   setInputFrameSize (first point the processing size is known). Policy:
+   480p/720p -> ms1; 1080p -> ms2 (540p domain); 4K -> ms4 (540p domain);
+   >3600px -> ms8. UI gains Quarter/Eighth rungs; SvPlayerSettings doc
+   updated. Output resolution NEVER changes - only the search coarsens.
+ - Harness: verify extended (ms4 at 480p, ms8 at 1080p, ms4 reset-reuse
+   byte-identity, ms4 CPU-warp passthrough). 27/27 PASS. ms4 resolves
+   16/32/48 px shifts at frac=1.000 (perfect); ms8 at 1080p 16/32 px
+   frac=1.000; the ms8/64px row is a documented reach-boundary probe
+   (ms8 reliable reach ~50-60 px, why the policy prefers ms4 for 4K).
+ - Perf (host, 4 threads, 3 runs, medians): 4K motion ms1 110-192 ms ->
+   ms2 25-64 -> ms4 14.5-27.8 -> ms8 10.6-32.7. ms4 lands UNDER the
+   41.7 ms pair budget on the host; device pre-M ms1 was 76.6 ms, so
+   device ms4 is expected ~10-20 ms (device-unverified). NOTE: harness
+   interp_ms is the CPU warp fallback, not the shipped GPU path.
+ - Quality: at ms4 the field quantization floors at 2 full-res px and
+   the dense warp interpolates between vectors - the same look class as
+   the smooth 480p processing mode, now composited at full resolution.
+
+VERIFICATION: clang++ -fsyntax-only clean; harness verify 27/27;
+gradlew :app (compile+ktlint+test), :feature:player (compile+ktlint),
+:core:model (compile+test), :core:ui (compile) all BUILD SUCCESSFUL.
+Device: no adb this session - on-device judder/4K fps claims pending the
+CI APK; check [PIPELINE] motionMs (expect << 41.7 ms at 4K) and the new
+"meScale=4 (user=1)" lifecycle line.

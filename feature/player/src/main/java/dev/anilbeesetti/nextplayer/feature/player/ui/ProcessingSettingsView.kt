@@ -363,10 +363,17 @@ private fun SvSettingsSection(
         )
         OptionGroup(
             title = stringResource(R.string.sv_me_scale),
-            options = listOf(1, 2),
+            options = listOf(1, 2, 4, 8),
             selected = settings.meScale,
             label = {
-                stringResource(if (it == 2) R.string.sv_me_scale_2 else R.string.sv_me_scale_1)
+                stringResource(
+                    when (it) {
+                        2 -> R.string.sv_me_scale_2
+                        4 -> R.string.sv_me_scale_4
+                        8 -> R.string.sv_me_scale_8
+                        else -> R.string.sv_me_scale_1
+                    }
+                )
             },
             onSelected = { onSettingsChanged(settings.copy(meScale = it)) },
         )

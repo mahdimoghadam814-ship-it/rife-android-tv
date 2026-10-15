@@ -42,10 +42,14 @@ struct SvConfig {
     // 0 = forward/backward average, 1 = plus per-pixel median, 2 = plus cover/uncover.
     int blendAlgorithm = 2;
     int sceneAdaptive = 1;
-    // Luma downscale the search runs at: 1 full, 2 half. At 2 the motion search, its pyramid
-    // and the masks all run on half-resolution luma while the packed field keeps the same
-    // full-resolution grid pitch (blockStep() doubles) and the same full-resolution reach, so
-    // the cost drops by roughly 4x and the field's precision floors at one full-res pixel.
+    // Luma downscale the search runs at, as a power of two: 1 full, 2 half, 4 quarter,
+    // 8 eighth. Above 1 the motion search, its pyramid and the masks all run on the
+    // downscaled luma while the packed field keeps a full-resolution pitch (blockStep()
+    // multiplies by the scale, so the vector count falls with its square) and the same
+    // full-resolution reach; the dense per-pixel warp then interpolates the coarse field
+    // back up to full resolution. Cost drops by roughly scale^2 and the field's precision
+    // floors at meScale/2 full-res pixels - the same trade SVP's own resolution lever
+    // makes, and what lets a 4K source search at 480p-class cost while outputting 4K.
     // The default of 1 keeps the search bit-identical to the full-resolution path.
     int meScale = 1;
 };
@@ -250,6 +254,8 @@ private:
     void microBench();
     void extractLuma(const uint8_t* rgba, int w, int h, uint8_t* luma);
     void downsample2(const uint8_t* src, int sw, int sh, uint8_t* dst);
+    // Factor x factor box average for meScale 4 and 8; factor is a power of two (4 or 8).
+    void downsampleBox(const uint8_t* src, int sw, int sh, uint8_t* dst, int factor);
     void buildPyramid(const uint8_t* luma, int w, int h, uint8_t** pyr);
 
     // tgt is the frame whose blocks we take; ref is the frame we search in.
@@ -367,8 +373,8 @@ private:
 
     // Scratch, allocated once per resolution instead of per frame.
     std::vector<uint8_t> luma0_, luma1_;
-    // Full-resolution luma staging, used only while meScale == 2: the search runs on the
-    // half-resolution planes in luma0_/luma1_, which are produced by box-downsampling this.
+    // Full-resolution luma staging, used only while meScale > 1: the search runs on the
+    // downscaled planes in luma0_/luma1_, which are produced by box-downsampling this.
     std::vector<uint8_t> lumaFull_;
     std::vector<uint8_t> pyr0_[kLevels];
     std::vector<uint8_t> pyr1_[kLevels];

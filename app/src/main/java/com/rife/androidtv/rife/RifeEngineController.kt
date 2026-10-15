@@ -222,7 +222,46 @@ class RifeEngineController(
         Log.i(TAG_LIFECYCLE, "Denoise level: $strength")
     }
 
-    override fun setSvPlayerSettings(settings: SvPlayerSettings) {
+    @Volatile private var lastSvSettings: SvPlayerSettings = SvPlayerSettings()
+
+    /**
+     * The search-domain height SVP itself is comfortable working at: everything above this
+     * pays the full-resolution search cost for vectors the dense warp is going to interpolate
+     * anyway. 900 keeps 1080p on the half-resolution domain (540p luma) and 4K on the quarter
+     * (540p luma) - the same ~480-540p-class search the 480p processing mode runs, which is
+     * exactly the smoothness this policy exists to reproduce at full output resolution.
+     *
+     * The 240 px floor stops the ladder one rung early when the next one would collapse the
+     * domain: below ~240 px the coarser pyramid levels fall under one matching window and the
+     * coarse search pass disappears, which costs quality without buying meaningful speed.
+     */
+    private fun autoMeScaleFor(processingHeight: Int): Int {
+        var ms = 1
+        while (ms < 8 && processingHeight > 0 &&
+            processingHeight / ms > 900 && processingHeight / (ms * 2) >= 240
+        ) {
+            ms *= 2
+        }
+        return ms
+    }
+
+    /**
+     * Effective meScale: the user's setting is a floor, the auto policy raises it until the
+     * search domain is at most ~900 px tall, both are held to the 240 px domain floor, and
+     * the native clamp accepts only powers of two up to 8. The warp always outputs full
+     * processing resolution; only the search coarsens.
+     */
+    private fun effectiveMeScale(userMeScale: Int): Int {
+        val processingH = processor.currentProcessingSize().second
+        var ms = maxOf(userMeScale.coerceIn(1, 8), autoMeScaleFor(processingH))
+        if (processingH > 0) {
+            while (ms > 1 && processingH / ms < 240) ms /= 2
+        }
+        return ms
+    }
+
+    private fun applySvPlayerSettings(settings: SvPlayerSettings) {
+        val ms = effectiveMeScale(settings.meScale)
         NativeEngine.setSvPlayerSettings(
             settings.performanceQuality,
             settings.artifactMaskLevel,
@@ -233,7 +272,7 @@ class RifeEngineController(
             settings.penaltyLambda,
             settings.blendAlgorithm.ordinal,
             if (settings.sceneAdaptive) 1 else 0,
-            settings.meScale,
+            ms,
         )
         // Not a native setting: the tone map is a capture-stage conversion inside the processor,
         // so it is branched off before the values above reach the search.
@@ -243,8 +282,13 @@ class RifeEngineController(
             "SVPlayer settings: pq=${settings.performanceQuality} " +
                 "mask=${settings.artifactMaskLevel} subpel=${settings.subpel} " +
                 "overlap=${settings.overlap} lambda=${settings.penaltyLambda} " +
-                "meScale=${settings.meScale} tonemap=${settings.hdrToSdrToneMap}"
+                "meScale=$ms (user=${settings.meScale}) tonemap=${settings.hdrToSdrToneMap}"
         )
+    }
+
+    override fun setSvPlayerSettings(settings: SvPlayerSettings) {
+        lastSvSettings = settings
+        applySvPlayerSettings(settings)
     }
 
     /**
@@ -265,6 +309,9 @@ class RifeEngineController(
     override fun setResolution(resolution: FeatureRifeResolution) {
         processor.resolution = RifeResolution.valueOf(resolution.name)
         processor.invalidateProcessingSize()
+        // The processing height feeds the auto meScale floor, so the policy has to run again
+        // against the new size before the next pair is captured.
+        applySvPlayerSettings(lastSvSettings)
     }
 
     /**
@@ -272,6 +319,8 @@ class RifeEngineController(
      */
     override fun setInputFrameSize(width: Int, height: Int) {
         processor.setInputFrameSize(width, height)
+        // First point at which the processing size (and therefore the auto meScale) is known.
+        applySvPlayerSettings(lastSvSettings)
     }
 
     /**

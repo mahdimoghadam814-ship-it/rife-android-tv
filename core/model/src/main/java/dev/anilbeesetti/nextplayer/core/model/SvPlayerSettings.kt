@@ -100,7 +100,14 @@ data class SvPlayerSettings(
     val blendAlgorithm: SvBlendAlgorithmSetting = SvBlendAlgorithmSetting.COVER,
     /** Backs off the search and the blend when the motion field says the scene just changed. */
     val sceneAdaptive: Boolean = true,
-    /** Luma downscale the search runs at: 1 is full resolution, 2 is half. */
+    /**
+     * Luma downscale the search runs at: 1 full, 2 half, 4 quarter, 8 eighth.
+     *
+     * This is a floor, not a fixed value: the pipeline raises it until the search domain is at
+     * most ~900 px tall, so a 1080p source searches at half and a 4K source at quarter - the
+     * same ~480-540p-class cost the 480p processing mode pays - while the warp always outputs
+     * the full processing resolution. The output resolution never changes with this setting.
+     */
     val meScale: Int = 1,
     /**
      * Converts an HDR (PQ or HLG) source to SDR inside the pipeline instead of presenting the
