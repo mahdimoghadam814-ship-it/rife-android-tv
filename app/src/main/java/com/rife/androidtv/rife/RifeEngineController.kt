@@ -92,6 +92,11 @@ class RifeEngineController(
                 processingTimeMs = stats.processingTimeMs,
                 droppedFrames = stats.droppedFrames,
                 currentResolution = stats.currentResolution,
+                motionMs = stats.motionMs,
+                renderMs = stats.renderMs,
+                warpMs = stats.warpMs,
+                pairMs = stats.pairMs,
+                meScale = lastAppliedMeScale,
             )
         },
         onError = { message -> _error.value = message },
@@ -120,6 +125,9 @@ class RifeEngineController(
         ),
     )
     override val stats: StateFlow<RifeStats> = _stats.asStateFlow()
+
+    /** Effective native meScale most recently pushed to the engine; surfaced on the overlay. */
+    @Volatile private var lastAppliedMeScale: Int = 1
 
     private val _error = MutableStateFlow<String?>(null)
     override val error: StateFlow<String?> = _error.asStateFlow()
@@ -262,6 +270,7 @@ class RifeEngineController(
 
     private fun applySvPlayerSettings(settings: SvPlayerSettings) {
         val ms = effectiveMeScale(settings.meScale)
+        lastAppliedMeScale = ms
         NativeEngine.setSvPlayerSettings(
             settings.performanceQuality,
             settings.artifactMaskLevel,

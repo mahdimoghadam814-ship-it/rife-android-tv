@@ -64,7 +64,14 @@ data class Statistics(
     val outputFrameRate: Float,
     val processingTimeMs: Long,
     val droppedFrames: Long,
-    val currentResolution: String
+    val currentResolution: String,
+    // Last completed timing window, per pair - the same numbers [PIPELINE] logs. Surfaced on the
+    // status overlay so a screenshot of the panel is a full budget statement: which stage eats
+    // the pair interval is visible without logcat.
+    val motionMs: Float,
+    val renderMs: Float,
+    val warpMs: Float,
+    val pairMs: Float,
 )
 
 /**
@@ -4473,7 +4480,11 @@ class VideoFrameProcessor(
                 },
                 processingTimeMs = lastProcTimeMs,
                 droppedFrames = droppedFrameCount,
-                currentResolution = resStr
+                currentResolution = resStr,
+                motionMs = if (timingCycles > 0) (nsMotion / timingCycles) / 1_000_000f else 0f,
+                renderMs = if (timingCycles > 0) (nsRender / timingCycles) / 1_000_000f else 0f,
+                warpMs = if (timingCycles > 0) (nsWarp / timingCycles) / 1_000_000f else 0f,
+                pairMs = if (timingCycles > 0) (nsPair / timingCycles) / 1_000_000f else 0f,
             )
 
             onStatisticsUpdated(stats)

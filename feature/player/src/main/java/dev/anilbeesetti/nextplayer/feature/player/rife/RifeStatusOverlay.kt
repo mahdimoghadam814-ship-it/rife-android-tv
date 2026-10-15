@@ -53,9 +53,18 @@ fun RifeStatusOverlay(
             append("Resolution: ").append(resolutionName)
                 .append(" | Interpolation: ")
                 .append(if (rifeEnabled) "ON ($algorithmName)" else "OFF")
-                .append(" | Denoise: ").append(if (fastDvdNetEnabled) "ON" else "OFF").append('\n')
-            append("Processing Time: ").append(stats.processingTimeMs).append(" ms")
-                .append(" | Dropped: ").append(stats.droppedFrames)
+                .append(" | Dropped: ").append(stats.droppedFrames).append('\n')
+            // The budget statement: pair wall time and its two dominant stages against the
+            // source interval (41.7 ms at 24 fps x3), plus the search scale the auto policy
+            // picked - one glance says whether the search (motionMs) or the present path
+            // (renderMs) is over budget and whether the coarse-search build is the one running.
+            append("Pair: ").append("%.1f".format(stats.pairMs)).append(" ms")
+                .append(" | Motion: ").append("%.1f".format(stats.motionMs))
+                .append(" | Render: ").append("%.1f".format(stats.renderMs))
+                .append(" | Warp: ").append("%.1f".format(stats.warpMs)).append('\n')
+            append("ME scale: ").append(stats.meScale).append("x")
+                .append(" | Denoise: ").append(if (fastDvdNetEnabled) "ON" else "OFF")
+                .append(" | Processing Time: ").append(stats.processingTimeMs).append(" ms")
         }
         Surface(
             shape = MaterialTheme.shapes.small,

@@ -39,6 +39,15 @@ data class RifeStats(
     val processingTimeMs: Long,
     val droppedFrames: Long,
     val currentResolution: String,
+    // Last timing-window stage averages per pair - the budget statement. motionMs is the search
+    // (the serial resource pairs queue on), renderMs the whole present window, warpMs the GPU
+    // resample inside it, pairMs the wall interval the engine needs vs the source interval.
+    val motionMs: Float = 0f,
+    val renderMs: Float = 0f,
+    val warpMs: Float = 0f,
+    val pairMs: Float = 0f,
+    // Effective native search downscale after the auto policy (1 full, 2 half, 4 quarter).
+    val meScale: Int = 1,
 )
 
 /**

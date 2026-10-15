@@ -905,3 +905,17 @@ gradlew :app (compile+ktlint+test), :feature:player (compile+ktlint),
 Device: no adb this session - on-device judder/4K fps claims pending the
 CI APK; check [PIPELINE] motionMs (expect << 41.7 ms at 4K) and the new
 "meScale=4 (user=1)" lifecycle line.
+
+PROBLEM O ADDENDUM - status overlay carries the budget:
+User reports insufficient Output FPS + visible lag at ORIGINAL 1080p with
+no adb available. RifeStatusOverlay previously showed only Input/Output
+FPS, Processing Time and Dropped - enough to see the deficit, not enough
+to name the stage. Extended: Pair/Motion/Render/Warp ms (same numbers
+[PIPELINE] logs) and ME scale x on the panel, so a single on-screen
+reading states whether the search (motionMs) or the present path
+(renderMs) owns the pair interval and whether the coarse-search build
+(see meScale>1) is the installed one. Symptom note: 64-vs-72 Output FPS
++ lag at 1080p ORIGINAL matches Problem J's pre-policy numbers exactly
+(outFps 64.3 = 72 x 41.7/46.7 motion); before diagnosing further,
+confirm the installed APK is run 38816242281 (934f1c7, first build with
+the auto meScale policy) - overlay now proves it via ME scale line.
