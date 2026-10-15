@@ -319,6 +319,22 @@ private:
     long long acc_bwd_ns_ = 0;
     long long acc_warp_ns_ = 0;
     long long acc_total_ns_ = 0;
+    // Search profiling, accumulated by motionEstimate() over both directions per frame.
+    // Per pyramid level: wall time of that level's parallel search region, candidate windows
+    // scored (search SADs), the extra half-pel locate SADs, and the gate remeasures that had
+    // to re-measure the winner at 16x16. Together with the pool's work/run split these
+    // separate coarse-level reach, finest-level grid density and thread waiting.
+    long long acc_lvl_wall_ns_[kLevels] = {0, 0, 0};
+    long long acc_lvl_sads_[kLevels] = {0, 0, 0};
+    long long acc_lvl_hp_sads_[kLevels] = {0, 0, 0};
+    long long acc_lvl_gate_[kLevels] = {0, 0, 0};
+    long long acc_lvl_skips_[kLevels] = {0, 0, 0};
+    // Per-direction MemcPool deltas over the whole fwd/bwd bucket (search + its two coherence
+    // passes), so the STAGES/SEARCH lines can split thread waiting out of the wall time.
+    long long acc_fwd_run_ns_ = 0;
+    long long acc_fwd_work_ns_ = 0;
+    long long acc_bwd_run_ns_ = 0;
+    long long acc_bwd_work_ns_ = 0;
     // Motion vectors that hit the packed field's +128-bias encoding ceiling (|v| >= 128 half-pel
     // units, i.e. 64 full-res px), and the total counted, over the same STAGES window as the
     // timings above. A rising percentage is the field asking for more reach than one byte can

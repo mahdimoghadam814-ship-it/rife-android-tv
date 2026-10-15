@@ -533,3 +533,149 @@ on device), or a motion-path optimization (separate, larger work).
 
 Verified: PairPacingTest 9/9 (deficit-rate decline, bounded period,
 cost-collapse release, reset), full gradle suite green.
+
+Problem L - black HDR and residual 1080p judder on the PairPacing build (5a30acf)
+
+Observed (device, user): the 5a30acf build plays HDR completely black, with
+HDR-to-SDR both enabled and disabled; 1080p full-resolution still judders.
+Timeline evidence: the 586ed03 build showed working HDR-to-SDR on device
+(the 0190 capture sessions S2/S4), and the only code delta since is the
+PairPacing commit.
+
+Cause (code trace, both symptoms one defect): the PairPacing decline at the
+CHAIN submit site (trySubmitNextMotion) had invalid ownership. There `prev`
+is the current pair's second frame - still motion-leased, about to render,
+and about to become previousFrame again through that render. The decline
+called releaseFrameBuffer(prev), which DEFERRED the release behind the
+motion lease, then promoted the peeked frame into previousFrame. The render
+that followed overwrote previousFrame back to `prev`, orphaning the promoted
+frame (its buffer and HDR source slot were never released again - a leak per
+decline), and dropMotionLeases then executed the DEFERRED release on `prev`
+itself: the live anchor's buffer re-entered the pool (subsequent captures
+aliased it, corrupting motion inputs - the residual 1080p judder) and, in
+HDR-retain mode, its retained OES texture was freed while still needed
+(hdrTextureByAnalysisBuffer lookup returns 0 -> hdrComposition false -> the
+warp falls off the retained-texture path), while each orphaned frame
+permanently consumed one hdrSourceSlot. Slot exhaustion ends in
+"hdr source leases exhausted" refusing every enqueue - a permanent
+blackout. The CAPTURE-side decline (processNextFramePair) was correct: its
+prev is a stable unleased anchor and its next has already left the queue.
+
+Fix: the chain site no longer applies declines. It parks the decision in
+pendingChainDecline and holds pairProcessing (the in-flight gate) through
+the render; renderPendingQueue applies the decline AFTER dropMotionLeases,
+at the exact point where the rendered pair's second frame has finished both
+of its roles: the finished anchor is released (buffer pool + HDR slot) and
+the peeked frame is promoted, one accrual per pair, chain pipelining
+preserved for every processed pair. resetPipelineOnWorker clears the parked
+decision. The ownership contract is documented at declinePairForPacing
+(capture-site only) and at the chain gate.
+
+Tests: PairPacingTest 15/15 - the original nine plus bounded consecutive
+declines at mild (<=1) and heavy (<=2) overrun (no starvation, no unbounded
+credit), jittered cost around the interval, sudden cost-rise with a bounded
+decline-onset window and settled heavy rate, jittered source intervals, and
+post-overrun release within a few pairs. HdrToneMapSelectionTest 13/13 -
+plus decision statelessness across streams/prior failures (the contract
+behind the first-launch freeze). Pure tests do not prove a nonblack device
+image; device verification is pending.
+
+OES/FBO/PBO audit (01100 section 3.2): refusals log with full readback state
+at 1/s; [RECOVER] discards-and-retries-once per stuck ring; dead-sync and
+null-map heads are discarded; RGBA16F slot allocation checks framebuffer
+completeness and fails closed. No additional defect found on those paths.
+Existing logs discriminate the black-origin stages as follows: [CONTENT]
+capture checksum nonzero => pixels were born sane before the queue;
+[RECOVER]/refuse => capture-stage starvation; [HDR] status + readbackState
+leases => retain-path health; [PACING] backpressure/stale/pairSkip =>
+queue pacing; [PIPELINE] path= + previewFps => renderer activity. No new
+instrumentation was required.
+
+Verification: compile, ktlint, app unit tests, model tests all green
+locally; no native files touched. Device verification (HDR10/PQ with
+tone-map on and off, HLG, session transitions, 1080p Original vs 480p
+diagnostic, 4K) not yet performed - required procedure is section 6 of
+mi-moPrompt01100.md.
+
+Problem M (mi-moPrompt01100 motion task) - 4K motion-estimation throughput
+
+Profiling (before any optimization edit): the offline harness gained a `profile` mode
+(64 motionField calls per config so the 60-frame STAGES/SEARCH report fires) and the
+native gained per-pyramid-level wall/SAD counters plus per-direction pool work/run
+deltas (SEARCH line, same cadence as STAGES). Measured at the shipped defaults
+(16x16, overlap 2, q=1.0, sd=60, 4 threads, this device): 4K motion 182-190 ms
+(fwd+bwd buckets), split level2 (coarsest) ~46% / level1 ~13% / level0 (finest)
+~45% of candidate SADs; pool efficiency 80-82% (compute-bound, not thread-waiting);
+raw sad16x16 microbench 7.8 M calls/s per core. The bottleneck is the exhaustive
+square candidate scan itself at both pyramid ends: 961 candidates per coarse group
+(range 15) and 49 per fine block x 57,600 blocks per direction.
+
+Optimization (quality-exact by construction, applied only to the candidate scan):
+1. Penalty-aware elimination - a candidate whose newLambda/zeroLambda penalty sum
+   already meets the best score is never measured (at 4K, 14.4 M of 15.4 M candidates
+   per frame die here; most are O(pixels) far from the prediction).
+2. Centre-out square rings - the prediction is scored first so `best` is established
+   before the outer rings; only tie preference changes (favouring the near-prediction
+   minimum), the candidate set and scoring are identical.
+3. Row-PDE bounded SAD (sadWinBounded) - rows are summed with an early exit once the
+   monotone partial total exceeds best-minus-penalties; returns the exact SAD when the
+   candidate qualifies, so winners are unchanged. One real bug was caught in review/
+   differential testing: the first 8x8 bounded kernel dropped bytes 4-7 of each row
+   (half-sum), corrupting every meScale=2 search; fixed and re-verified field-exact.
+
+Results (paired before/after on identical synthetic frames, tMin of 64 runs):
+1080p ms=1 sd=60: 51-52 -> 32-33 ms (1.6x); 4K ms=1 sd=60: 184-190 -> 112-121 ms
+(1.5-1.6x; a cool-device run measured 73 ms after vs 124 before); 4K ms=2 sd=60:
+~20 ms unchanged (already cheap). The 4K full-resolution stage therefore sits at
+~2-3x the 41.7 ms pair budget on this hardware class even after the win: the budget
+is unattainable at meScale=1 here. Best measured trade-off remains the existing
+user-selectable meScale=2 (~20 ms, fits with headroom), which is NOT defaulted and
+whose quality cost is the documented -8..-12 dB psnr_correct at 1080p (Problem B);
+it remains a settings choice with the trade-off stated in SvPlayerSettings.
+
+Quality: scale-sweep (480p/1080p/4K, ms 1/2, sd 60/48, shifts 0..63 + resolution-
+relative) before vs after: max |delta| = 0.01 dB on every PSNR column, frac_1px /
+frac_both / sat_pct identical on all 58 rows; two rows shift the median error by
+1 half-pel at sd=48 (non-default) pack-clamped dx=63. Packed-field diffs: only the
+known left/right border bands (a handful of blocks per thousands) move, by
+tie-breaks between equal-score candidates, exactly where Problem B documented the
+by-design crossfade masking. Half-pel units, the +128 bias pack, the 63.5 px pack
+ceiling, scene-cut SAD measurement and mask construction are untouched.
+
+Regression tests: the harness `verify` mode pins 16 checks and passes identically on
+the pre-change and post-change builds - vector accuracy at ms=1/2 for shifts
+0/16/24/32/48/63 and diagonal, the sd=16 short-reach collapse (dx=48 unresolvable),
+whole-pixel mode producing no odd half-pel vectors outside pack clamps, odd
+(partial-tile) frame sizes, reset()/scratch reuse byte-identical to a fresh instance
+(buffer ownership), and CPU-warp static passthrough PSNR>40 (CPU/GPU consistency
+proxy for the shared prepare/field path). Build: clang++ -std=c++17 -O2 -pthread
+-I stub -I <repo>/app/src/main/cpp bench.cpp <repo>/app/src/main/cpp/memc_interpolator.cpp
+; run `./bench verify`. gradle suite + clang -Wall -Wextra syntax check PASS.
+Changed repo files: app/src/main/cpp/memc_interpolator.{h,cpp} only (search loop,
+bounded SAD kernel, SEARCH profiling). HDR, tone-map, PairPacing, output timing,
+packing contracts and defaults untouched.
+
+Device-unverified: all timings are from the offline harness on the development device
+(5 cores, 4 threads, NEON); the target box's [PIPELINE] motionMs and [SEARCH] lines
+must be re-captured after installing the CI APK, and 4K fast-pan behavior watched for
+the pack-ceiling saturation counter. No new judder is expected (PairPacing and the
+output grid are unchanged) but this remains unverified on physical hardware.
+
+Problem M addendum - meScale=1 vs meScale=2 on identical inputs (post-optimization,
+sd=60, synthetic translation, harness scale + profile modes; interpolate() times below
+include the CPU NEON warp, which the GPU motionField path does not pay - use the
+motionField tMin from profile for stage comparisons):
+
+  res    ms  dx=16 psnr_cor frac1px | dx=32 psnr_cor frac1px | dx=48 psnr_cor frac1px | motion ms (profile tMin)
+  1080p   1    64.3   0.993       |  62.7   0.981       |  61.7   0.966       | 32-33
+  1080p   2    58.4   1.000       |  52.5   1.000       |  49.2   0.999       | ~8
+  4K      1    69.0   0.997       |  63.2   0.991       |  65.8   0.983       | 112-121 (73 cool)
+  4K      2    60.9   1.000       |  54.9   1.000       |  50.3   1.000       | ~20
+
+Reading: ms=2 keeps the vectors inside one full-res pixel (its precision floor) but
+loses 5-12 dB of psnr_correct against the analytic mid-frame as the resample quantises
+to whole-pixel positions; ms=1 holds the half-pel lattice. At 4K, ms=1 after the
+optimization is still 2-3x over the 41.7 ms pair budget on this device class, while
+ms=2 fits with headroom - the explicit, user-selectable lever (ProcessingSettingsView,
+default stays 1). No silent reduction was made; the trade-off remains as documented in
+Problem B and in the SvConfig header comment.

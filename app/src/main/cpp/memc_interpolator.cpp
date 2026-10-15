@@ -78,6 +78,51 @@ static inline int sadWin(const uint8_t* a, const uint8_t* b, int stride, int bw,
     return s;
 }
 
+// SAD with an early-exit bound, used only by the search's candidate scoring. Row sums are
+// non-negative, so the running total is a lower bound of the full SAD: as soon as it passes
+// `bound` the candidate cannot qualify and the rest of the rows are skipped. Returns the
+// full SAD when it is <= bound, otherwise a value > bound - callers only test the result
+// against their bound, so the early-exit value's exact magnitude is irrelevant. A negative
+// bound is answered immediately: even an all-zero SAD cannot qualify.
+static inline int sadWinBounded(const uint8_t* a, const uint8_t* b, int stride,
+                                int bw, int bh, int bound) {
+    if (bound < 0) return 1;
+    if (bw == 16 && bh == 16) {
+        uint32_t total = 0;
+        for (int y = 0; y < 16; y++) {
+            const uint8x16_t d = vabdq_u8(vld1q_u8(a + y * stride), vld1q_u8(b + y * stride));
+            const uint16x8_t s = vaddl_u8(vget_low_u8(d), vget_high_u8(d));
+            const uint32x2_t p = vadd_u32(vpaddl_u16(vget_low_u16(s)),
+                                          vpaddl_u16(vget_high_u16(s)));
+            total += vget_lane_u32(vpadd_u32(p, p), 0);
+            if (static_cast<int>(total) > bound) return static_cast<int>(total);
+        }
+        return static_cast<int>(total);
+    }
+    if (bw == 8 && bh == 8) {
+        uint32_t total = 0;
+        for (int y = 0; y < 8; y++) {
+            const uint8x8_t d = vabd_u8(vld1_u8(a + y * stride), vld1_u8(b + y * stride));
+            const uint16x8_t s = vmovl_u8(d);
+            const uint32x2_t p = vadd_u32(vpaddl_u16(vget_low_u16(s)),
+                                          vpaddl_u16(vget_high_u16(s)));
+            total += vget_lane_u32(vpadd_u32(p, p), 0);
+            if (static_cast<int>(total) > bound) return static_cast<int>(total);
+        }
+        return static_cast<int>(total);
+    }
+    int s = 0;
+    for (int y = 0; y + 8 <= bh; y += 8) {
+        const uint8_t* ra = a + y * stride;
+        const uint8_t* rb = b + y * stride;
+        for (int x = 0; x + 8 <= bw; x += 8) {
+            s += sadWinBounded(ra + x, rb + x, stride, 8, 8, bound - s);
+            if (s > bound) return s;
+        }
+    }
+    return s;
+}
+
 
 // MV coherence penalties, in SAD counts per full-resolution pixel of deviation. These are the
 // block-matching counterpart of SVP's penalty.* settings and they are what keeps a per-block
@@ -728,8 +773,21 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
         // Shown to the SAD only through `range`, so it can be read once per level.
         const bool adaptive = searchDistance == 0 && base > 1;
 
+        // Per-level search profiling: wall time of this level's region plus the candidate
+        // counts each worker scored. Reduced outside the region so the counters stay plain
+        // integers inside the hot loop.
+        const auto tLvl = std::chrono::steady_clock::now();
+        std::atomic<long long> sadCalls{0};
+        std::atomic<long long> hpCalls{0};
+        std::atomic<long long> gateCalls{0};
+        std::atomic<long long> skipCalls{0};
+
         parallelFor(0, lrows, [&](int r0, int r1) {
             long long localSad = 0;
+            long long localSads = 0;
+            long long localHp = 0;
+            long long localGate = 0;
+            long long localSkip = 0;
             for (int lr = r0; lr < r1; lr++) {
                 const int by = std::min(lr * dstep, lh - kBlock);
                 for (int lc = 0; lc < lcols; lc++) {
@@ -762,6 +820,7 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                         // adaptive setting sitting - and a short look in the flat areas is
                         // what stops a repeating texture from pulling the vector around.
                         const int zero = sadWin(tb, ref + by * lw + bx, lw, bw, bh);
+                        localSads++;
                         const int span = 32 * bw * bh;   // 32 per pixel = clearly unmatched
                         const int hit = clampi(zero, 0, span);
                         range = base / 3 + ((base - base / 3) * hit) / span;
@@ -775,22 +834,49 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                     // motion-compensated difference the scene-change gate reads.
                     int bestPlain = -1;
 
-                    for (int dy = -range; dy <= range; dy++) {
-                        const int yy = by + gy + dy;
-                        if (yy < 0 || yy + bh > lh) continue;
-                        const uint8_t* row = ref + yy * lw;
-                        for (int dx = -range; dx <= range; dx++) {
-                            const int xx = bx + gx + dx;
-                            if (xx < 0 || xx + bw > lw) continue;
-                            const int s = sadWin(tb, row + xx, lw, bw, bh);
-                            int score = s;
-                            score += newLambda * (std::abs(dx) + std::abs(dy));
-                            score += zeroLambda * (std::abs(gx + dx) + std::abs(gy + dy));
-                            if (score < best) {
-                                best = score;
-                                bestDx = gx + dx;
-                                bestDy = gy + dy;
-                                bestPlain = s;
+                    // Centre-out square rings around the prediction. The winner normally sits
+                    // within a pixel or two of it, so establishing `best` on ring 0 lets the
+                    // bounded SAD and the penalty skip below dismiss the outer rings instead
+                    // of running every candidate to completion. Same candidate set, same
+                    // scoring as the old raster scan; only the order (and therefore tie
+                    // preference, which now favours the near-prediction minimum) changes.
+                    for (int ring = 0; ring <= range; ring++) {
+                        for (int dy = -ring; dy <= ring; dy++) {
+                            const int yy = by + gy + dy;
+                            const bool topBot = (dy == -ring || dy == ring);
+                            const auto tryDx = [&](int dx) {
+                                if (!topBot && dx != -ring && dx != ring) return;
+                                const int xx = bx + gx + dx;
+                                if (yy < 0 || yy + bh > lh) return;
+                                if (xx < 0 || xx + bw > lw) return;
+                                // A candidate whose penalty sum already meets the best score
+                                // cannot win whatever its SAD is, so it is never measured.
+                                const int pen = newLambda * (std::abs(dx) + std::abs(dy)) +
+                                                zeroLambda * (std::abs(gx + dx) +
+                                                              std::abs(gy + dy));
+                                if (pen >= best) {
+                                    localSkip++;
+                                    return;
+                                }
+                                // The SAD itself is bounded by what is left of `best` after
+                                // the penalties; rows that cannot change the answer are cut.
+                                const int s = sadWinBounded(tb, ref + yy * lw + xx,
+                                                            lw, bw, bh, best - pen);
+                                localSads++;
+                                if (s > best - pen) return;
+                                const int score = s + pen;
+                                if (score < best) {
+                                    best = score;
+                                    bestDx = gx + dx;
+                                    bestDy = gy + dy;
+                                    bestPlain = s;
+                                }
+                            };
+                            if (topBot) {
+                                for (int dx = -ring; dx <= ring; dx++) tryDx(dx);
+                            } else {
+                                tryDx(-ring);
+                                tryDx(ring);
                             }
                         }
                     }
@@ -816,6 +902,7 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                             const int xx = bx + bestDx + ox;
                             const int yy = by + bestDy + oy;
                             if (xx < 0 || yy < 0 || xx + bw > lw || yy + bh > lh) return -1;
+                            localHp++;
                             return sadWin(tb, ref + yy * lw + xx, lw, bw, bh);
                         };
                         // Vertex of the parabola through the three samples, in pixels relative
@@ -842,6 +929,7 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
                     if (l == 0 && bestPlain >= 0) {
                         int gateSad = bestPlain;
                         if (bw != kBlock || bh != kBlock) {
+                            localGate++;
                             // The gate wants a whole 16x16 whole-pixel SAD. Where the matching
                             // window is not that shape, re-measure the winner at 16x16, and
                             // fall back to the zero-shift match if the winner runs off the
@@ -902,7 +990,24 @@ long long MemcInterpolator::motionEstimate(uint8_t* const tgtPyr[kLevels],
             if (l == 0 && localSad != 0) {
                 sadAcc.fetch_add(localSad, std::memory_order_relaxed);
             }
+            if (localSads != 0) {
+                sadCalls.fetch_add(localSads, std::memory_order_relaxed);
+            }
+            if (localHp != 0) {
+                hpCalls.fetch_add(localHp, std::memory_order_relaxed);
+            }
+            if (localGate != 0) {
+                gateCalls.fetch_add(localGate, std::memory_order_relaxed);
+            }
+            if (localSkip != 0) {
+                skipCalls.fetch_add(localSkip, std::memory_order_relaxed);
+            }
         });
+        acc_lvl_wall_ns_[l] += nsSince(tLvl);
+        acc_lvl_sads_[l] += sadCalls.load(std::memory_order_relaxed);
+        acc_lvl_hp_sads_[l] += hpCalls.load(std::memory_order_relaxed);
+        acc_lvl_gate_[l] += gateCalls.load(std::memory_order_relaxed);
+        acc_lvl_skips_[l] += skipCalls.load(std::memory_order_relaxed);
     }
     return sadAcc.load(std::memory_order_relaxed);
 }
@@ -1456,6 +1561,12 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     // Each estimate is followed by two coherence passes, fed output-first so a correction can
     // travel more than one block. Their cost is folded into the same accumulator, so STAGES
     // still reports one number per direction and keeps the same meaning.
+    // Per-direction pool deltas: the search regions' summed worker time against their wall
+    // time, so thread waiting is separable from arithmetic in the SEARCH report.
+    long long poolRun0 = 0, poolWork0 = 0, poolRuns0 = 0;
+    int poolPart0 = 1;
+    pool_->stats(&poolRun0, &poolWork0, &poolRuns0, &poolPart0);
+
     const auto tFwd = std::chrono::steady_clock::now();
     const long long sadFwd = motionEstimate(pyr0, pyr1, w, h, mvf_x_.data(), mvf_y_.data());
     regulariseField(luma0_.data(), luma1_.data(), w, h,
@@ -1463,6 +1574,13 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
     regulariseField(luma0_.data(), luma1_.data(), w, h,
                     tmpx_.data(), tmpy_.data(), mvf_x_.data(), mvf_y_.data());
     acc_fwd_ns_ += nsSince(tFwd);
+    {
+        long long poolRun1 = 0, poolWork1 = 0, poolRuns1 = 0;
+        int poolPart1 = 1;
+        pool_->stats(&poolRun1, &poolWork1, &poolRuns1, &poolPart1);
+        acc_fwd_run_ns_ += poolRun1 - poolRun0;
+        acc_fwd_work_ns_ += poolWork1 - poolWork0;
+    }
 
     long long sadBwd = 0;
     if (forwardOnly) {
@@ -1473,6 +1591,9 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
         std::fill(mvb_x_.begin(), mvb_x_.end(), 0);
         std::fill(mvb_y_.begin(), mvb_y_.end(), 0);
     } else {
+        long long poolRunB0 = 0, poolWorkB0 = 0, poolRunsB0 = 0;
+        int poolPartB0 = 1;
+        pool_->stats(&poolRunB0, &poolWorkB0, &poolRunsB0, &poolPartB0);
         const auto tBwd = std::chrono::steady_clock::now();
         sadBwd = motionEstimate(pyr1, pyr0, w, h, mvb_x_.data(), mvb_y_.data());
         regulariseField(luma1_.data(), luma0_.data(), w, h,
@@ -1480,6 +1601,11 @@ bool MemcInterpolator::prepare(const uint8_t* src0, const uint8_t* src1,
         regulariseField(luma1_.data(), luma0_.data(), w, h,
                         tmpx_.data(), tmpy_.data(), mvb_x_.data(), mvb_y_.data());
         acc_bwd_ns_ += nsSince(tBwd);
+        long long poolRunB1 = 0, poolWorkB1 = 0, poolRunsB1 = 0;
+        int poolPartB1 = 1;
+        pool_->stats(&poolRunB1, &poolWorkB1, &poolRunsB1, &poolPartB1);
+        acc_bwd_run_ns_ += poolRunB1 - poolRunB0;
+        acc_bwd_work_ns_ += poolWorkB1 - poolWorkB0;
     }
 
     // Compute raw forward/backward consistency before the cut decision, but keep its reliability
@@ -1833,10 +1959,25 @@ void MemcInterpolator::reportStagesIfDue() {
                               : 0.0;
 
     LOGI_SVP("STAGES n=%lld frame=%.1f setup=%.2f resize=%.2f luma=%.2f "
-              "lumaCpu=%.2f pyr=%.2f fwd=%.1f bwd=%.1f warp=%.1f ms sat=%.1f%% | pool "
-              "runs/frame=%.1f runWall=%.1f work=%.1f eff=%.0f%% thr=%d",
-              acc_frames_, frame, setup, resize, luma, lumaCpu, pyr, fwd, bwd, warp, satPct,
-              runsPerFrame, runPerFrame, workPerFrame, eff, participants);
+             "lumaCpu=%.2f pyr=%.2f fwd=%.1f bwd=%.1f warp=%.1f ms sat=%.1f%% | pool "
+             "runs/frame=%.1f runWall=%.1f work=%.1f eff=%.0f%% thr=%d",
+             acc_frames_, frame, setup, resize, luma, lumaCpu, pyr, fwd, bwd, warp, satPct,
+             runsPerFrame, runPerFrame, workPerFrame, eff, participants);
+    // Second line, same window: the search split by pyramid level (wall ms of the level's
+    // parallel region; candidate, half-pel and gate SADs in millions per frame, both
+    // directions) and the per-direction pool deltas (run = wall ms inside the fwd/bwd bucket,
+    // work = summed worker ms). work ~= run * thr means compute-bound; work << run means the
+    // bucket is paying for thread waiting instead.
+    LOGI_SVP("SEARCH n=%lld lvlWall=%.1f/%.1f/%.1f sads=%.2f/%.2f/%.2fM "
+             "hp=%.2fM gate=%.2fM skip=%.2fM | dir fwdRun=%.1f fwdWork=%.1f "
+             "bwdRun=%.1f bwdWork=%.1f",
+             acc_frames_,
+             ms(acc_lvl_wall_ns_[0]), ms(acc_lvl_wall_ns_[1]), ms(acc_lvl_wall_ns_[2]),
+             ms(acc_lvl_sads_[0]), ms(acc_lvl_sads_[1]), ms(acc_lvl_sads_[2]),
+             ms(acc_lvl_hp_sads_[0]), ms(acc_lvl_gate_[0]),
+             ms(acc_lvl_skips_[0]) + ms(acc_lvl_skips_[1]) + ms(acc_lvl_skips_[2]),
+             ms(acc_fwd_run_ns_), ms(acc_fwd_work_ns_),
+             ms(acc_bwd_run_ns_), ms(acc_bwd_work_ns_));
 
     acc_frames_ = 0;
     acc_setup_ns_ = 0;
@@ -1850,6 +1991,17 @@ void MemcInterpolator::reportStagesIfDue() {
     acc_total_ns_ = 0;
     acc_sat_vecs_ = 0;
     acc_total_vecs_ = 0;
+    for (int l = 0; l < kLevels; l++) {
+        acc_lvl_wall_ns_[l] = 0;
+        acc_lvl_sads_[l] = 0;
+        acc_lvl_hp_sads_[l] = 0;
+        acc_lvl_gate_[l] = 0;
+        acc_lvl_skips_[l] = 0;
+    }
+    acc_fwd_run_ns_ = 0;
+    acc_fwd_work_ns_ = 0;
+    acc_bwd_run_ns_ = 0;
+    acc_bwd_work_ns_ = 0;
 }
 
 }  // namespace rife
