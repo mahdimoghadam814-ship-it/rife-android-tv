@@ -539,6 +539,12 @@ class VideoFrameProcessor(
     private val pairPacing = PairPacing()
     private var pairSkipCount = 0L
     private var pacingSkipAtWindowStart = 0L
+    // Async ring health: polls where a PBO was pending but its fence had not signalled. The
+    // zero-timeout fence poll makes "head not ready" and "ring empty" look identical from the
+    // outside, so this counter is what separates a GPU-readback-bound ring (rising w8 with a
+    // filling pending=) from an idle one. Worker-only; windowed like the pacing deltas.
+    private var pboNotReadyCount = 0L
+    private var pboNotReadyAtWindowStart = 0L
     // A decline decided at the chain submit site cannot release its `prev` there: that frame is
     // the in-flight pair's second frame, still motion-leased, and about to render. The decision
     // is parked in this flag, the in-flight gate is held, and renderPendingQueue applies the
@@ -2530,6 +2536,7 @@ class VideoFrameProcessor(
                 val completedPixels = obtainFrameBuffer(info.width, info.height)
                 val ready = grabber.pollReadback(completedPixels)
                 if (ready == null) {
+                    pboNotReadyCount++
                     releaseFrameBuffer(completedPixels)
                     // Head PBO not signaled yet; it will be retried on the next capture.
                     break
@@ -3692,7 +3699,7 @@ class VideoFrameProcessor(
         val previewFps = (if (encodeActive) swaps[1] else swaps[0]) / windowSeconds
         val encoderFps = if (encodeActive) swaps[0] / windowSeconds else 0.0
         val f1 = { v: Double -> String.format(java.util.Locale.US, "%.1f", v) }
-        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"} path=tex:$presentWarpTexCount den:$presentWarpDenCount w8:$presentWarp8Count cpu:$presentCpuCount hfb:$presentHdrFallbackCount plain:$presentPlainCount cadDisc=$cadenceDiscontinuityCount${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
+        Log.i(TAG, "[PIPELINE] src=${inputWidth}x$inputHeight capture=${previousFrame?.width ?: 0}x${previousFrame?.height ?: 0} srcFps=${String.format(java.util.Locale.US, "%.3f", sourceFps)} requestedOutFps=${String.format(java.util.Locale.US, "%.3f", sourceFps * memcLevelMultiplier)} generatedOutFps=${String.format(java.util.Locale.US, "%.3f", generatedFps)} decoderArrivalFps=${f1(arrivalRate)} previewFps=${f1(previewFps)} encoderFps=${f1(encoderFps)} pairMs=${fmtMs(nsPair / n)} readbackMs=${fmtMs(nsReadback / n)} pollMs=${fmtMs(nsPoll / n)} motionMs=${fmtMs(nsMotion / n)} interpMs=${fmtMs(nsInterp / n)} jniMs=${fmtMs(nsJni / n)} renderMs=${fmtMs(nsRender / n)} encoderMs=${fmtMs(nsRenderSwap / n)} droppedIn=$dropped droppedOut=$droppedOutput queue=${frameQueue.size} queueLatencyMs=$avgQueueLatencyMs burstSubmission=${memcLevelMultiplier > 1f} gateDeferred=$pairGateDeferredCount pairGaps=$pairGapCount tsRegress=${outputTimeline.regressions} rendererCalls=${renderCalls.toInt()} readback=${frameGrabber?.readbackState() ?: "off"} motionLeases=${motionLeasedBuffers.size} deferred=${motionDeferredReleases.size} pool=${frameBufferPool.size} path=tex:$presentWarpTexCount den:$presentWarpDenCount w8:$presentWarp8Count cpu:$presentCpuCount hfb:$presentHdrFallbackCount plain:$presentPlainCount cadDisc=$cadenceDiscontinuityCount${if (bypassTargetSize != 0) " alloc=bypass:$bypassTargetSize" else if (rejectedTargetSize != 0) " alloc=reject:$rejectedTargetSize" else ""}")
         // Windowed distributions behind the pulse investigation: the averages above hide a
         // recurring dip, so each metric closes with p50/p95/max/outliers where outliers are
         // samples above twice the window's median - a 2x pair interval is a skipped pair, a
@@ -3714,7 +3721,8 @@ class VideoFrameProcessor(
                 "submitUs=${usToken(submitIntervals.closeWindow())} " +
                 "stale=${staleDiscardCount - pacingStaleAtWindowStart} " +
                 "backpressure=${backpressureDropCount - pacingBackpressureAtWindowStart} " +
-                "pairSkip=${pairSkipCount - pacingSkipAtWindowStart}"
+                "pairSkip=${pairSkipCount - pacingSkipAtWindowStart} " +
+                "pboW8=${pboNotReadyCount - pboNotReadyAtWindowStart}"
         )
         // Presentation-side arithmetic, logged once per (srcFps, multiplier, refresh) change:
         // a stamp rate that does not divide the display refresh evenly holds or skips frames
@@ -3821,6 +3829,7 @@ class VideoFrameProcessor(
         pacingStaleAtWindowStart = staleDiscardCount
         pacingBackpressureAtWindowStart = backpressureDropCount
         pacingSkipAtWindowStart = pairSkipCount
+        pboNotReadyAtWindowStart = pboNotReadyCount
 
         // Periodic safety net: a wipe between two resets would otherwise go unnoticed until the
         // next surface change, and the decoder's answer is only available once frames are flowing.

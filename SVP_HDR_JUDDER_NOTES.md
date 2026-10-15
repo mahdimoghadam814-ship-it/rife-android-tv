@@ -679,3 +679,92 @@ optimization is still 2-3x over the 41.7 ms pair budget on this device class, wh
 ms=2 fits with headroom - the explicit, user-selectable lever (ProcessingSettingsView,
 default stays 1). No silent reduction was made; the trade-off remains as documented in
 Problem B and in the SvConfig header comment.
+
+Fresh-eyes re-audit (prompt 01200, HEAD=4020a8a) - confirmed vs hypothesis.
+Scope: full code trace of capture -> pair -> motion -> render -> present for SDR and
+HDR, ownership/lifetime of every buffer class, pacing gates, ME contracts, output
+cadence. No device was involved; every CONFIRMED item below is code-read evidence
+(this session), every HYPOTHESIS needs the target box.
+
+CONFIRMED (code):
+ 1. Single-worker event loop is what makes the gate/pendingChainDecline windows
+    safe: capture (queueCapturedFrame, backpressure drop-oldest, stale-discard
+    loop) and render (renderPendingQueue) are separate handler posts on one
+    looper, so no capture can interleave inside a render callback. The peeked
+    frame a parked chain-decline will promote therefore cannot be stolen by
+    backpressure between peek (trySubmitNextMotion) and poll (apply block), and
+    declinePairForPacing always sees a stable unleased anchor.
+ 2. Chain-decline apply ordering is exact: gate cleared -> render -> dropMotionLeases
+    (drops prev/next leases, 'next' count 2->1 when chain re-leased it) -> poll
+    promote -> release old anchor -> pairSkipCount -> gate false. Stale-generation
+    branch: drop(recycle=false) removes the deferred entry, then the explicit
+    releaseFrameBuffer() finalizes exactly once (finishFrameBufferRelease is
+    idempotent: pool dedup guard + hdr map remove-nothing on second call).
+ 3. HDR source lifetime has no leak path: enqueue sets inUse (refuses on any inUse
+    for resize; refuses when leases exhausted, with recovery), poll publishes
+    hdrTextureByAnalysisBuffer[buffer], finishFrameBufferRelease releases it,
+    releasePbos() releases still-pending sources on PBO size change and teardown,
+    releaseHdrSources() deletes fb+textures, reset clears map after leases drop.
+    One texture <-> one buffer at a time throughout.
+ 4. Async capture never blocks: glClientWaitSync is zero-timeout; a not-ready head
+    frees the just-obtained analysis buffer and breaks; the drain loop empties
+    whatever the GPU finished between captures.
+ 5. Output cadence survives declines: after a skipped span nextOutputUs lies in
+    (lastPairEnd, lastPairEnd+step] < next baseUs, so outputTimesFor's
+    re-anchor condition (nextOutputUs <= baseUs) fires - phase restarts with one
+    emission per pair, no burst and no missed slot. OutputTimelineGuard stays
+    monotonic by construction; 3x pins thirds; MAX_OUTPUTS_PER_PAIR caps bursts.
+ 6. Residency shortcut requires token!=0 AND token==resident AND same buffer
+    instance AND same dims, and is reset on pipeline boundaries (seek/stream
+    change), so pool recycling and timestamp replay cannot present stale pixels.
+ 7. interp_mutex_ serializes interpolate() vs motionField() (shared prepare()
+    pyramid scratch). Contentious only when the CPU fallback renders while the
+    next pair's motion runs off-thread - a rare path that itself requires a
+    failed/refused motion or warp. Deliberate tradeoff (splitting needs a second
+    scratch set); recorded, not fixed.
+ 8. 1 Hz glReadPixels GPU probe in GlOutputRenderer.swapBuffers() forces a
+    pipeline flush once per second by design; rate-limited, intentional, not a
+    cadence-period stall.
+ 9. motionExecutor is never shut down (daemon thread), so execute() cannot throw
+    RejectedExecutionException; teardown safety comes from workerHandler==null and
+    handler.post()==false branches, both of which drop leases without recycling.
+
+INSTRUMENTATION ADDED (this session, VideoFrameProcessor.kt only):
+ - pboW8=<n> in [PACING]: windowed count of polls where a PBO was pending but its
+   fence had not signalled. Discriminates "GPU readback bound ring" (pboW8 rising
+   while readback=pending fills) from an idle ring; previously head-not-ready and
+   ring-empty were indistinguishable.
+ - motionLeases=/deferred=/pool= gauges in [PIPELINE]: live motion lease count,
+   deferred-release backlog, pool size. Discriminates lease leak / pool starvation
+   from stage-cost regressions when output degrades.
+ Nothing else was added: [PIPELINE]/[PACING]/[SCHED]/[CADENCE]/[HDR]/[CONTENT] plus
+ native STAGES/SEARCH already split capture, poll, copy, jni, motion, interp,
+ render, swap, queue age, worker gaps, decoder intervals and cadence arithmetic;
+ actual display pacing remains a Perfetto FrameTimeline question (platform tool).
+
+OFFLINE BASELINES (todo 4/8; Termux host CPU, 4 threads, medians of 4 runs -
+NOT the target device): perf mode before(parent of 4020a8a) vs after(4020a8a):
+ 1080p ms1 sd60 motion 64.2 -> 61.3 ms (noise band); 1080p ms1 sd48 66.7 -> 33.7;
+ 4K ms1 sd48 158.5 -> 96.7 (-39%); 4K ms1 sd60 171.1 -> 106.6 (-38%);
+ 4K ms2 rows ~24 ms unchanged. profile mode (64 calls, sd60) tMed:
+ 1080p ms1 37.3 -> 30.4; 4K ms1 178.8 -> 117.7 (-34%); 4K ms2 17.7 -> 17.2.
+ interp_ms deltas before/after are run noise (the ME change does not touch
+ interpolate; the before-run shows the expected sd48<sd60 inversion). verify mode
+ on the after build: 16/16 PASS exit 0 (accuracy, half-pel, reach, pack ceiling,
+ odd sizes, reset byte-identity, CPU-warp passthrough). 4K ms1 motion alone
+ (107 ms) is ~2.5x the 41.7 ms pair budget - the measured basis for Problem C
+ and for PairPacing declining pairs. Saved: svpbench/perf_baseline_01200.txt,
+ profile_{before,after}_01200.txt.
+
+DECISION: no new behavioral fix staged. Across capture, pairing, gates, leases,
+HDR lifetimes, fences, cadence and present paths the re-audit found no remaining
+code-level defect; the only gaps were observational (pboW8, lease gauges), which
+are the instrumentation above. Stage A-F stays empty pending device evidence.
+
+HYPOTHESES still open (need target box): (h1) residual 4K stutter is pacing
+periodicity (pairSkip beat) rather than stage overrun - check [PACING]
+pairSkip/pairUs p95 against submitUs outliers; (h2) any black frame correlates
+with hfb= or [RECOVER] lines, not with the warp path; (h3) HDR lifetime errors,
+if seen, will show as motionLeases/deferred gauges never returning to 0 across a
+seek - if so, the reset sequence is the first place to look, and these gauges
+now make that observable.
