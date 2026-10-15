@@ -181,4 +181,38 @@ class HdrToneMapSelectionTest {
         assertTrue(d is ToneMapDecision.ToneMap)
         assertFalse((d as ToneMapDecision.ToneMap).sourceIsLinear)
     }
+
+    @Test
+    fun decisionIsStatelessAcrossStreamsAndPriorFailures() {
+        // A new stream after an earlier tone-map failure or success must get the same verdict
+        // for the same evidence: the decision carries no history, so the runtime's only cache
+        // is the per-frame ensureToneMap() result. This is the contract behind the
+        // first-launch-only freeze, where a cached availability flag survived a grabber
+        // recreation and refused every frame of the new session.
+        val fail = VideoFrameProcessor.toneMapDecision(
+            enabled = true,
+            colorTransfer = C.COLOR_TRANSFER_ST2084,
+            shaderCompiled = false,
+            representation = Representation.ENCODED,
+        )
+        val succeed = VideoFrameProcessor.toneMapDecision(
+            enabled = true,
+            colorTransfer = C.COLOR_TRANSFER_ST2084,
+            shaderCompiled = true,
+            representation = Representation.ENCODED,
+        )
+        val failAgain = VideoFrameProcessor.toneMapDecision(
+            enabled = true,
+            colorTransfer = C.COLOR_TRANSFER_ST2084,
+            shaderCompiled = false,
+            representation = Representation.ENCODED,
+        )
+        assertTrue(fail is ToneMapDecision.HdrRetain)
+        assertTrue(succeed is ToneMapDecision.ToneMap)
+        assertTrue(failAgain is ToneMapDecision.HdrRetain)
+        assertEquals(
+            (fail as ToneMapDecision.HdrRetain).reason,
+            (failAgain as ToneMapDecision.HdrRetain).reason,
+        )
+    }
 }

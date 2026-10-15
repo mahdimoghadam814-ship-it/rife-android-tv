@@ -539,6 +539,11 @@ class VideoFrameProcessor(
     private val pairPacing = PairPacing()
     private var pairSkipCount = 0L
     private var pacingSkipAtWindowStart = 0L
+    // A decline decided at the chain submit site cannot release its `prev` there: that frame is
+    // the in-flight pair's second frame, still motion-leased, and about to render. The decision
+    // is parked in this flag, the in-flight gate is held, and renderPendingQueue applies the
+    // decline after the render's leases drop. Worker-only; cleared by the apply block and reset.
+    private var pendingChainDecline = false
     // Worker-only key of the last [CADENCE] tuple (srcFps|multiplier|refresh): the line logs
     // once per change instead of once per window, so a 30-minute session adds a handful of
     // lines while still catching a multiplier switch or a source-cadence change.
@@ -1744,6 +1749,7 @@ class VideoFrameProcessor(
         // and in the lease table below; there is no separate "in-flight pair" reservation to
         // drop, so the previous frame is released outright.
         pairProcessing = false
+        pendingChainDecline = false
         // The output timeline restarts with the pipeline: after a seek the first present carries
         // no relation to the last one before it, so the regression check has to re-arm rather
         // than report the cut as a defect.
@@ -2620,10 +2626,13 @@ class VideoFrameProcessor(
     }
 
     /**
-     * Overrun pacing gate, applied before a pair is committed. A declined pair releases the
-     * anchor, advances it to the next frame without synthesis and never reaches motion, so
-     * every processed pair keeps the original one-interval span and the output grid stays
-     * regular. Worker-only.
+     * Overrun pacing gate for the capture-side submit site, where `prev` is a stable unleased
+     * anchor and `next` has already left the queue: a declined pair releases the anchor,
+     * advances it to the next frame without synthesis and never reaches motion, so every
+     * processed pair keeps the original one-interval span and the output grid stays regular.
+     * The chain submit site (trySubmitNextMotion) must NOT call this - its `prev` is still the
+     * in-flight pair's second frame - and parks the same decision in [pendingChainDecline]
+     * instead. Worker-only.
      */
     private fun declinePairForPacing(prev: FrameData, next: FrameData): Boolean {
         if (!pairPacing.shouldDeclinePair(lastPairIntervalUs)) return false
@@ -2781,6 +2790,24 @@ class VideoFrameProcessor(
         // would ever re-enter the pool and the HDR source texture would never be released.
         dropMotionLeases(prev, next)
 
+        // A decline parked at the chain submit site is applied only now: the just-rendered
+        // pair has released its leases, so the old anchor (`next`, which the render above made
+        // previousFrame) can return to the pool and its HDR source texture can be freed, and
+        // the frame the gate peeked can be promoted in its place. Both roles of `next` are
+        // finished at this point, which is exactly the ownership the capture-side decline
+        // path relies on. If the poll comes up empty (nothing else polls, so it cannot in
+        // practice) the old anchor is kept and the chain continues from it.
+        if (pendingChainDecline) {
+            pendingChainDecline = false
+            val promoted = frameQueue.poll()
+            if (promoted != null) {
+                previousFrame?.let { releaseFrameBuffer(it.pixels) }
+                previousFrame = promoted
+                pairSkipCount++
+            }
+            pairProcessing = false
+        }
+
         // Schedule next render on next worker cycle instead of recursing
         if (pendingRenderQueue.isNotEmpty()) {
             workerHandler?.post { renderPendingQueue() }
@@ -2793,10 +2820,16 @@ class VideoFrameProcessor(
         val nextFrame = frameQueue.peek() ?: return
         val prev = prevForNextPair
 
-        // Same overrun gate as the capture-side submit: the peeked frame is consumed here
-        // because it becomes the anchor rather than the second half of a processed pair.
-        if (declinePairForPacing(prev, nextFrame)) {
-            frameQueue.poll()
+        // Same overrun gate as the capture-side submit, but the decline cannot be applied here.
+        // `prev` is the current pair's second frame: still motion-leased, about to render, and
+        // about to become the anchor again through the render below - releasing it here would
+        // queue a deferred release that destroys that live anchor once the leases drop, and the
+        // peeked frame would be orphaned when the render overwrites previousFrame. Hold the
+        // in-flight gate instead and let renderPendingQueue promote the peeked frame once `prev`
+        // has finished both roles; the frame itself stays in the queue until then.
+        if (pairPacing.shouldDeclinePair(lastPairIntervalUs)) {
+            pendingChainDecline = true
+            pairProcessing = true
             return
         }
 
