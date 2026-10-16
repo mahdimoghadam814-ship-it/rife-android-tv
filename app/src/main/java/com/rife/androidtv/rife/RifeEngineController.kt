@@ -97,6 +97,7 @@ class RifeEngineController(
                 warpMs = stats.warpMs,
                 pairMs = stats.pairMs,
                 meScale = lastAppliedMeScale,
+                multiplier = stats.multiplier,
             )
         },
         onError = { message -> _error.value = message },

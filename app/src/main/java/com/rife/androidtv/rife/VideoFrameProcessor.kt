@@ -72,6 +72,12 @@ data class Statistics(
     val renderMs: Float,
     val warpMs: Float,
     val pairMs: Float,
+    /**
+     * The multiplier the pipeline actually ran with: the user's 2x/3x setting snapped to the
+     * rate that lands evenly on the display refresh ([MemcLevelSnap]). Surfaced on the status
+     * overlay so the effective cadence is visible in one screenshot.
+     */
+    val multiplier: Float = 2f,
 )
 
 /**
@@ -655,8 +661,20 @@ class VideoFrameProcessor(
     private var lastPairIntervalUs = 0L
 
     @Volatile private var sourceFrameRateHint = 0f
+
+    /**
+     * The source rate the cadence snap works from. The container's frame-rate metadata is
+     * preferred ([sourceFrameRateHint]); when that is missing the first measured pair interval
+     * latches a value here. Latched rather than re-estimated every window so pair-interval
+     * jitter cannot flap the snapped multiplier and re-anchor the emission phase every second.
+     */
+    @Volatile private var latchedSourceFps = 0f
+
     fun setSourceFrameRate(frameRate: Float) {
-        sourceFrameRateHint = frameRate.takeIf { it.isFinite() && it > 0f } ?: 0f
+        val hint = frameRate.takeIf { it.isFinite() && it > 0f } ?: 0f
+        sourceFrameRateHint = hint
+        if (hint > 0f) latchedSourceFps = hint
+        applyEffectiveMemcLevel()
     }
     fun currentOutputFrameRate(): Float = if (sourceFrameRateHint > 0f) {
         sourceFrameRateHint * memcLevelMultiplier
@@ -698,6 +716,14 @@ class VideoFrameProcessor(
      */
     @Volatile
     private var memcLevelMultiplier = 2f
+
+    /**
+     * The user's interpolation level, before the display-refresh snap. [memcLevelMultiplier]
+     * is what the pipeline runs with; this is what comes back when refresh or source rate is
+     * unknown, or when the even target falls outside the 2x-4x band.
+     */
+    @Volatile
+    private var userMemcLevel = 2f
 
     /**
      * Strength of the motion-aligned denoiser's history blend, on the settings' own scale (one is
@@ -1484,15 +1510,40 @@ class VideoFrameProcessor(
      * Sets how many output frames are synthesised per source frame. Read on every cycle, so the
      * next pair already emits at the new cadence; the emission phase is re-anchored from that
      * pair's own timestamps rather than carried over from the old ratio.
+     *
+     * The value stored here is the user's *neighbourhood* choice: the effective multiplier the
+     * pipeline runs with may be snapped toward the rate that lands evenly on the display refresh
+     * (see [applyEffectiveMemcLevel]); 24 fps x 2 (48) and x 3 (72) both miss 60 Hz and present
+     * some frames on two vsyncs no matter how fast the pipeline is.
      */
     fun setMemcLevel(multiplier: Float) {
-        val clamped = multiplier.coerceIn(2f, 4f)
-        if (memcLevelMultiplier == clamped) return
-        memcLevelMultiplier = clamped
-        runOnWorker("setMemcLevel()") {
+        userMemcLevel = multiplier.coerceIn(MemcLevelSnap.MIN_MULTIPLIER, MemcLevelSnap.MAX_MULTIPLIER)
+        applyEffectiveMemcLevel()
+    }
+
+    /**
+     * Recomputes the effective multiplier from the user setting, the display refresh and the
+     * latched source rate. Re-anchors the emission phase only when the value actually changes.
+     */
+    private fun applyEffectiveMemcLevel() {
+        val target = MemcLevelSnap.effective(userMemcLevel, sourceFpsForSnap(), displayRefreshRateHz)
+        if (target == memcLevelMultiplier) return
+        memcLevelMultiplier = target
+        runOnWorker("applyEffectiveMemcLevel()") {
             nextOutputUs = Long.MIN_VALUE
         }
-        Log.i(TAG, "Interpolation level: ${clamped}x")
+        Log.i(
+            TAG,
+            "Interpolation level: ${target}x " +
+                "(user=${userMemcLevel}x src=${String.format(java.util.Locale.US, "%.3f", sourceFpsForSnap())} fps " +
+                "display=${displayRefreshRateHz} Hz - output lands on the vsync grid)"
+        )
+    }
+
+    private fun sourceFpsForSnap(): Double = when {
+        latchedSourceFps > 0f -> latchedSourceFps.toDouble()
+        lastPairIntervalUs > 0L -> 1_000_000.0 / lastPairIntervalUs
+        else -> 0.0
     }
 
     /**
@@ -1505,6 +1556,7 @@ class VideoFrameProcessor(
 
     fun setDisplayRefreshRate(hz: Float) {
         displayRefreshRateHz = hz
+        applyEffectiveMemcLevel()
     }
 
     /**
@@ -4466,6 +4518,14 @@ class VideoFrameProcessor(
                 RifeResolution.RES_480P -> "480p"
             }
 
+            // First stable pair interval is the fallback source rate for the cadence snap when
+            // the container carried no frame-rate metadata. Latched once so interval jitter
+            // cannot flap the snapped multiplier every second.
+            if (latchedSourceFps == 0f && lastPairIntervalUs > 0L) {
+                latchedSourceFps = 1_000_000f / lastPairIntervalUs
+                applyEffectiveMemcLevel()
+            }
+
             val stats = Statistics(
                 inputFps = inFps,
                 outputFps = outFps,
@@ -4485,6 +4545,7 @@ class VideoFrameProcessor(
                 renderMs = if (timingCycles > 0) (nsRender / timingCycles) / 1_000_000f else 0f,
                 warpMs = if (timingCycles > 0) (nsWarp / timingCycles) / 1_000_000f else 0f,
                 pairMs = if (timingCycles > 0) (nsPair / timingCycles) / 1_000_000f else 0f,
+                multiplier = memcLevelMultiplier,
             )
 
             onStatisticsUpdated(stats)

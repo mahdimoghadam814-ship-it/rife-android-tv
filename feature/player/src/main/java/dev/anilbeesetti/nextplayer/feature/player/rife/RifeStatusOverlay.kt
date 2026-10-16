@@ -49,7 +49,11 @@ fun RifeStatusOverlay(
         }
         val text = buildString {
             append("Input FPS: ").append("%.1f".format(stats.inputFps))
-                .append(" | Output FPS: ").append("%.1f".format(stats.outputFps)).append('\n')
+                .append(" | Output FPS: ").append("%.1f".format(stats.outputFps))
+                // The effective multiplier, after the display-refresh snap - 2.5x is the
+                // 24->60 Hz cadence. Without this line a snapped run is indistinguishable
+                // from a plain 2x or 3x on the panel.
+                .append(" @").append("%.2f".format(stats.multiplier)).append("x").append('\n')
             append("Resolution: ").append(resolutionName)
                 .append(" | Interpolation: ")
                 .append(if (rifeEnabled) "ON ($algorithmName)" else "OFF")

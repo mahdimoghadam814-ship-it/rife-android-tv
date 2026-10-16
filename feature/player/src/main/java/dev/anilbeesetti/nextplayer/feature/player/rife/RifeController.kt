@@ -48,6 +48,9 @@ data class RifeStats(
     val pairMs: Float = 0f,
     // Effective native search downscale after the auto policy (1 full, 2 half, 4 quarter).
     val meScale: Int = 1,
+    // The multiplier the pipeline actually ran with: the user's 2x/3x setting snapped to the
+    // rate that lands evenly on the display refresh (24 fps -> 2.5x on 60 Hz).
+    val multiplier: Float = 2f,
 )
 
 /**

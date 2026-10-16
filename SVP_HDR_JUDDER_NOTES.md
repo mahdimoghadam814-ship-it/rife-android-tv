@@ -919,3 +919,61 @@ reading states whether the search (motionMs) or the present path
 (outFps 64.3 = 72 x 41.7/46.7 motion); before diagnosing further,
 confirm the installed APK is run 38816242281 (934f1c7, first build with
 the auto meScale policy) - overlay now proves it via ME scale line.
+
+PROBLEM P - output cadence vs display refresh (the beat under the lag):
+User still reports insufficient Output FPS + lag at ORIGINAL 1080p even
+with the budget overlay installed. The [CADENCE] diagnostic already
+predicted this failure mode since it landed: an output rate that does not
+divide the display refresh holds some frames two vsyncs (or skips), so
+motion beats at the arithmetic difference frequency no matter how fast
+every stage is - OutputCadence's own worked case is exactly this one
+(24 fps x 2 = 48 on 60 Hz: 24 of every 60 slots are double-frames,
+motion "speeds up and slows down" 24 times/s while every FPS counter
+reads healthy). Nothing in the pipeline ever CHOSE the even rate: the
+settings enum offers only 2x and 3x (48 or 72 - both miss 60), and
+idealEvenMultiplier was advisory only. A 24 fps film at 3x presents
+72 stamps onto a 60 Hz grid: 12 frames/s are dropped on arrival, the
+panel alternates 1 and 2 vsync holds, and the result reads as lag plus
+insufficient-output-rate even when motionMs is under budget.
+
+MECHANISM (what was already there, what was missing):
+ - outputTimesFor() already phase-carries fractional ratios: stepUs =
+   intervalUs/ratio with a cursor walk, so a 2.5 ratio emits the
+   2-1-2-1 alternation of 3 and 2 points per pair that IS 60 fps from
+   24. MAX_OUTPUTS_PER_PAIR=8 covers it. No scheduler change needed.
+ - exactThreeTimes pins pair-relative thirds at exactly 3.0; a snapped
+   2.5 correctly falls through to the phase path.
+ - The display refresh was already pushed at startup
+   (setDisplayRefreshRate(defaultDisplayRefreshRate()) in start()); the
+   source rate was already known (container metadata via
+   setSourceFrameRate, or the measured pair interval).
+ - Missing: anything that computed refresh/srcFps and ran with it.
+
+CHANGES:
+ - MemcLevelSnap (new, pure, unit-tested): effective(user, srcFps,
+   refreshHz) = refresh/srcFps clamped into the same 2x-4x band as the
+   user setting; unknown refresh or source returns the user value; moves
+   under 0.01 are measurement jitter and keep the user value so the
+   emission phase is never re-anchored for noise.
+ - VideoFrameProcessor: userMemcLevel keeps the setting, memcLevelMultiplier
+   is what the pipeline runs; applyEffectiveMemcLevel() recomputes on
+   setMemcLevel / setSourceFrameRate / setDisplayRefreshRate and re-anchors
+   nextOutputUs only when the value changes. Latched source fps: container
+   metadata preferred; first stable pair interval latches the fallback
+   once (never re-estimated - interval jitter must not flap the snap).
+   Log line prints the full arithmetic. Statistics gains multiplier.
+ - RifeStats/RifeEngineController/RifeStatusOverlay: effective multiplier
+   shown as "@2.5x" next to Output FPS - a snapped run is now visible in
+   one screenshot.
+ - MemcLevelSetting doc: the setting is the neighbourhood, the panel's
+   arithmetic picks the exact rate; UI labels unchanged (defaults not
+   silently changed).
+ Arithmetic: 24@60 -> 2.5 (user 2 or 3); 30@60 -> 2; 25@60 -> 2.4;
+ 23.976@60 -> 2.5025; 24@120 -> 5 clamped to 4; refresh unknown -> user.
+
+VERIFICATION: MemcLevelSnapTest 8/8; full offline gradle suite green
+(:app compile+ktlint+test, :feature:player compile+ktlint, :core:model
+compile+test). Device-unverified: whether the user's symptom is this
+beat (vs Problem J motionMs deficit) needs the overlay numbers - "@2.5x"
+plus steady 60.0 Output FPS confirms the snap engaged; Motion ms near
+or above 41.7 is the other failure mode.
