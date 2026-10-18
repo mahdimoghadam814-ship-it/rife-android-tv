@@ -977,3 +977,85 @@ compile+test). Device-unverified: whether the user's symptom is this
 beat (vs Problem J motionMs deficit) needs the overlay numbers - "@2.5x"
 plus steady 60.0 Output FPS confirms the snap engaged; Motion ms near
 or above 41.7 is the other failure mode.
+
+PROBLEM Q - offline non-realtime 3x file interpolation (new feature):
+Request: an option in the main menu that batch-processes a 1080p/4K
+SDR/HDR movie as one offline job - not realtime playback - producing
+3x interpolated frames at native resolution using the same SVPlayer
+"480p-class" search math, with audio + subtitle streams bit-identical
+and container metadata unchanged. Realtime at 4K is ME-bound (Problem
+M/J); offline has no pair-interval budget, so the same ME that runs
+search at ms2/ms4 domain can warp at full native resolution while the
+codec encodes in the background.
+
+DESIGN (locked before code):
+ - Decode: extractor -> decoder -> Surface(SurfaceTexture) ->
+   OesFrameGrabber.read() -> RGBA direct buffers. Byte-buffer HDR10
+   decode is unreliable; the GL path is the proven HDR path in-app.
+ - Interpolate: reuse NativeEngine.interpolateFrameBuffers(in0, in1,
+   srcW, srcH, outW, outH, timestep, out) at t=1/3 and t=2/3 per pair.
+   The JNI takes any jfloat timestep (rife_jni.cpp:183; memc
+   interpolator honours [0,1], 0.5 is just what the realtime pipeline
+   exercises). V1 costs two ME runs per pair and needs zero native
+   changes; a future JNI "warp from cached field" could halve it.
+ - Search domain: port RifeEngineController.autoMeScaleFor exactly -
+   1080p->ms2, 4K->ms4 - so offline does the same search the smooth
+   realtime 480p mode does ("the same math", user's words).
+ - Timeline: OfflinePts keeps the SOURCE timeline. N source frames ->
+   3N-2 output frames; anchors keep original PTS, mids land at
+   prev+(next-prev)*i/3; audio/subs copied with original timestamps.
+   Movie duration and A/V sync unchanged by construction.
+ - Container: custom pure-KT MatroskaMuxer - MediaMuxer cannot carry
+   subtitles at all nor DTS/TrueHD. Unknown-size Segment, Timestamp
+   Scale 10_000 (10us ticks; int16 block offsets reach +-327ms),
+   250ms clusters, SimpleBlock video/audio, BlockGroup+Duration subs,
+   Cues per video keyframe. Subtitle events pre-buffered
+   (addSubtitleEvents) because duration = gap to next event, which
+   streaming cannot know. Fail fast on audio/sub codecs the container
+   cannot carry (TrackMapper.Passthrough.unsupportedReason).
+ - Encode: HdrHevcEncoder (surface input, existing HDR10/SDR keys)
+   fed by new RgbaSurfacePresenter: RGBA ByteBuffer -> texture ->
+   quad -> encoder EGL window surface with eglPresentationTimeANDROID
+   (GlOutputRenderer's hand-off, without the realtime features).
+   Bitrate source*1.15 clamped [8,80]Mbps else w*h*fps/10; GOP 2s;
+   B=0 (decode-order == presentation-order, same reason as MPEG-TS).
+ - Job: OfflineInterpolationJob singleton StateFlow + Interpolation
+   Service foreground service (type mediaProcessing on API 35+,
+   dataSync on 34, none below - the platform's own types; the earlier
+   "dataProcessing" draft was not a real ServiceInfo constant).
+   Output via MediaStore Movies/Interpolated (IS_PENDING workflow).
+   One job at a time: it already saturates decoder+ME+encoder.
+ - UI: Setting.INTERPOLATE_FILE row after VIDEO_PROCESSING, SAF
+   picker (OpenDocument video/*), progress from the job's StateFlow.
+
+CHANGES (all new files under app/src/main/java/com/rife/androidtv/
+offline/ unless noted): MatroskaMuxer.kt, OfflinePts.kt, TrackMapper
+.kt, RgbaSurfacePresenter.kt, OfflineInterpolationRunner.kt,
+OfflineInterpolationJob.kt, InterpolationService.kt,
+InterpolateFileScreen.kt; navigation/InterpolateFileNavigation.kt +
+SettingsNavGraph entry; feature SettingsScreen Setting row; core/ui
+strings; AndroidManifest (FGS permissions + service); test files
+MatroskaMuxerTest (8) + OfflinePtsTest (6).
+
+BUGS CAUGHT BY THE JVM TESTS BEFORE ANY DEVICE TIME:
+ - usToTicks was `us * (TIMESTAMP_SCALE / 1_000_000L)` - integer
+   division made 10_000/1_000_000 = 0, so EVERY timestamp in every
+   file would have been zero (clusters, cues, all block times). Now
+   `us * 1_000L / TIMESTAMP_SCALE`. Subtitle durations had the same
+   zeroing and were converted through usToTicks too.
+ - Mkv cue offset now measured from segment data start at cluster open
+   (bytesWritten - segmentDataStart), matching the write order.
+ - Runner draft bugs fixed pre-commit: MediaExtractor (Context,Uri)
+   overload absent from this compile SDK -> ParcelFileDescriptor path;
+   decoder buffer released to SurfaceTexture BEFORE updateTexImage
+   (else stale GL frame); latch replaced by lock/flag (CountDownLatch
+   does not re-arm); prev/cur copy through real ByteBuffer.put.
+
+VERIFICATION: offline tests 14/14 green; full gradle suite green
+(app compile+ktlint+test, feature:player compile+ktlint,
+feature:settings compile+ktlint, core:model compile+test,
+core:ui compile). Device-unverified: the whole feature - no adb this
+session, no on-device run of decode->interpolate->encode->mux; first
+device check is a short 1080p SDR clip (audio sync at 3N-2 frames,
+HDR10 static info via mediainfo, subtitle durations), then a 4K HDR
+movie (ms4 search domain, encoder Main10, job wall time).

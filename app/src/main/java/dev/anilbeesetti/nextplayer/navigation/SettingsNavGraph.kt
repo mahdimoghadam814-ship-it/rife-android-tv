@@ -41,6 +41,7 @@ fun EntryProviderScope<NavKey>.settingsNavGraph(
                 Setting.MEDIA_LIBRARY -> backStack.navigateToMediaLibraryPreferencesScreen()
                 Setting.PLAYER -> backStack.navigateToPlayerPreferences()
                 Setting.VIDEO_PROCESSING -> backStack.navigateToVideoProcessingPreferences()
+                Setting.INTERPOLATE_FILE -> backStack.navigateToInterpolateFile()
                 Setting.GESTURES -> backStack.navigateToGesturePreferences()
                 Setting.AUDIO -> backStack.navigateToAudioPreferences()
                 Setting.SUBTITLE -> backStack.navigateToSubtitlePreferences()
@@ -67,6 +68,9 @@ fun EntryProviderScope<NavKey>.settingsNavGraph(
         onNavigateUp = { backStack.removeLastIfNotRoot() },
     )
     videoProcessingPreferencesEntry(
+        onNavigateUp = { backStack.removeLastIfNotRoot() },
+    )
+    interpolateFileEntry(
         onNavigateUp = { backStack.removeLastIfNotRoot() },
     )
     gesturePreferencesEntry(

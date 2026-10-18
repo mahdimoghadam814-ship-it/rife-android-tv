@@ -108,6 +108,7 @@ enum class Setting {
     MEDIA_LIBRARY,
     PLAYER,
     VIDEO_PROCESSING,
+    INTERPOLATE_FILE,
     GESTURES,
     AUDIO,
     SUBTITLE,
@@ -144,6 +145,12 @@ private enum class SettingRow(
         descriptionResId = R.string.video_processing_description,
         icon = NextIcons.Speed,
         setting = Setting.VIDEO_PROCESSING,
+    ),
+    INTERPOLATE_FILE(
+        titleResId = R.string.interpolate_file,
+        descriptionResId = R.string.interpolate_file_description,
+        icon = NextIcons.Frame,
+        setting = Setting.INTERPOLATE_FILE,
     ),
     GESTURES(
         titleResId = R.string.gestures_name,

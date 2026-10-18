@@ -7,6 +7,9 @@
     <uses-permission
         android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
 
     <uses-feature
         android:name="android.software.leanback"
@@ -44,6 +47,11 @@
         </activity>
 
         <activity android:name="dev.anilbeesetti.nextplayer.crash.CrashActivity" />
+
+        <service
+            android:name="com.rife.androidtv.offline.InterpolationService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProcessing|dataSync" />
 
         <provider
             android:name="androidx.core.content.FileProvider"
