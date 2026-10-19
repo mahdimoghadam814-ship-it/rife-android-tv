@@ -6,7 +6,6 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.opengl.EGL14
-import android.opengl.EGLConfig
 import android.opengl.EGLDisplay
 import android.opengl.EGLSurface
 import android.os.Handler
@@ -293,7 +292,6 @@ class OfflineInterpolationRunner(
             ) ?: throw IllegalStateException("no HEVC encoder available on this device")
             val presenterInstance = RgbaSurfacePresenter(
                 display = display,
-                config = currentConfig(display),
                 context = context3,
                 width = source.width,
                 height = source.height,
@@ -617,24 +615,6 @@ class OfflineInterpolationRunner(
             normalized.contains("hdmv") ||
             normalized.contains("vobsub") ||
             normalized.contains("subtitle")
-    }
-
-    private fun currentConfig(display: EGLDisplay): EGLConfig {
-        val attribs = intArrayOf(
-            EGL14.EGL_RED_SIZE, 8,
-            EGL14.EGL_GREEN_SIZE, 8,
-            EGL14.EGL_BLUE_SIZE, 8,
-            EGL14.EGL_ALPHA_SIZE, 8,
-            EGL14.EGL_RENDERABLE_TYPE, 0x0030,
-            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
-            EGL14.EGL_NONE,
-        )
-        val configs = arrayOfNulls<EGLConfig>(1)
-        val count = IntArray(1)
-        if (!EGL14.eglChooseConfig(display, attribs, 0, configs, 0, 1, count, 0) || count[0] == 0) {
-            throw IllegalStateException("eglChooseConfig returned no config")
-        }
-        return configs[0]!!
     }
 
     private fun copyCurrentIntoPrev(curBuf: ByteBuffer, prevBuf: ByteBuffer) {

@@ -24,6 +24,9 @@ import java.nio.FloatBuffer
  *      -> HdrHevcEncoder's input Surface
  * ```
  *
+ * The config is chosen against the encoder's input Surface itself, not pre-picked: this
+ * encoder is always Main10 and a Main10 input surface rejects an 8-bit config with
+ * EGL_BAD_MATCH (the same reason GlOutputRenderer keeps strict/10-bit/relaxed attempts).
  * The offline job has no display surface and no mirror, so this is the smallest possible
  * cousin of [com.rife.androidtv.rife.GlOutputRenderer]'s present path: same quad orientation
  * (texture row 0 lands at the top of the frame) and same timestamp hand-off, minus every
@@ -31,7 +34,6 @@ import java.nio.FloatBuffer
  */
 class RgbaSurfacePresenter(
     private val display: EGLDisplay,
-    private val config: EGLConfig,
     private val context: android.opengl.EGLContext,
     width: Int,
     height: Int,
@@ -57,11 +59,7 @@ class RgbaSurfacePresenter(
     )
 
     init {
-        val attribs = intArrayOf(EGL14.EGL_NONE)
-        windowSurface = EGL14.eglCreateWindowSurface(display, config, surface, attribs, 0)
-        if (windowSurface == EGL14.EGL_NO_SURFACE) {
-            throw IllegalStateException("eglCreateWindowSurface failed: 0x${Integer.toHexString(EGL14.eglGetError())}")
-        }
+        windowSurface = createEncoderWindowSurface(surface)
         if (!EGL14.eglMakeCurrent(display, windowSurface, windowSurface, context)) {
             throw IllegalStateException("eglMakeCurrent(encoder surface) failed")
         }
@@ -82,6 +80,67 @@ class RgbaSurfacePresenter(
         texCoordHandle = GLES20.glGetAttribLocation(program, "aTexCoord")
         textureHandle = GLES20.glGetUniformLocation(program, "uTexture")
         Log.i(TAG, "presenter ready ${width}x$height")
+    }
+
+    /**
+     * Creates the window surface over the encoder's input Surface, trying strict 8-bit, then
+     * the 10-bit RGB10_A2 every Main10 input surface needs, then an unconstrained config that
+     * lets the driver match the native window's format - the same three attempts
+     * GlOutputRenderer makes, whose failure signal is EGL_BAD_MATCH from this very call.
+     */
+    private fun createEncoderWindowSurface(surface: Surface): EGLSurface {
+        val strict = intArrayOf(
+            EGL14.EGL_RED_SIZE, 8,
+            EGL14.EGL_GREEN_SIZE, 8,
+            EGL14.EGL_BLUE_SIZE, 8,
+            EGL14.EGL_ALPHA_SIZE, 8,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_NONE,
+        )
+        val hdr = intArrayOf(
+            EGL14.EGL_RED_SIZE, 10,
+            EGL14.EGL_GREEN_SIZE, 10,
+            EGL14.EGL_BLUE_SIZE, 10,
+            EGL14.EGL_ALPHA_SIZE, 2,
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_NONE,
+        )
+        val relaxed = intArrayOf(
+            EGL14.EGL_SURFACE_TYPE, EGL14.EGL_WINDOW_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_NONE,
+        )
+        val attempts = arrayOf(
+            "strict8bit" to strict,
+            "hdr10bit" to hdr,
+            "relaxed" to relaxed,
+        )
+        var lastError = 0
+        for ((attempt, configAttribs) in attempts) {
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val count = IntArray(1)
+            if (!EGL14.eglChooseConfig(display, configAttribs, 0, configs, 0, 1, count, 0) ||
+                count[0] == 0
+            ) {
+                Log.w(TAG, "eglChooseConfig found no config (attempt=$attempt)")
+                continue
+            }
+            val candidate = EGL14.eglCreateWindowSurface(
+                display, configs[0], surface, intArrayOf(EGL14.EGL_NONE), 0,
+            )
+            if (candidate != null && candidate != EGL14.EGL_NO_SURFACE) {
+                Log.i(TAG, "encoder window surface created (attempt=$attempt)")
+                return candidate
+            }
+            lastError = EGL14.eglGetError()
+            Log.w(TAG, "eglCreateWindowSurface failed (attempt=$attempt): 0x$lastError")
+        }
+        throw IllegalStateException(
+            "no EGL config matched the encoder input surface (last error 0x" +
+                Integer.toHexString(lastError) + ")",
+        )
     }
 
     /** Uploads [rgba] (width*height*4 bytes, top-down) and presents it at [ptsUs]. */

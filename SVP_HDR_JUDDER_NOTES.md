@@ -1059,3 +1059,22 @@ session, no on-device run of decode->interpolate->encode->mux; first
 device check is a short 1080p SDR clip (audio sync at 3N-2 frames,
 HDR10 static info via mediainfo, subtitle durations), then a 4K HDR
 movie (ms4 search domain, encoder Main10, job wall time).
+
+PROBLEM Q addendum - first device run crashed in eglChooseConfig:
+On-device trigger of the offline job threw "eglChooseConfig returned no
+config" from the presenter construction (OfflineInterpolationRunner.kt
+currentConfig). Root cause: the EGL_RENDERABLE_TYPE attribute was the
+literal 0x0030 - not a valid renderable bit (ES2 is 0x0004, ES3 is
+0x0040; 0x10/0x20 are undefined) - so no config can ever match and the
+call returns 0 configs on every device. Second, latent bug fixed in
+the same pass: the config was pre-picked as fixed RGBA8888, but this
+encoder is ALWAYS Main10 (HdrHevcEncoder picks Main10 or Main10HDR10),
+and a Main10 input surface rejects an 8-bit config with EGL_BAD_MATCH
+(GlOutputRenderer.kt:1024-1025 documents exactly this for encoder
+input surfaces) - the fixed config would have been the next crash.
+FIX: config selection moved into RgbaSurfacePresenter, which now
+chooses against the actual encoder Surface with the same three
+attempts GlOutputRenderer uses (strict8bit -> hdr10bit RGB10_A2 ->
+relaxed), logging which attempt won; the runner no longer pre-picks a
+config. Compile + ktlint + full test suite green; device re-run
+pending (this and the whole feature remain device-unverified).
